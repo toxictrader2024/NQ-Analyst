@@ -534,7 +534,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
     const vwap     = latest?.vwap  ?? 0;
 
     const personality = getPersonality();
-    const recentCalls = storage.getCommentary(5).map((c: any) => `${c.title} @ ${c.price?.toLocaleString() || "?"}`);
+    const recentCalls = storage.getRecentCommentary(5).map((c: any) => `${c.title} @ ${c.price?.toLocaleString() || "?"}`);
 
     const ctx: MarketContext = {
       price, vwap, bias, score,
