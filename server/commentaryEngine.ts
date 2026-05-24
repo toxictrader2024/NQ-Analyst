@@ -16,6 +16,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { storage } from "./storage";
 import type { WebhookPayload } from "@shared/schema";
 import { getPersonality, buildVwapRel, type MarketContext } from "./personalities";
+import { evaluateSignal, clearExpiredSignals } from "./signalEngine";
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY || "",
@@ -467,6 +468,43 @@ export function startPulse() {
     } catch (err) {
       console.error("[Pulse] AI generation failed:", err);
     }
+
+    // ── Signal Engine evaluation ──────────────────────────────────────────────
+    // Build a combined market data object from latest stored signals so the
+    // engine has access to both ICT scores (from routes.ts scoreSetup) and
+    // the raw webhook fields it needs.
+    try {
+      // Import scoreSetup dynamically is awkward; instead pass what we have
+      // available in commentaryEngine's closure: bias, score, and the latest
+      // webhook payload fields.
+      const signalMarketData = {
+        close:           latest.close,
+        delta:           (latest as any).delta ?? null,
+        bias,
+        score,
+        orderFlowScore:  0, // pulse doesn't recompute OF score; signal engine guards this
+        absorptionBull:  (latest as any).absorptionBull ?? 0,
+        absorptionBear:  (latest as any).absorptionBear ?? 0,
+      };
+      // Determine active session from current ET hour
+      const etHour = parseInt(
+        new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', hour12: false }),
+        10
+      );
+      const activeSession = etHour >= 7 && etHour < 12 ? 'ny'
+        : etHour >= 0 && etHour < 7 ? 'london'
+        : 'asia';
+
+      const newSignal = evaluateSignal(signalMarketData, activeSession);
+      if (newSignal) {
+        console.log(`[Pulse] Signal generated: ${newSignal.direction.toUpperCase()} @ ${newSignal.entry}`);
+      }
+    } catch (sigErr) {
+      console.error("[Pulse] Signal evaluation failed:", sigErr);
+    }
+
+    // Clear any pending signals older than 5 minutes
+    clearExpiredSignals();
   }, 5 * 60 * 1000); // every 5 minutes
 
   console.log("[Pulse] 5-minute market pulse started");

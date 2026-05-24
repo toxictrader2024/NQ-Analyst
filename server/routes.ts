@@ -5,6 +5,13 @@ import type { InsertWebhookPayload, InsertAnalysis } from "@shared/schema";
 import Anthropic from "@anthropic-ai/sdk";
 import { detectTriggers, generateCommentary, updateState } from "./commentaryEngine";
 import { getPersonality, setPersonality, isTrashTalk, buildVwapRel, type MarketContext, type PersonalityId } from "./personalities";
+import {
+  getPendingSignal,
+  confirmSignal,
+  updateSignalResult,
+  getRecentSignals,
+  getSignalStats,
+} from "./signalEngine";
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY || "",
@@ -202,7 +209,8 @@ function buildAnalysisPrompt(
   bias: string,
   confluences: string[],
   warnings: string[],
-  userQuestion?: string
+  userQuestion?: string,
+  session?: string
 ): string {
   const latest = webhooks[0];
   const priceStr = latest?.close ? `$${latest.close.toLocaleString()}` : "unknown";
@@ -245,6 +253,11 @@ You also analyze order flow from Sierra Chart: delta, CVD, DOM depth (bid/ask st
 
 Your job: give precise, actionable trade analysis that COMBINES ICT context with order flow confirmation. Be direct like a prop desk analyst.
 Never give generic advice. Always specify: bias, entry zone, stop, targets, and WHY with both ICT reasons AND order flow confirmation.
+
+${session === "asia" ? `ACTIVE SESSION: ASIA (6PM–Midnight ET)
+Focus: Range identification only. Look for liquidity pools forming above/below key highs and lows. Identify where stops are resting. DO NOT call directional trades during Asia — focus on marking the range high and low, noting where equal highs/lows are forming as sweep targets for London. Flag any unusual volume or delta that suggests smart money positioning.` : session === "london" ? `ACTIVE SESSION: LONDON (Midnight–6AM ET)
+Focus: Sweep mechanics. Is London sweeping the Asia high or low? A sweep of the Asia LOW = bullish setup for NY open. A sweep of the Asia HIGH = bearish setup for NY open. Look for: liquidity grabs above/below Asia range, sharp reversals after the sweep, and displacement candles that confirm direction. Give a clear NY directional bias based on what London is doing.` : `ACTIVE SESSION: NEW YORK (7AM–11AM ET)
+Focus: ICT kill zone entries. Use the London sweep direction as confirmation. Look for: OTE retracements (62-79% fib), FVG fills, order block taps in the NY open kill zone (7-9am ET). Give specific entry zones, stops, TP1 and TP2. This is the primary trading session — be precise and actionable.`}
 
 CURRENT MARKET DATA:
 - Instrument: NQ Futures (NQ1!)
@@ -359,7 +372,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
         if (score >= 40) {
           try {
-            const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings);
+            const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings, undefined, activeSession);
             const msg = await anthropic.messages.create({
               model: "claude-opus-4-5",
               max_tokens: 800,
@@ -499,7 +512,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
 
     try {
-      const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings);
+      const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings, undefined, activeSession);
       const msg = await anthropic.messages.create({
         model: "claude-opus-4-5",
         max_tokens: 1000,
@@ -605,6 +618,21 @@ export function registerRoutes(httpServer: Server, app: Express) {
   app.get("/api/personality", (req, res) => {
     const p = getPersonality();
     return res.json({ id: p.id, name: p.name, emoji: p.emoji, description: p.description });
+  });
+
+  // ── GET/POST /api/session — Get or set active session mode ──────────────────
+  let activeSession = "ny"; // default NY session
+
+  app.get("/api/session", (req, res) => {
+    return res.json({ session: activeSession });
+  });
+
+  app.post("/api/session", (req, res) => {
+    const { session } = req.body;
+    if (!["asia", "london", "ny"].includes(session))
+      return res.status(400).json({ error: "Invalid session. Use: asia, london, ny" });
+    activeSession = session;
+    return res.json({ session: activeSession });
   });
 
   // ── GET /api/chat/:sessionId — Get chat history ───────────────────────────
@@ -830,6 +858,42 @@ export function registerRoutes(httpServer: Server, app: Express) {
       console.error("Scorecard simulate error:", err);
       return res.status(500).json({ error: "Simulate failed" });
     }
+  });
+
+  // ── GET /api/trade-signal/pending — Return oldest pending signal ─────────
+  app.get("/api/trade-signal/pending", (_req, res) => {
+    const signal = getPendingSignal();
+    return res.json(signal ?? {});
+  });
+
+  // ── POST /api/trade-signal/confirm — Confirm receipt of a signal ───────────
+  app.post("/api/trade-signal/confirm", (req, res) => {
+    const { id, status } = req.body as { id: string; status?: string };
+    if (!id) return res.status(400).json({ error: "id required" });
+    confirmSignal(id);
+    // Allow caller to also pass an updated status (e.g. 'filled')
+    if (status && status !== 'pending') {
+      updateSignalResult(id, { status: status as any });
+    }
+    return res.json({ ok: true, id });
+  });
+
+  // ── POST /api/trade-signal/result — Update fill/close data ────────────────
+  app.post("/api/trade-signal/result", (req, res) => {
+    const { id, ...rest } = req.body as { id: string; [key: string]: any };
+    if (!id) return res.status(400).json({ error: "id required" });
+    updateSignalResult(id, rest);
+    return res.json({ ok: true, id });
+  });
+
+  // ── GET /api/trade-signal/history — Last 50 signals with outcomes ──────────
+  app.get("/api/trade-signal/history", (_req, res) => {
+    return res.json(getRecentSignals(50));
+  });
+
+  // ── GET /api/trade-signal/stats — Aggregated performance stats ────────────
+  app.get("/api/trade-signal/stats", (_req, res) => {
+    return res.json(getSignalStats());
   });
 
   // ── GET /api/commentary — Live commentary feed ─────────────────────────────

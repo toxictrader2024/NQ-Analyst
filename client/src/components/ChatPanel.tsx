@@ -23,12 +23,12 @@ export default function ChatPanel() {
   const { muted, toggleMute, speak } = useTTS();
 
   // Get active personality from API
-  const { data: personalityData } = useQuery<{ personality: string }>({
+  const { data: personalityData } = useQuery<{ id: string; name: string }>({
     queryKey: ["/api/personality"],
     queryFn: () => apiRequest("GET", "/api/personality").then(r => r.json()),
     refetchInterval: 10000,
   });
-  const personality = personalityData?.personality || "shark";
+  const personality = personalityData?.id || "shark";
 
   const { data: messages = [] } = useQuery<ChatMessage[]>({
     queryKey: ["/api/chat", SESSION_ID],
@@ -44,13 +44,16 @@ export default function ChatPanel() {
     },
   });
 
-  // Speak new AI messages
+  // Speak new AI messages — first 2 sentences max
   useEffect(() => {
     if (!messages.length) return;
     const latest = messages[messages.length - 1];
     if (latest.role === "assistant" && latest.id !== lastSpokenId.current) {
       lastSpokenId.current = latest.id;
-      speak(latest.content, personality);
+      // Split into sentences, speak first 2 only
+      const sentences = latest.content.split(/(?<=[.!?])\s+/).slice(0, 2).join(" ");
+      const truncated = sentences.length > 300 ? sentences.slice(0, 300) + "..." : sentences;
+      speak(truncated, personality);
     }
   }, [messages, personality, speak]);
 

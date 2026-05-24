@@ -140,12 +140,12 @@ export default function CommentaryFeed() {
   const { muted, toggleMute, speak } = useTTS();
 
   // Get active personality
-  const { data: personalityData } = useQuery<{ personality: string }>({
+  const { data: personalityData } = useQuery<{ id: string; name: string }>({
     queryKey: ["/api/personality"],
     queryFn: () => apiRequest("GET", "/api/personality").then(r => r.json()),
     refetchInterval: 10000,
   });
-  const personality = personalityData?.personality || "shark";
+  const personality = personalityData?.id || "shark";
 
   const { data: items = [], isLoading } = useQuery<CommentaryItem[]>({
     queryKey: ["/api/commentary"],
@@ -172,7 +172,12 @@ export default function CommentaryFeed() {
       // Speak the highest urgency new item
       const newItems = items.filter(i => incoming.has(i.id));
       const toSpeak = newItems.find(i => i.urgency === "high") || newItems[0];
-      if (toSpeak) speak(`${toSpeak.title}. ${toSpeak.message}`, personality);
+      if (toSpeak) {
+        // Speak title + first sentence only — don't read the full analysis
+        const firstSentence = toSpeak.message.split(/(?<=[.!?])\s+/)[0] || toSpeak.message;
+        const truncated = firstSentence.length > 200 ? firstSentence.slice(0, 200) + "..." : firstSentence;
+        speak(`${toSpeak.title}. ${truncated}`, personality);
+      }
     }
   }, [items, personality, speak]);
 

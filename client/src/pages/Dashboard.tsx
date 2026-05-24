@@ -7,6 +7,8 @@ import ScoreGauge from "@/components/ScoreGauge";
 import ChatPanel from "@/components/ChatPanel";
 import CommentaryFeed from "@/components/CommentaryFeed";
 import PersonalitySelector from "@/components/PersonalitySelector";
+import SessionToggle from "@/components/SessionToggle";
+import TradeLog from "@/components/TradeLog";
 import { RefreshCw, Zap, TrendingUp, TrendingDown, Minus, AlertTriangle, CheckCircle2, Clock, Loader2, FlaskConical } from "lucide-react";
 
 interface DashboardData {
@@ -269,10 +271,14 @@ export default function Dashboard() {
               <p className="text-sm text-muted-foreground">No analysis yet — click "Analyze Now" or inject a demo signal to get started.</p>
             </div>
           )}
+
+          {/* Bot Trade Log */}
+          <TradeLog />
         </div>
 
         {/* Right column — Personality + Commentary + Chat */}
         <div className="xl:col-span-1 flex flex-col gap-4 min-h-0">
+          <SessionToggle />
           <PersonalitySelector />
           <div className="h-[400px] xl:h-[50%] flex-shrink-0">
             <CommentaryFeed />
