@@ -216,22 +216,32 @@ function buildAnalysisPrompt(
     `Zone:${w.premium ? "premium" : w.discount ? "discount" : "mid"}`
   ).join("\n");
 
-  const ofLatest = webhooks.find(w => (w as any).source === "bookmap_cme");
+  const ofLatest = webhooks.find(w => w.source === "sierra_chart");
   const ofSection = ofLatest ? `
-ORDER FLOW DATA (Bookmap CME Live):
-- Cumulative Delta: ${(ofLatest as any).delta ?? "N/A"} (positive = net buying)
-- Bid Stack: ${(ofLatest as any).bidStackSize ?? "N/A"} / Ask Stack: ${(ofLatest as any).askStackSize ?? "N/A"}
-- Large Prints: ${(ofLatest as any).largeTradeCount ?? 0} (${(ofLatest as any).largeBuyCount ?? 0} buys / ${(ofLatest as any).largeSellCount ?? 0} sells)
-- Bull Absorption: ${(ofLatest as any).absorptionBull ? "YES ← high conviction" : "No"}
-- Bear Absorption: ${(ofLatest as any).absorptionBear ? "YES ← high conviction" : "No"}
-- DOM Imbalance: ${(ofLatest as any).imbalanceBull ? "STACKED BIDS (bull)" : (ofLatest as any).imbalanceBear ? "STACKED ASKS (bear)" : "Balanced"}
-- Volume POC: ${(ofLatest as any).vapPoc ?? "N/A"}
-` : "ORDER FLOW: Not yet connected (Bookmap add-on not installed)";
+ORDER FLOW DATA (Sierra Chart — Live CME Data):
+- Delta (this bar): ${ofLatest.delta !== null ? (ofLatest.delta! > 0 ? "+" : "") + ofLatest.delta : "N/A"} contracts (positive = net buying pressure)
+- Buy Volume: ${ofLatest.buyVolume ?? "N/A"} / Sell Volume: ${ofLatest.sellVolume ?? "N/A"}
+- CVD trend available via recent delta history
+- DOM Bid Stack: ${ofLatest.bidStackSize ?? "N/A"} / Ask Stack: ${ofLatest.askStackSize ?? "N/A"} (top ${10} levels)
+- Spread: visible in raw data
+- Large Prints: ${ofLatest.largeTradeCount ?? 0} total (${ofLatest.largeBuyCount ?? 0} buys / ${ofLatest.largeSellCount ?? 0} sells)
+- Bull Absorption: ${ofLatest.absorptionBull ? "YES ← STRONG SIGNAL: sellers being absorbed, buyers in control" : "No"}
+- Bear Absorption: ${ofLatest.absorptionBear ? "YES ← STRONG SIGNAL: buyers being absorbed, sellers in control" : "No"}
+- DOM Imbalance: ${ofLatest.imbalanceBull ? "STACKED BIDS — 3x+ more bids than asks (bullish pressure)" : ofLatest.imbalanceBear ? "STACKED ASKS — 3x+ more asks than bids (bearish pressure)" : "Balanced DOM"}
+- Volume POC: ${ofLatest.vapPoc ?? "N/A"} (highest volume price level — acts as magnet)
+- VWAP: ${ofLatest.vwap ?? "N/A"}
 
-  const systemPrompt = `You are an elite NQ futures quant analyst combining ICT (Inner Circle Trader) methodology with live order flow analysis from CME market data via Bookmap.
+ORDER FLOW INTERPRETATION:
+${ofLatest.absorptionBull ? "→ Bullish absorption confirms buyers defending the level — ICT discount zone + absorption = high conviction long" : ""}
+${ofLatest.absorptionBear ? "→ Bearish absorption confirms sellers capping the move — ICT premium zone + absorption = high conviction short" : ""}
+${ofLatest.delta !== null && ofLatest.delta! > 0 && ofLatest.close !== null && ofLatest.close! < (ofLatest.vwap ?? 999999) ? "→ Positive delta below VWAP = buyers accumulating in discount — potential long setup" : ""}
+${ofLatest.delta !== null && ofLatest.delta! < 0 && ofLatest.close !== null && ofLatest.close! > (ofLatest.vwap ?? 0) ? "→ Negative delta above VWAP = distribution in premium — potential short setup" : ""}
+` : "ORDER FLOW: Sierra Chart not yet connected. Install NQ_Analyst_Bridge.cpp study in Sierra Chart to enable live delta, DOM, and absorption data.";
+
+  const systemPrompt = `You are an elite NQ futures quant analyst combining ICT (Inner Circle Trader) methodology with live order flow analysis from Sierra Chart CME data.
 You analyze NQ (Nasdaq 100 E-mini futures) using: kill zones (London Open 2-5am CT, NY Open 7-10am CT, NY Close 1-3pm CT), 
 market structure (BOS/CHoCH), fair value gaps, order blocks, liquidity sweeps, premium/discount zones, VWAP, and 15-min bias with 1-min entries.
-You also analyze order flow: delta, DOM depth, absorption, large prints, and volume at price (POC).
+You also analyze order flow from Sierra Chart: delta, CVD, DOM depth (bid/ask stack), absorption events, large prints, and volume POC.
 
 Your job: give precise, actionable trade analysis that COMBINES ICT context with order flow confirmation. Be direct like a prop desk analyst.
 Never give generic advice. Always specify: bias, entry zone, stop, targets, and WHY with both ICT reasons AND order flow confirmation.
@@ -603,6 +613,107 @@ export function registerRoutes(httpServer: Server, app: Express) {
     return res.json(messages);
   });
 
+  // ── POST /api/sierra-webhook — Sierra Chart ACSIL order flow receiver ─────
+  app.post("/api/sierra-webhook", async (req, res) => {
+    try {
+      const body = req.body;
+      if (!body) return res.status(400).json({ error: "Empty body" });
+
+      // Merge Sierra Chart order flow into webhook payload
+      // Sierra sends camelCase keys — map them to our schema
+      const payload: InsertWebhookPayload = {
+        receivedAt: Date.now(),
+        ticker: body.ticker || "NQ1!",
+        timeframe: String(body.timeframe || "1"),
+        open:   body.open   !== undefined ? Number(body.open)   : null,
+        high:   body.high   !== undefined ? Number(body.high)   : null,
+        low:    body.low    !== undefined ? Number(body.low)    : null,
+        close:  body.close  !== undefined ? Number(body.close)  : null,
+        volume: body.volume !== undefined ? Number(body.volume) : null,
+        vwap:   body.vwap   !== undefined ? Number(body.vwap)   : null,
+        // ICT fields — not provided by Sierra, keep nulls so TV data stays dominant
+        killzone: null,
+        marketStructure: null,
+        fvgBull: 0, fvgBear: 0,
+        obBull: 0,  obBear: 0,
+        sweepHigh: 0, sweepLow: 0,
+        premium: 0, discount: 0,
+        rawJson: JSON.stringify(body),
+        // Order flow fields from Sierra
+        source: "sierra_chart",
+        bidStackSize:   body.bidStackSize   !== undefined ? Number(body.bidStackSize)   : null,
+        askStackSize:   body.askStackSize   !== undefined ? Number(body.askStackSize)   : null,
+        delta:          body.delta          !== undefined ? Number(body.delta)          : null,
+        buyVolume:      body.buyVolume      !== undefined ? Number(body.buyVolume)      : null,
+        sellVolume:     body.sellVolume     !== undefined ? Number(body.sellVolume)     : null,
+        largeTradeCount: body.largeTradeCount !== undefined ? Number(body.largeTradeCount) : null,
+        largeBuyCount:  body.largeBuyCount  !== undefined ? Number(body.largeBuyCount)  : null,
+        largeSellCount: body.largeSellCount !== undefined ? Number(body.largeSellCount) : null,
+        absorptionBull: body.absorptionBull ? 1 : 0,
+        absorptionBear: body.absorptionBear ? 1 : 0,
+        vapPoc:         body.vapPoc         !== undefined ? Number(body.vapPoc)         : null,
+        imbalanceBull:  body.imbalanceBull  ? 1 : 0,
+        imbalanceBear:  body.imbalanceBear  ? 1 : 0,
+      };
+
+      const saved = storage.saveWebhook(payload);
+
+      // ── Merge with latest TradingView signal for combined analysis ──────────
+      // Get the most recent TradingView signal and overlay Sierra order flow
+      const recentWebhooks = storage.getRecentWebhooks(10);
+      const latestTV = recentWebhooks.find(w => w.source === "tradingview" || w.source === null);
+
+      if (latestTV && saved.delta !== null) {
+        // Check if absorption or imbalance warrants a commentary event
+        const triggers = [];
+        if (saved.absorptionBull) {
+          triggers.push({
+            type: "absorption" as const,
+            urgency: "high" as const,
+            title: "Bullish Absorption Detected",
+            detail: `Large sell volume (${saved.sellVolume} contracts) absorbed at ${saved.close?.toFixed(2)} — sellers couldn't push price down`,
+          });
+        }
+        if (saved.absorptionBear) {
+          triggers.push({
+            type: "absorption" as const,
+            urgency: "high" as const,
+            title: "Bearish Absorption Detected",
+            detail: `Large buy volume (${saved.buyVolume} contracts) absorbed at ${saved.close?.toFixed(2)} — buyers couldn't push price up`,
+          });
+        }
+        if (saved.imbalanceBull) {
+          triggers.push({
+            type: "general" as const,
+            urgency: "medium" as const,
+            title: "DOM Bid Imbalance",
+            detail: `Bid stack (${saved.bidStackSize}) is 3x+ the ask — strong buy-side pressure at ${saved.close?.toFixed(2)}`,
+          });
+        }
+        if (saved.imbalanceBear) {
+          triggers.push({
+            type: "general" as const,
+            urgency: "medium" as const,
+            title: "DOM Ask Imbalance",
+            detail: `Ask stack (${saved.askStackSize}) is 3x+ the bid — strong sell-side pressure at ${saved.close?.toFixed(2)}`,
+          });
+        }
+
+        if (triggers.length > 0 && process.env.ANTHROPIC_API_KEY) {
+          const { score, ictScore, bias, confluences, warnings } = scoreSetup(recentWebhooks);
+          const top = triggers[0];
+          generateCommentary(top, recentWebhooks, bias, score, ictScore, confluences, warnings)
+            .catch(e => console.error("[Sierra Commentary] Error:", e));
+        }
+      }
+
+      return res.json({ ok: true, id: saved.id, source: "sierra_chart" });
+    } catch (err) {
+      console.error("[Sierra Webhook] Error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
   // ── GET /api/webhook-url — Return the webhook URL hint ───────────────────
   app.get("/api/webhook-url", (req, res) => {
     const host = req.headers.host || "localhost:5000";
@@ -694,7 +805,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
   // ── POST /api/commentary/simulate — Inject demo commentary ─────────────────
   app.post("/api/commentary/simulate", async (req, res) => {
     const webhooks = storage.getRecentWebhooks(10);
-    const { score, ictScore, bias, confluences, warnings } = scoreSetup(webhooks);
+    const { score, ictScore, orderFlowScore, bias, confluences, orderFlowConfluences, warnings } = scoreSetup(webhooks);
     const latest = webhooks[0];
     const price = latest?.close ?? 21420;
 
