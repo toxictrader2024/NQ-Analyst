@@ -1,9 +1,10 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { useEffect, useRef, useState } from "react";
-import { Bot, TrendingUp, TrendingDown, Zap, Activity, Repeat2, ChevronDown, ChevronUp, FlaskConical, Loader2, Bell } from "lucide-react";
+import { Bot, TrendingUp, TrendingDown, Zap, Activity, Repeat2, ChevronDown, ChevronUp, FlaskConical, Loader2, Bell, Volume2, VolumeX } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { useTTS } from "@/hooks/use-tts";
 
 interface CommentaryItem {
   id: number;
@@ -136,6 +137,15 @@ export default function CommentaryFeed() {
   const [seenIds, setSeenIds] = useState<Set<number>>(new Set());
   const [newIds, setNewIds] = useState<Set<number>>(new Set());
   const [autoScroll, setAutoScroll] = useState(true);
+  const { muted, toggleMute, speak } = useTTS();
+
+  // Get active personality
+  const { data: personalityData } = useQuery<{ personality: string }>({
+    queryKey: ["/api/personality"],
+    queryFn: () => apiRequest("GET", "/api/personality").then(r => r.json()),
+    refetchInterval: 10000,
+  });
+  const personality = personalityData?.personality || "shark";
 
   const { data: items = [], isLoading } = useQuery<CommentaryItem[]>({
     queryKey: ["/api/commentary"],
@@ -159,8 +169,12 @@ export default function CommentaryFeed() {
       setNewIds(incoming);
       setSeenIds(prev => new Set([...prev, ...incoming]));
       setTimeout(() => setNewIds(new Set()), 8000);
+      // Speak the highest urgency new item
+      const newItems = items.filter(i => incoming.has(i.id));
+      const toSpeak = newItems.find(i => i.urgency === "high") || newItems[0];
+      if (toSpeak) speak(`${toSpeak.title}. ${toSpeak.message}`, personality);
     }
-  }, [items]);
+  }, [items, personality, speak]);
 
   // Auto-scroll to top (newest first)
   useEffect(() => {
@@ -185,6 +199,15 @@ export default function CommentaryFeed() {
           )}
         </div>
         <span className="text-sm font-semibold text-foreground">AI Market Commentary</span>
+        <Button
+          variant="ghost"
+          size="icon"
+          className={`w-7 h-7 ml-1 ${muted ? "text-muted-foreground" : "text-primary"}`}
+          onClick={toggleMute}
+          title={muted ? "Unmute voice" : "Mute voice"}
+        >
+          {muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+        </Button>
         <div className="flex gap-1.5 ml-1">
           {urgencyCounts.high > 0 && (
             <Badge variant="outline" className="text-xs h-4 px-1.5 text-red-400 border-red-400/30">{urgencyCounts.high} high</Badge>

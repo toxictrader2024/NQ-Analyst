@@ -3,7 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Send, Bot, User, Loader2 } from "lucide-react";
+import { Send, Bot, User, Loader2, Volume2, VolumeX } from "lucide-react";
+import { useTTS } from "@/hooks/use-tts";
 
 const SESSION_ID = `session-${Date.now()}`;
 
@@ -17,12 +18,22 @@ interface ChatMessage {
 export default function ChatPanel() {
   const [input, setInput] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
+  const lastSpokenId = useRef<number>(-1);
   const qc = useQueryClient();
+  const { muted, toggleMute, speak } = useTTS();
+
+  // Get active personality from API
+  const { data: personalityData } = useQuery<{ personality: string }>({
+    queryKey: ["/api/personality"],
+    queryFn: () => apiRequest("GET", "/api/personality").then(r => r.json()),
+    refetchInterval: 10000,
+  });
+  const personality = personalityData?.personality || "shark";
 
   const { data: messages = [] } = useQuery<ChatMessage[]>({
     queryKey: ["/api/chat", SESSION_ID],
     queryFn: () => apiRequest("GET", `/api/chat/${SESSION_ID}`).then(r => r.json()),
-    refetchInterval: 3000,
+    refetchInterval: 2000,
   });
 
   const sendMutation = useMutation({
@@ -32,6 +43,16 @@ export default function ChatPanel() {
       qc.invalidateQueries({ queryKey: ["/api/chat", SESSION_ID] });
     },
   });
+
+  // Speak new AI messages
+  useEffect(() => {
+    if (!messages.length) return;
+    const latest = messages[messages.length - 1];
+    if (latest.role === "assistant" && latest.id !== lastSpokenId.current) {
+      lastSpokenId.current = latest.id;
+      speak(latest.content, personality);
+    }
+  }, [messages, personality, speak]);
 
   const handleSend = () => {
     if (!input.trim() || sendMutation.isPending) return;
@@ -64,6 +85,16 @@ export default function ChatPanel() {
         <Bot className="w-4 h-4 text-primary" />
         <span className="text-sm font-semibold text-foreground">AI Analyst Chat</span>
         <span className="ml-auto text-xs text-muted-foreground font-mono">ICT · NQ1!</span>
+        {/* Mute button */}
+        <Button
+          variant="ghost"
+          size="icon"
+          className={`w-7 h-7 ml-1 ${muted ? "text-muted-foreground" : "text-primary"}`}
+          onClick={toggleMute}
+          title={muted ? "Unmute voice" : "Mute voice"}
+        >
+          {muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+        </Button>
       </div>
 
       {/* Messages */}
@@ -115,7 +146,6 @@ export default function ChatPanel() {
               key={q}
               onClick={() => { setInput(q); }}
               className="text-xs px-2.5 py-1.5 rounded-full border border-border text-muted-foreground hover:text-foreground hover:border-primary/50 transition-colors"
-              data-testid={`quick-q-${q.slice(0, 10).replace(/\s+/g, "-")}`}
             >
               {q}
             </button>
@@ -132,14 +162,12 @@ export default function ChatPanel() {
           placeholder="Ask about the current setup..."
           className="resize-none text-sm min-h-[40px] max-h-[120px] bg-background border-border"
           rows={1}
-          data-testid="chat-input"
         />
         <Button
           size="icon"
           onClick={handleSend}
           disabled={!input.trim() || sendMutation.isPending}
           className="flex-shrink-0 bg-primary hover:bg-primary/90"
-          data-testid="button-send"
         >
           <Send className="w-4 h-4" />
         </Button>
