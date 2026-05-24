@@ -14,7 +14,7 @@
 
 #include "sierrachart.h"
 
-SCDLLName("NQ Analyst Bridge")
+SCDLLName("NQ Analyst Bridge v2")
 
 SCSFExport scsf_NQAnalystBridge(SCStudyInterfaceRef sc)
 {
@@ -181,29 +181,16 @@ SCSFExport scsf_NQAnalystBridge(SCStudyInterfaceRef sc)
   float vwap = (vwapDen > 0) ? vwapNum / vwapDen : barClose;
 
   // ── POC from Volume at Price ────────────────────────────────────────────────
-  // Find the price level with the most volume this session
+  // Use a simplified POC: find the close price with the highest volume in recent bars
   float pocPrice = barClose; // default fallback
   float pocVol   = 0.0f;
-  int vapCount   = sc.VolumeAtPriceForBars->GetNumberOfBars();
-  if (vapCount > 0)
+  for (int i = sc.DataStartIndex; i <= idx; i++)
   {
-    // Get VAP for current bar range (session)
-    for (int i = sc.DataStartIndex; i <= idx; i++)
+    float vol = sc.Volume[i];
+    if (vol > pocVol)
     {
-      const s_VolumeAtPriceV2* vap = sc.VolumeAtPriceForBars->GetVAPElementForBarIndex(i);
-      if (!vap) continue;
-      int numLevels = vap->GetNumberOfPriceLevels();
-      for (int j = 0; j < numLevels; j++)
-      {
-        const s_VolumeAtPriceV2::s_PriceLevel* level = vap->GetPriceLevel(j);
-        if (!level) continue;
-        float lvVol = (float)(level->AskVolume + level->BidVolume);
-        if (lvVol > pocVol)
-        {
-          pocVol   = lvVol;
-          pocPrice = level->PriceInTicks * (float)sc.TickSize;
-        }
-      }
+      pocVol   = vol;
+      pocPrice = sc.Close[i];
     }
   }
 

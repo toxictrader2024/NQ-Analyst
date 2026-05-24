@@ -1,79 +1,92 @@
 /**
- * useTTS — browser Web Speech API text-to-speech hook
+ * useTTS — OpenAI TTS (server-side) with browser Web Speech API fallback
  * Persists mute state in localStorage so it survives page reloads.
+ *
+ * OpenAI voices per personality:
+ *   shark  → onyx  (deep, authoritative, cocky)
+ *   oracle → nova  (sharp, confident female)
+ *   suit   → echo  (calm, professional male)
  */
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useRef } from "react";
 
 const STORAGE_KEY = "nq_tts_muted";
 
-// Pick a voice that sounds good per personality
-const VOICE_HINTS: Record<string, { lang: string; gender: "male" | "female"; rate: number; pitch: number }> = {
-  shark:  { lang: "en-US", gender: "male",   rate: 1.05, pitch: 0.85 }, // deep, fast
-  suit:   { lang: "en-US", gender: "male",   rate: 0.95, pitch: 1.0  }, // calm, measured
-  oracle: { lang: "en-US", gender: "female", rate: 1.0,  pitch: 1.1  }, // sharp female
+// OpenAI voice mapping
+const OPENAI_VOICES: Record<string, string> = {
+  shark:  "onyx",
+  suit:   "echo",
+  oracle: "nova",
 };
 
-function pickVoice(personality: string): SpeechSynthesisVoice | null {
-  const hint = VOICE_HINTS[personality] || VOICE_HINTS.shark;
-  const voices = window.speechSynthesis.getVoices();
-  if (!voices.length) return null;
-
-  // Try to match lang + gender keyword in name
-  const genderKeywords = hint.gender === "female"
-    ? ["female", "woman", "zira", "samantha", "karen", "victoria", "moira", "tessa", "fiona"]
-    : ["male", "man", "david", "mark", "daniel", "alex", "fred", "lee", "james"];
-
-  // First pass: lang match + gender hint
-  let match = voices.find(v =>
-    v.lang.startsWith(hint.lang.split("-")[0]) &&
-    genderKeywords.some(k => v.name.toLowerCase().includes(k))
-  );
-
-  // Second pass: just lang match
-  if (!match) match = voices.find(v => v.lang.startsWith(hint.lang.split("-")[0]));
-
-  // Fallback: first voice
-  return match || voices[0];
+function cleanText(text: string): string {
+  return text
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
+    .replace(/#{1,6}\s/g, "")
+    .replace(/`{1,3}[^`]*`{1,3}/g, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[-•*]\s/g, "")
+    .replace(/_{1,2}(.*?)_{1,2}/g, "$1")
+    .replace(/\n{2,}/g, ". ")
+    .replace(/\n/g, " ")
+    .trim();
 }
 
 export function useTTS() {
   const [muted, setMuted] = useState<boolean>(() => {
     try { return localStorage.getItem(STORAGE_KEY) === "true"; } catch { return false; }
   });
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   const toggleMute = useCallback(() => {
     setMuted(prev => {
       const next = !prev;
       try { localStorage.setItem(STORAGE_KEY, String(next)); } catch {}
-      if (next) window.speechSynthesis?.cancel(); // stop any current speech
+      if (next) {
+        // Stop any playing audio
+        if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
+        window.speechSynthesis?.cancel();
+      }
       return next;
     });
   }, []);
 
-  const speak = useCallback((text: string, personality = "shark") => {
+  const speak = useCallback(async (text: string, personality = "shark") => {
     if (muted) return;
-    if (!window.speechSynthesis) return;
+    const cleaned = cleanText(text);
+    if (!cleaned) return;
 
-    // Cancel any ongoing speech
-    window.speechSynthesis.cancel();
+    // Stop any currently playing audio
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
+    window.speechSynthesis?.cancel();
 
-    const hint = VOICE_HINTS[personality] || VOICE_HINTS.shark;
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate  = hint.rate;
-    utterance.pitch = hint.pitch;
-    utterance.volume = 1;
+    const voice = OPENAI_VOICES[personality] || "onyx";
 
-    const doSpeak = () => {
-      const voice = pickVoice(personality);
-      if (voice) utterance.voice = voice;
-      window.speechSynthesis.speak(utterance);
-    };
+    try {
+      // Call our server proxy endpoint (avoids exposing API key in client)
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: cleaned, voice }),
+      });
 
-    // Voices may not be loaded yet
-    if (window.speechSynthesis.getVoices().length === 0) {
-      window.speechSynthesis.onvoiceschanged = () => { doSpeak(); };
-    } else {
-      doSpeak();
+      if (!res.ok) throw new Error("TTS API failed");
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.onended = () => URL.revokeObjectURL(url);
+      audio.play();
+    } catch (err) {
+      // Fallback to browser TTS
+      console.warn("OpenAI TTS failed, falling back to browser:", err);
+      if (window.speechSynthesis) {
+        const utterance = new SpeechSynthesisUtterance(cleaned);
+        utterance.rate = personality === "shark" ? 1.05 : 0.95;
+        utterance.pitch = personality === "oracle" ? 1.2 : 0.9;
+        window.speechSynthesis.speak(utterance);
+      }
     }
   }, [muted]);
 

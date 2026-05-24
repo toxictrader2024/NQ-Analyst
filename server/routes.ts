@@ -714,6 +714,43 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
   });
 
+  // ── POST /api/tts — OpenAI Text-to-Speech proxy ──────────────────────────
+  app.post("/api/tts", async (req, res) => {
+    try {
+      const { text, voice = "onyx" } = req.body;
+      if (!text) return res.status(400).json({ error: "No text provided" });
+      if (!process.env.OPENAI_API_KEY) return res.status(503).json({ error: "OpenAI API key not configured" });
+
+      const response = await fetch("https://api.openai.com/v1/audio/speech", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "tts-1",
+          input: text.slice(0, 4096), // OpenAI max
+          voice,
+          speed: voice === "onyx" ? 1.05 : 1.0, // Shark talks fast
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.text();
+        console.error("[TTS] OpenAI error:", err);
+        return res.status(502).json({ error: "OpenAI TTS failed" });
+      }
+
+      const audioBuffer = await response.arrayBuffer();
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Content-Length", audioBuffer.byteLength);
+      return res.send(Buffer.from(audioBuffer));
+    } catch (err) {
+      console.error("[TTS] Error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
   // ── GET /api/webhook-url — Return the webhook URL hint ───────────────────
   app.get("/api/webhook-url", (req, res) => {
     const host = req.headers.host || "localhost:5000";
