@@ -214,7 +214,7 @@ export default function CommentaryFeed() {
           {muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
         </Button>
         <div className="flex gap-1.5 ml-1">
-          {urgencyCounts.high > 0 && (
+          {urgencyCounts.high > 0 && urgencyCounts.high <= 10 && (
             <Badge variant="outline" className="text-xs h-4 px-1.5 text-red-400 border-red-400/30">{urgencyCounts.high} high</Badge>
           )}
         </div>

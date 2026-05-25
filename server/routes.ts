@@ -272,7 +272,9 @@ You are watching for Turtle Soup setups and Silver Bullet reversals off the Asia
 Key output: Has Asia high or low been swept yet? Is a Turtle Soup forming? Is this the Silver Bullet window? Call the setup with entry, SL, TP1, TP2.` : `ACTIVE SESSION: NEW YORK (7AM–11AM ET)
 Focus: ICT kill zone entries. Use the London sweep direction as confirmation. Look for: OTE retracements (62-79% fib of the London displacement), FVG fills left by London displacement candles, order block taps in the NY open kill zone (7-9am ET). Give specific entry zones, stops, TP1 and TP2. This is the primary trading session — be precise and actionable.`}
 
-CRITICAL RULE: Every price level you output (entry, stop, TP1, TP2, support, resistance) MUST be within a reasonable range of the current live price of ${priceStr}. Never use prices from your training data or memory. If the live price is ${priceStr}, all levels must be near that number.
+CRITICAL RULES (never override these):
+- Current time: ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit', hour12: true })} CT / ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: true })} ET
+- Every price level (entry, stop, TP1, TP2, support, resistance) MUST be within 200 points of the live price of ${priceStr}. Never use prices from training data or memory.
 
 CURRENT MARKET DATA:
 - Instrument: NQ Futures (NQ1!)
@@ -300,17 +302,20 @@ ${recentSignals || "  No signals received yet"}`;
 }
 
 // ── Parse AI trade plan from narrative ──────────────────────────────────────
-function parseTradePlan(narrative: string, latest: ReturnType<typeof storage.getLatestWebhook>) {
-  const entryMatch = narrative.match(/entry[:\s]+\$?([\d,]+(?:\s*-\s*[\d,]+)?)/i);
-  const stopMatch = narrative.match(/stop[:\s]+\$?([\d,]+)/i);
-  const t1Match = narrative.match(/target\s*1[:\s]+\$?([\d,]+)/i);
-  const t2Match = narrative.match(/target\s*2[:\s]+\$?([\d,]+)/i);
+function parseTradePlan(narrative: string, latest: ReturnType<typeof storage.getLatestWebhook>, livePrice?: number | null) {
+  const entryMatch = narrative.match(/entry[:\s]+\$?([\d,]+(?:\.\d+)?(?:\s*[-–]\s*\$?[\d,]+(?:\.\d+)?)?)/i);
+  const stopMatch  = narrative.match(/stop[^\n]{0,20}[:\s]+\$?([\d,]+(?:\.\d+)?)/i);
+  const t1Match    = narrative.match(/(?:target\s*1|tp\s*1|take\s*profit\s*1)[:\s]+\$?([\d,]+(?:\.\d+)?)/i);
+  const t2Match    = narrative.match(/(?:target\s*2|tp\s*2|take\s*profit\s*2)[:\s]+\$?([\d,]+(?:\.\d+)?)/i);
+
+  // Use live price as fallback anchor — never stale webhook close
+  const p = livePrice ?? latest?.close ?? null;
 
   return {
-    entryZone: entryMatch?.[1] || (latest?.close ? `${(latest.close - 5).toFixed(0)} - ${(latest.close + 5).toFixed(0)}` : null),
-    stopLoss: stopMatch?.[1] || null,
-    target1: t1Match?.[1] || null,
-    target2: t2Match?.[1] || null,
+    entryZone: entryMatch?.[1] || (p ? `${(p - 8).toFixed(2)} - ${(p + 3).toFixed(2)}` : null),
+    stopLoss:  stopMatch?.[1]  || (p ? `${(p - 20).toFixed(2)}` : null),
+    target1:   t1Match?.[1]   || (p ? `${(p + 30).toFixed(2)}` : null),
+    target2:   t2Match?.[1]   || (p ? `${(p + 75).toFixed(2)}` : null),
   };
 }
 
@@ -400,13 +405,13 @@ export function registerRoutes(httpServer: Server, app: Express) {
             });
             const narrative = (msg.content[0] as any).text;
             const latest = webhooks[0];
-            const tradePlan = parseTradePlan(narrative, latest);
+            const tradePlan = parseTradePlan(narrative, latest, livePrice);
 
             const direction = bias === "BULLISH" ? "LONG" : bias === "BEARISH" ? "SHORT" : "WAIT";
 
             storage.saveAnalysis({
               createdAt: Date.now(),
-              latestPrice: latest?.close || null,
+              latestPrice: livePrice ?? latest?.close ?? null,
               sessionBias: bias,
               setupScore: score,
               tradeDirection: direction,
@@ -511,21 +516,23 @@ export function registerRoutes(httpServer: Server, app: Express) {
     const { score, ictScore, bias, confluences, warnings } = scoreSetup(webhooks);
 
     if (!process.env.ANTHROPIC_API_KEY) {
-      // Demo mode — return scored analysis without AI narrative
-      const direction = bias === "BULLISH" ? "LONG" : bias === "BEARISH" ? "SHORT" : "WAIT";
+      // Demo mode — use live price, never stale webhook close
+      const livePrice = await fetchLiveNQPrice();
       const latest = webhooks[0];
-      const demoNarrative = `[DEMO MODE — Add ANTHROPIC_API_KEY for full AI analysis]\n\nSetup Score: ${score}/100\nBias: ${bias}\n\nActive Confluences:\n${confluences.map(c => `• ${c}`).join("\n")}\n\n${warnings.length ? `Warnings:\n${warnings.map(w => `⚠ ${w}`).join("\n")}\n\n` : ""}Based on the current ICT signals, the market shows a ${bias.toLowerCase()} setup. ${direction === "WAIT" ? "Confluence is mixed — wait for clearer structure." : `Look for ${direction === "LONG" ? "bullish" : "bearish"} confirmation on the 1-minute chart within the identified zones.`}`;
+      const p = livePrice ?? latest?.close ?? null;
+      const direction = bias === "BULLISH" ? "LONG" : bias === "BEARISH" ? "SHORT" : "WAIT";
+      const demoNarrative = `[DEMO MODE — ANTHROPIC_API_KEY not configured]\n\nSetup Score: ${score}/100 | Bias: ${bias} | Live Price: ${p ? `$${p.toLocaleString()}` : "unknown"}\n\nActive Confluences:\n${confluences.map(c => `• ${c}`).join("\n")}\n\n${warnings.length ? `Risk Warnings:\n${warnings.map(w => `⚠ ${w}`).join("\n")}\n\n` : ""}Based on current ICT signals at live price $${p?.toLocaleString() ?? "unknown"}, the market shows a ${bias.toLowerCase()} setup. ${direction === "WAIT" ? "Confluence is mixed — wait for clearer structure." : `Look for ${direction === "LONG" ? "bullish" : "bearish"} confirmation on the 1-minute chart.`}`;
 
       const analysis = storage.saveAnalysis({
         createdAt: Date.now(),
-        latestPrice: latest?.close || null,
+        latestPrice: p,
         sessionBias: bias,
         setupScore: score,
         tradeDirection: direction,
-        entryZone: latest?.close ? `${(latest.close - 8).toFixed(0)} - ${(latest.close + 3).toFixed(0)}` : null,
-        stopLoss: latest?.close ? `${(latest.close - 20).toFixed(0)}` : null,
-        target1: latest?.close ? `${(latest.close + 25).toFixed(0)}` : null,
-        target2: latest?.close ? `${(latest.close + 50).toFixed(0)}` : null,
+        entryZone: p ? `${(p - 8).toFixed(2)} - ${(p + 3).toFixed(2)}` : null,
+        stopLoss: p ? `${(p - 20).toFixed(2)}` : null,
+        target1: p ? `${(p + 25).toFixed(2)}` : null,
+        target2: p ? `${(p + 60).toFixed(2)}` : null,
         narrative: demoNarrative,
         confluences: JSON.stringify(confluences),
         warnings: warnings.length ? JSON.stringify(warnings) : null,
@@ -544,7 +551,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
       });
       const narrative = (msg.content[0] as any).text;
       const latest = webhooks[0];
-      const tradePlan = parseTradePlan(narrative, latest);
+      const tradePlan = parseTradePlan(narrative, latest, livePrice);
       const direction = bias === "BULLISH" ? "LONG" : bias === "BEARISH" ? "SHORT" : "WAIT";
 
       const analysis = storage.saveAnalysis({

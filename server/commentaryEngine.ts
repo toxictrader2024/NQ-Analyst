@@ -29,7 +29,11 @@ let lastScore: number = 0;
 let lastKillzone: string | null = null;
 let signalCount: number = 0;
 let lastCommentaryAt: number = 0;
-const MIN_COMMENTARY_GAP_MS = 45_000; // don't fire more than once per 45s
+const MIN_COMMENTARY_GAP_MS = 5 * 60 * 1000; // minimum 5 min between any commentary
+
+// Per-trigger-type cooldown — prevents same trigger spamming
+const lastTriggerAt: Record<string, number> = {};
+const TRIGGER_COOLDOWN_MS = 15 * 60 * 1000; // same trigger type won't fire within 15 min
 
 type TriggerType = "reversal" | "continuation" | "tp_update" | "sl_update" | "bias_change" | "absorption" | "general" | "structure" | "killzone" | "imbalance";
 type Urgency = "high" | "medium" | "low";
@@ -55,8 +59,15 @@ export function detectTriggers(
   // Throttle: don't fire if last commentary was too recent
   if (now - lastCommentaryAt < MIN_COMMENTARY_GAP_MS) return [];
 
+  // Helper: only allow a trigger source once per cooldown window
+  const allowed = (source: string) => {
+    if (now - (lastTriggerAt[source] ?? 0) < TRIGGER_COOLDOWN_MS) return false;
+    lastTriggerAt[source] = now;
+    return true;
+  };
+
   // 1. Bias flip — highest priority
-  if (lastBias && currentBias !== "NEUTRAL" && currentBias !== lastBias && lastBias !== "NEUTRAL") {
+  if (lastBias && currentBias !== "NEUTRAL" && currentBias !== lastBias && lastBias !== "NEUTRAL" && allowed("bias_flip")) {
     triggers.push({
       type: "bias_change",
       urgency: "high",
@@ -67,7 +78,7 @@ export function detectTriggers(
   }
 
   // 2. Bull/Bear absorption — very high conviction
-  if ((latest as any).absorptionBull) {
+  if ((latest as any).absorptionBull && allowed("absorption_bull")) {
     triggers.push({
       type: "absorption",
       urgency: "high",
@@ -76,7 +87,7 @@ export function detectTriggers(
       source: "absorption_bull",
     });
   }
-  if ((latest as any).absorptionBear) {
+  if ((latest as any).absorptionBear && allowed("absorption_bear")) {
     triggers.push({
       type: "absorption",
       urgency: "high",
@@ -88,7 +99,7 @@ export function detectTriggers(
 
   // 3. Market structure flip (BOS or CHoCH)
   const ms = latest.marketStructure || "";
-  if (ms.includes("CHoCH")) {
+  if (ms.includes("CHoCH") && allowed("choch")) {
     triggers.push({
       type: "reversal",
       urgency: "high",
@@ -96,7 +107,7 @@ export function detectTriggers(
       reason: `Change of Character (CHoCH) printed on ${latest.timeframe}m — potential trend reversal`,
       source: "choch",
     });
-  } else if (ms.includes("BOS")) {
+  } else if (ms.includes("BOS") && allowed("bos")) {
     triggers.push({
       type: "continuation",
       urgency: "medium",
@@ -107,7 +118,7 @@ export function detectTriggers(
   }
 
   // 4. Liquidity sweep (high-value entry signal)
-  if (latest.sweepLow) {
+  if (latest.sweepLow && allowed("sweep_low")) {
     triggers.push({
       type: "reversal",
       urgency: "high",
@@ -116,7 +127,7 @@ export function detectTriggers(
       source: "sweep_low",
     });
   }
-  if (latest.sweepHigh) {
+  if (latest.sweepHigh && allowed("sweep_high")) {
     triggers.push({
       type: "reversal",
       urgency: "high",
@@ -136,7 +147,7 @@ export function detectTriggers(
       const priceUp = close > prevClose;
       const deltaNeg = delta < -200;
       const deltaPos = delta > 200;
-      if (priceUp && deltaNeg) {
+      if (priceUp && deltaNeg && allowed("delta_divergence_bear")) {
         triggers.push({
           type: "reversal",
           urgency: "medium",
@@ -144,7 +155,7 @@ export function detectTriggers(
           reason: `Price moved up to ${close} but cumulative delta is ${delta} — bearish divergence, potential trap`,
           source: "delta_divergence_bear",
         });
-      } else if (!priceUp && deltaPos) {
+      } else if (!priceUp && deltaPos && allowed("delta_divergence_bull")) {
         triggers.push({
           type: "reversal",
           urgency: "medium",
@@ -157,7 +168,7 @@ export function detectTriggers(
   }
 
   // 6. DOM imbalance appeared
-  if ((latest as any).imbalanceBull) {
+  if ((latest as any).imbalanceBull && allowed("imbalance_bull")) {
     triggers.push({
       type: "continuation",
       urgency: "medium",
@@ -166,7 +177,7 @@ export function detectTriggers(
       source: "imbalance_bull",
     });
   }
-  if ((latest as any).imbalanceBear) {
+  if ((latest as any).imbalanceBear && allowed("imbalance_bear")) {
     triggers.push({
       type: "continuation",
       urgency: "medium",
@@ -178,7 +189,7 @@ export function detectTriggers(
 
   // 7. Score crosses significant thresholds
   const scoreDelta = currentScore - lastScore;
-  if (scoreDelta >= 20 && currentScore >= 65) {
+  if (scoreDelta >= 20 && currentScore >= 65 && allowed("score_surge")) {
     triggers.push({
       type: "continuation",
       urgency: "medium",
@@ -186,7 +197,7 @@ export function detectTriggers(
       reason: `Confluence buildup: score jumped ${scoreDelta} points — high-probability setup forming`,
       source: "score_surge",
     });
-  } else if (scoreDelta <= -20 && lastScore >= 50) {
+  } else if (scoreDelta <= -20 && lastScore >= 50 && allowed("score_drop")) {
     triggers.push({
       type: "tp_update",
       urgency: "medium",
@@ -197,7 +208,7 @@ export function detectTriggers(
   }
 
   // 8. Killzone activated
-  if (latest.killzone && latest.killzone !== lastKillzone) {
+  if (latest.killzone && latest.killzone !== lastKillzone && allowed("killzone_activate")) {
     const kzLabel = latest.killzone.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
     triggers.push({
       type: "general",
@@ -209,7 +220,7 @@ export function detectTriggers(
   }
 
   // 9. FVG + Order Block confluence appears
-  if ((latest.fvgBull && (latest as any).obBull) || (latest.fvgBear && (latest as any).obBear)) {
+  if (((latest.fvgBull && (latest as any).obBull) || (latest.fvgBear && (latest as any).obBear)) && allowed("fvg_ob_confluence")) {
     triggers.push({
       type: "continuation",
       urgency: "medium",
@@ -231,7 +242,10 @@ export function detectTriggers(
     });
   }
 
-  return triggers;
+  // Return only the single highest-priority trigger to prevent commentary spam
+  const priority = { high: 0, medium: 1, low: 2 };
+  triggers.sort((a, b) => priority[a.urgency] - priority[b.urgency]);
+  return triggers.slice(0, 1);
 }
 
 // ── Generate AI commentary for a trigger ─────────────────────────────────────
@@ -440,7 +454,9 @@ export function startPulse() {
       time: new Date().toLocaleTimeString("en-US", { timeZone: "America/Chicago", hour: "2-digit", minute: "2-digit" }),
       vwapRel: buildVwapRel(price, vwap),
     };
-    const priceAnchor = `\n\nCRITICAL: Live NQ price is ${price.toLocaleString()}. Every SL, TP1, TP2, and price level you mention MUST be within 200 points of ${price.toLocaleString()}. Never use prices from training data.`;
+    const ctTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit', hour12: true });
+    const etTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: true });
+    const priceAnchor = `\n\nCRITICAL FACTS (do not override):\n- Current time: ${ctTime} CT / ${etTime} ET\n- Live NQ price: ${price.toLocaleString()}\n- Every SL, TP1, TP2 MUST be within 200 points of ${price.toLocaleString()}. Never use prices from training data. Never state a different time than what is listed above.`;
     const prompt = personality.pulsePrompt(ctx) + priceAnchor;
 
     try {
@@ -495,11 +511,13 @@ export function startPulse() {
         absorptionBear:  (latest as any).absorptionBear ?? 0,
       };
       // Determine active session from current ET hour
+      // Use Intl.DateTimeFormat to reliably get 0-23 hour in ET
+      const etNow = new Date();
       const etHour = parseInt(
-        new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', hour12: false }),
+        new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: false }).format(etNow),
         10
-      );
-      // AMD Strat = 6PM-2AM ET (asia), London = 2AM-5AM ET, NY = 7AM-11AM ET
+      ) % 24; // guard against "24" returned at midnight
+      // AMD Strat = 6PM(18)-2AM ET, London = 2AM-5AM ET, NY = 7AM-11AM ET
       const activeSession = (etHour >= 7 && etHour < 11) ? 'ny'
         : (etHour >= 2 && etHour < 5) ? 'london'
         : 'asia';

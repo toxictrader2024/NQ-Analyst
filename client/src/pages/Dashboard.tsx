@@ -60,7 +60,10 @@ export default function Dashboard() {
 
   const d = data!;
   const lw = d.latestWebhook;
-  const la = d.latestAnalysis;
+  // Don't show analyses older than 4 hours — stale data causes price confusion
+  const MAX_ANALYSIS_AGE_MS = 4 * 60 * 60 * 1000;
+  const rawLa = d.latestAnalysis;
+  const la = rawLa && (Date.now() - rawLa.createdAt) < MAX_ANALYSIS_AGE_MS ? rawLa : null;
 
   const biasIcon = d.bias === "BULLISH"
     ? <TrendingUp className="w-4 h-4 text-green-500" />
@@ -226,7 +229,7 @@ export default function Dashboard() {
                   </span>
                   <span className="text-xs text-muted-foreground font-mono">
                     <Clock className="w-3 h-3 inline mr-1" />
-                    {new Date(la.createdAt).toLocaleTimeString()}
+                    {new Date(la.createdAt).toLocaleTimeString('en-US', { timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit', hour12: true })} CT
                   </span>
                 </div>
               </div>
