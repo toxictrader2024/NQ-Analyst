@@ -8,21 +8,21 @@ import { apiRequest } from "@/lib/queryClient";
 const SESSIONS = [
   {
     id: "asia",
-    label: "Asia",
-    hours: "6PM–midnight ET",
+    label: "AMD Strat",
+    hours: "6PM–2AM ET",
     color: "from-blue-600/20 to-blue-500/10 border-blue-500/40 text-blue-400",
     activeColor: "from-blue-600/40 to-blue-500/20 border-blue-400 text-blue-300",
     dot: "bg-blue-400",
-    description: "Range building, liquidity pools, stop hunts",
+    description: "Accumulation → Manipulation → Distribution",
   },
   {
     id: "london",
     label: "London",
-    hours: "Midnight–6AM ET",
+    hours: "2AM–5AM ET",
     color: "from-purple-600/20 to-purple-500/10 border-purple-500/40 text-purple-400",
     activeColor: "from-purple-600/40 to-purple-500/20 border-purple-400 text-purple-300",
     dot: "bg-purple-400",
-    description: "Sweep Asia highs/lows, set NY direction",
+    description: "Asia sweep → Turtle Soup / Silver Bullet",
   },
   {
     id: "ny",
@@ -31,7 +31,7 @@ const SESSIONS = [
     color: "from-green-600/20 to-green-500/10 border-green-500/40 text-green-400",
     activeColor: "from-green-600/40 to-green-500/20 border-green-400 text-green-300",
     dot: "bg-green-400",
-    description: "ICT setups, killzone entries, trend continuation",
+    description: "Killzone entries, FVG fills, OTE retracements",
   },
 ];
 

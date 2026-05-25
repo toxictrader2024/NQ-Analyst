@@ -491,8 +491,9 @@ export function startPulse() {
         new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', hour12: false }),
         10
       );
-      const activeSession = etHour >= 7 && etHour < 12 ? 'ny'
-        : etHour >= 0 && etHour < 7 ? 'london'
+      // AMD Strat = 6PM-2AM ET (asia), London = 2AM-5AM ET, NY = 7AM-11AM ET
+      const activeSession = (etHour >= 7 && etHour < 11) ? 'ny'
+        : (etHour >= 2 && etHour < 5) ? 'london'
         : 'asia';
 
       const newSignal = evaluateSignal(signalMarketData, activeSession);

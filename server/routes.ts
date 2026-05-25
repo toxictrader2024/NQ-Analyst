@@ -1,6 +1,30 @@
 import type { Express } from "express";
 import type { Server } from "http";
 import { storage } from "./storage";
+
+// ── Live NQ price fetch (Yahoo Finance, no auth required) ─────────────────
+let cachedNQPrice: number | null = null;
+let cachedNQPriceAt = 0;
+async function fetchLiveNQPrice(): Promise<number | null> {
+  // Cache for 30 seconds
+  if (cachedNQPrice && Date.now() - cachedNQPriceAt < 30_000) return cachedNQPrice;
+  try {
+    const res = await fetch(
+      "https://query1.finance.yahoo.com/v8/finance/chart/NQ=F?interval=1m&range=1d",
+      { headers: { "User-Agent": "Mozilla/5.0" } }
+    );
+    const json = await res.json() as any;
+    const price = json?.chart?.result?.[0]?.meta?.regularMarketPrice as number | undefined;
+    if (price && price > 0) {
+      cachedNQPrice = price;
+      cachedNQPriceAt = Date.now();
+      return price;
+    }
+  } catch (e) {
+    console.warn("[LivePrice] Yahoo fetch failed:", e);
+  }
+  return null;
+}
 import type { InsertWebhookPayload, InsertAnalysis } from "@shared/schema";
 import Anthropic from "@anthropic-ai/sdk";
 import { detectTriggers, generateCommentary, updateState } from "./commentaryEngine";
@@ -210,10 +234,13 @@ function buildAnalysisPrompt(
   confluences: string[],
   warnings: string[],
   userQuestion?: string,
-  session?: string
+  session?: string,
+  livePrice?: number | null
 ): string {
   const latest = webhooks[0];
-  const priceStr = latest?.close ? `$${latest.close.toLocaleString()}` : "unknown";
+  // Prefer live Yahoo Finance price over stale webhook close
+  const effectivePrice = livePrice ?? latest?.close ?? null;
+  const priceStr = effectivePrice ? `$${effectivePrice.toLocaleString()}` : "unknown";
   const vwapStr = latest?.vwap ? `$${latest.vwap.toLocaleString()}` : "N/A";
 
   const recentSignals = webhooks.slice(0, 5).map(w =>
@@ -254,14 +281,24 @@ You also analyze order flow from Sierra Chart: delta, CVD, DOM depth (bid/ask st
 Your job: give precise, actionable trade analysis that COMBINES ICT context with order flow confirmation. Be direct like a prop desk analyst.
 Never give generic advice. Always specify: bias, entry zone, stop, targets, and WHY with both ICT reasons AND order flow confirmation.
 
-${session === "asia" ? `ACTIVE SESSION: ASIA (6PM–Midnight ET)
-Focus: Range identification only. Look for liquidity pools forming above/below key highs and lows. Identify where stops are resting. DO NOT call directional trades during Asia — focus on marking the range high and low, noting where equal highs/lows are forming as sweep targets for London. Flag any unusual volume or delta that suggests smart money positioning.` : session === "london" ? `ACTIVE SESSION: LONDON (Midnight–6AM ET)
-Focus: Sweep mechanics. Is London sweeping the Asia high or low? A sweep of the Asia LOW = bullish setup for NY open. A sweep of the Asia HIGH = bearish setup for NY open. Look for: liquidity grabs above/below Asia range, sharp reversals after the sweep, and displacement candles that confirm direction. Give a clear NY directional bias based on what London is doing.` : `ACTIVE SESSION: NEW YORK (7AM–11AM ET)
-Focus: ICT kill zone entries. Use the London sweep direction as confirmation. Look for: OTE retracements (62-79% fib), FVG fills, order block taps in the NY open kill zone (7-9am ET). Give specific entry zones, stops, TP1 and TP2. This is the primary trading session — be precise and actionable.`}
+${session === "asia" ? `ACTIVE SESSION: AMD STRATEGY (6PM–2AM ET)
+You are analyzing the AMD (Accumulation, Manipulation, Distribution) cycle.
+- ACCUMULATION phase (6PM–8PM ET): Smart money builds a position quietly. Price moves sideways or compresses. Look for: tight range, low delta, equal highs/lows forming as future sweep targets. DO NOT call directional trades yet. Mark the range boundaries.
+- MANIPULATION phase (8PM–11PM ET): False move to trap retail. Price sweeps above or below the accumulation range to hunt stops. Look for: liquidity grabs above equal highs or below equal lows, spike + reversal candle, delta divergence (price moves up but delta drops = bearish trap). Identify which side is being swept.
+- DISTRIBUTION phase (11PM–2AM ET): Smart money delivers price in the true direction opposite the manipulation. Look for: strong displacement away from the swept level, FVG formation, order block left behind. Call the directional bias for London and NY based on which side was swept in manipulation.
+Key output: Label current AMD phase, identify swept liquidity, call the directional bias for the rest of the night.` : session === "london" ? `ACTIVE SESSION: LONDON — WATCH FOR ASIA SWEEP REVERSAL (2AM–5AM ET)
+You are watching for Turtle Soup setups and Silver Bullet reversals off the Asia range sweep.
+- TURTLE SOUP: Price sweeps above the Asia session high or below the Asia session low (liquidity grab), then immediately reverses and closes back inside the Asia range. This is the signal. Long if Asia low was swept, Short if Asia high was swept. Entry: on the reversal candle close or first pullback FVG. SL: beyond the swept extreme. TP1: Asia range midpoint. TP2: opposite side of Asia range.
+- SILVER BULLET (2:00AM–3:00AM ET window): A 3-candle FVG forms during this specific window after a liquidity sweep. Enter on the FVG fill. This is a high-probability setup — only valid if London has already swept a key level (Asia high, Asia low, prior day high/low, or overnight high/low).
+- CONFIRMATION signals: Displacement candle (large body, closes near high/low), bullish/bearish engulfing after the sweep, delta confirms (buy delta surging after Asia low sweep = bullish Turtle Soup).
+Key output: Has Asia high or low been swept yet? Is a Turtle Soup forming? Is this the Silver Bullet window? Call the setup with entry, SL, TP1, TP2.` : `ACTIVE SESSION: NEW YORK (7AM–11AM ET)
+Focus: ICT kill zone entries. Use the London sweep direction as confirmation. Look for: OTE retracements (62-79% fib of the London displacement), FVG fills left by London displacement candles, order block taps in the NY open kill zone (7-9am ET). Give specific entry zones, stops, TP1 and TP2. This is the primary trading session — be precise and actionable.`}
+
+CRITICAL RULE: Every price level you output (entry, stop, TP1, TP2, support, resistance) MUST be within a reasonable range of the current live price of ${priceStr}. Never use prices from your training data or memory. If the live price is ${priceStr}, all levels must be near that number.
 
 CURRENT MARKET DATA:
 - Instrument: NQ Futures (NQ1!)
-- Latest Price: ${priceStr}
+- Live Price (authoritative): ${priceStr}
 - VWAP: ${vwapStr}
 - Combined Setup Score: ${score}/100
 - Session Bias: ${bias}
@@ -273,9 +310,13 @@ ${ofSection}
 RECENT SIGNAL HISTORY (newest first):
 ${recentSignals || "  No signals received yet"}`; 
 
-  const userPrompt = userQuestion 
-    ? userQuestion 
-    : `Based on the current ICT signals and setup score of ${score}/100 with a ${bias} bias, provide your complete trade analysis including: session bias reasoning, setup score breakdown, specific entry zone, stop loss, and two targets. Also note any key risks.`;
+  const noData = !latest || (!latest.killzone && !latest.marketStructure && !latest.fvgBull && !latest.fvgBear && !latest.obBull && !latest.obBear && !latest.sweepLow && !latest.sweepHigh);
+
+  const userPrompt = userQuestion
+    ? userQuestion
+    : noData
+      ? `No live webhook data is connected yet (TradingView or Sierra Chart not sending signals). However, the live NQ price is ${priceStr}. Based ONLY on the live price, current session mode, and ICT methodology, provide a complete trade analysis. Use the live price as your anchor for ALL levels — entry zones, stop loss, TP1, TP2 must all be calculated relative to ${priceStr}. Do not use any price from memory or training data. State clearly that no confluence data is live yet, but still give a full actionable analysis using the live price.`
+      : `Based on the current ICT signals and setup score of ${score}/100 with a ${bias} bias, provide your complete trade analysis including: session bias reasoning, setup score breakdown, specific entry zone, stop loss, and two targets. All price levels must be relative to the current live price of ${priceStr}. Also note any key risks.`;
 
   return `${systemPrompt}\n\nUser Question: ${userPrompt}`;
 }
@@ -372,7 +413,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
         if (score >= 40) {
           try {
-            const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings, undefined, activeSession);
+            const livePrice = await fetchLiveNQPrice();
+            const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings, undefined, activeSession, livePrice);
             const msg = await anthropic.messages.create({
               model: "claude-opus-4-5",
               max_tokens: 800,
@@ -411,20 +453,23 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
   // ── POST /api/simulate — Inject test/demo data ─────────────────────────────
   app.post("/api/simulate", async (req, res) => {
+    // Always use live NQ price as the base — never hardcode stale levels
+    const liveBase = await fetchLiveNQPrice() ?? (storage.getRecentWebhooks(1)[0]?.close ?? 29900);
+    const b = Math.round(liveBase * 4) / 4; // round to nearest 0.25 tick
     const scenarios = [
       {
-        timeframe: "15", close: 21420, high: 21445, low: 21390, open: 21400, volume: 12500,
-        vwap: 21405, killzone: "ny_open", marketStructure: "BOS_bull",
+        timeframe: "15", close: b, high: b + 25, low: b - 30, open: b - 5, volume: 12500,
+        vwap: b - 15, killzone: "ny_open", marketStructure: "BOS_bull",
         fvg_bull: 1, sweep_low: 1, discount: 1,
       },
       {
-        timeframe: "1", close: 21428, high: 21435, low: 21415, open: 21420, volume: 3200,
-        vwap: 21408, killzone: "ny_open", marketStructure: "CHoCH_bull",
+        timeframe: "1", close: b + 8, high: b + 15, low: b - 5, open: b, volume: 3200,
+        vwap: b - 8, killzone: "ny_open", marketStructure: "CHoCH_bull",
         ob_bull: 1, fvg_bull: 1, discount: 1,
       },
       {
-        timeframe: "15", close: 21380, high: 21410, low: 21360, open: 21395, volume: 9800,
-        vwap: 21410, killzone: "ny_close", marketStructure: "BOS_bear",
+        timeframe: "15", close: b - 40, high: b + 10, low: b - 60, open: b - 5, volume: 9800,
+        vwap: b + 10, killzone: "ny_close", marketStructure: "BOS_bear",
         fvg_bear: 1, sweep_high: 1, premium: 1,
       },
     ];
@@ -512,7 +557,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
 
     try {
-      const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings, undefined, activeSession);
+      const livePrice = await fetchLiveNQPrice();
+      const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings, undefined, activeSession, livePrice);
       const msg = await anthropic.messages.create({
         model: "claude-opus-4-5",
         max_tokens: 1000,
@@ -525,7 +571,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
       const analysis = storage.saveAnalysis({
         createdAt: Date.now(),
-        latestPrice: latest?.close || null,
+        latestPrice: livePrice ?? latest?.close ?? null,
         sessionBias: bias,
         setupScore: score,
         tradeDirection: direction,
@@ -806,8 +852,10 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // ── POST /api/scorecard/simulate — Inject demo scorecard data ─────────────
-  app.post("/api/scorecard/simulate", (req, res) => {
+  app.post("/api/scorecard/simulate", async (req, res) => {
     const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const liveBase = await fetchLiveNQPrice() ?? (storage.getRecentWebhooks(1)[0]?.close ?? 29900);
+    const b = Math.round(liveBase * 4) / 4;
     const demoEntry = {
       sessionDate: today,
       createdAt: Date.now(),
@@ -815,10 +863,10 @@ export function registerRoutes(httpServer: Server, app: Express) {
       morningScore: 72,
       setup1Name: "London Sweep → NY Reversal Long",
       setup1Direction: "LONG",
-      setup1Entry: 21420,
-      setup1Sl: 21398,
-      setup1Tp1: 21455,
-      setup1Tp2: 21510,
+      setup1Entry: b - 30,
+      setup1Sl: b - 52,
+      setup1Tp1: b + 5,
+      setup1Tp2: b + 60,
       setup1Confluences: JSON.stringify(["London low swept", "Bullish FVG", "NY Open killzone", "Discount zone"]),
       setup1Outcome: "TP2",
       setup1EntryTriggered: 1,
@@ -828,10 +876,10 @@ export function registerRoutes(httpServer: Server, app: Express) {
       setup1PnlPts: 90,
       setup2Name: "VWAP Rejection Short",
       setup2Direction: "SHORT",
-      setup2Entry: 21510,
-      setup2Sl: 21532,
-      setup2Tp1: 21475,
-      setup2Tp2: 21440,
+      setup2Entry: b + 60,
+      setup2Sl: b + 82,
+      setup2Tp1: b + 25,
+      setup2Tp2: b - 10,
       setup2Confluences: JSON.stringify(["Bearish OB at VWAP", "Premium zone", "NY close killzone"]),
       setup2Outcome: "NO_TRIGGER",
       setup2EntryTriggered: 0,
@@ -839,13 +887,13 @@ export function registerRoutes(httpServer: Server, app: Express) {
       setup2Tp2Hit: 0,
       setup2Stopped: 0,
       setup2PnlPts: 0,
-      sessionHigh: 21518,
-      sessionLow: 21388,
-      sessionOpen: 21402,
-      sessionClose: 21490,
+      sessionHigh: b + 68,
+      sessionLow: b - 62,
+      sessionOpen: b - 28,
+      sessionClose: b + 50,
       actualDirection: "UP",
       biasCorrect: 1,
-      reviewNarrative: "[DEMO] Perfect ICT playbook day. London swept the Asian low, creating the liquidity grab that fueled the NY morning pump. Setup 1 played out cleanly: price tapped the FVG at 21,420, bounced with strong delta, and ran all the way to TP2 at 21,510. Setup 2 never triggered — price stalled just below the entry zone before the close. Bias was correct. Key win: trusting the London sweep thesis instead of fading the initial push.",
+      reviewNarrative: `[DEMO] Perfect ICT playbook day. London swept the Asian low, creating the liquidity grab that fueled the NY morning pump. Setup 1 played out cleanly: price tapped the FVG at ${(b-30).toLocaleString()}, bounced with strong delta, and ran all the way to TP2 at ${(b+60).toLocaleString()}. Setup 2 never triggered — price stalled just below the entry zone before the close. Bias was correct. Key win: trusting the London sweep thesis instead of fading the initial push.`,
       keyLessons: JSON.stringify(["London sweep thesis was the highest-conviction signal of the day", "FVG fill + positive delta = high-probability long", "TP2 patience rewarded — don't take all off at TP1 on clean ICT setups"]),
       rollingWinRate: 65,
       rollingBiasAccuracy: 72,
@@ -908,7 +956,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
     const webhooks = storage.getRecentWebhooks(10);
     const { score, ictScore, orderFlowScore, bias, confluences, orderFlowConfluences, warnings } = scoreSetup(webhooks);
     const latest = webhooks[0];
-    const price = latest?.close ?? 21420;
+    const price = latest?.close ?? (await fetchLiveNQPrice()) ?? 29900;
 
     const demoTriggers = [
       { type: "bias_change" as const, urgency: "high" as const, title: "⚡ Bias Flip: BEARISH → BULLISH", reason: "CHoCH printed on 15m with low swept and FVG fill", source: "demo_bias" },

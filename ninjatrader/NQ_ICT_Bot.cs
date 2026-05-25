@@ -504,21 +504,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             // ── Place stop loss ──
             if (isLong)
             {
-                stopOrder = ExitLongStopMarket(0, true, filledQty, signalSL, "ICT_SL", entryOrder.Name);
+                stopOrder = ExitLongStopMarket(filledQty, signalSL, "ICT_SL", entryOrder.Name);
 
                 if (tp1Qty > 0)
-                    tp1Order = ExitLong(0, true, tp1Qty, signalTP1, "ICT_TP1", entryOrder.Name);
+                    tp1Order = ExitLongLimit(tp1Qty, signalTP1, "ICT_TP1", entryOrder.Name);
 
-                tp2Order = ExitLong(0, true, tp2Qty, signalTP2, "ICT_TP2", entryOrder.Name);
+                tp2Order = ExitLongLimit(tp2Qty, signalTP2, "ICT_TP2", entryOrder.Name);
             }
             else
             {
-                stopOrder = ExitShortStopMarket(0, true, filledQty, signalSL, "ICT_SL", entryOrder.Name);
+                stopOrder = ExitShortStopMarket(filledQty, signalSL, "ICT_SL", entryOrder.Name);
 
                 if (tp1Qty > 0)
-                    tp1Order = ExitShort(0, true, tp1Qty, signalTP1, "ICT_TP1", entryOrder.Name);
+                    tp1Order = ExitShortLimit(tp1Qty, signalTP1, "ICT_TP1", entryOrder.Name);
 
-                tp2Order = ExitShort(0, true, tp2Qty, signalTP2, "ICT_TP2", entryOrder.Name);
+                tp2Order = ExitShortLimit(tp2Qty, signalTP2, "ICT_TP2", entryOrder.Name);
             }
 
             // ── Start minimum-duration hold timer ──
