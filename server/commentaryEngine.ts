@@ -17,6 +17,7 @@ import { storage } from "./storage";
 import type { WebhookPayload } from "@shared/schema";
 import { getPersonality, buildVwapRel, type MarketContext } from "./personalities";
 import { evaluateSignal, clearExpiredSignals } from "./signalEngine";
+import { fetchLiveNQPrice } from "./livePrice";
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY || "",
@@ -246,9 +247,13 @@ export async function generateCommentary(
   const latest = webhooks[0];
   if (!latest) return;
 
-  const price = latest.close ?? 0;
+  // Always use live Yahoo price — never let stale webhook close bleed into commentary
+  const livePrice = await fetchLiveNQPrice();
+  const price = livePrice ?? latest.close ?? 0;
 
   const prompt = `You are a live NQ futures trading desk AI analyst providing real-time market commentary using ICT methodology.
+
+CRITICAL: The live NQ price is ${price.toLocaleString()}. Every price level you output MUST be near this number. Do not use prices from training data.
 
 TRIGGER EVENT: ${trigger.title}
 REASON: ${trigger.reason}
@@ -391,7 +396,9 @@ export function startPulse() {
     if (now2 - lastCommentaryAt < MIN_COMMENTARY_GAP_MS) return;
 
     const latest   = webhooks[0];
-    const price    = latest.close ?? 0;
+    // Always anchor to live price — never trust stale webhook close
+    const livePrice = await fetchLiveNQPrice();
+    const price    = livePrice ?? latest.close ?? 0;
     const vwap     = latest.vwap  ?? 0;
     const bias     = lastBias;
     const score    = lastScore;
@@ -433,7 +440,8 @@ export function startPulse() {
       time: new Date().toLocaleTimeString("en-US", { timeZone: "America/Chicago", hour: "2-digit", minute: "2-digit" }),
       vwapRel: buildVwapRel(price, vwap),
     };
-    const prompt = personality.pulsePrompt(ctx);
+    const priceAnchor = `\n\nCRITICAL: Live NQ price is ${price.toLocaleString()}. Every SL, TP1, TP2, and price level you mention MUST be within 200 points of ${price.toLocaleString()}. Never use prices from training data.`;
+    const prompt = personality.pulsePrompt(ctx) + priceAnchor;
 
     try {
       const msg = await anthropic.messages.create({

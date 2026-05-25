@@ -2,29 +2,7 @@ import type { Express } from "express";
 import type { Server } from "http";
 import { storage } from "./storage";
 
-// ── Live NQ price fetch (Yahoo Finance, no auth required) ─────────────────
-let cachedNQPrice: number | null = null;
-let cachedNQPriceAt = 0;
-async function fetchLiveNQPrice(): Promise<number | null> {
-  // Cache for 30 seconds
-  if (cachedNQPrice && Date.now() - cachedNQPriceAt < 30_000) return cachedNQPrice;
-  try {
-    const res = await fetch(
-      "https://query1.finance.yahoo.com/v8/finance/chart/NQ=F?interval=1m&range=1d",
-      { headers: { "User-Agent": "Mozilla/5.0" } }
-    );
-    const json = await res.json() as any;
-    const price = json?.chart?.result?.[0]?.meta?.regularMarketPrice as number | undefined;
-    if (price && price > 0) {
-      cachedNQPrice = price;
-      cachedNQPriceAt = Date.now();
-      return price;
-    }
-  } catch (e) {
-    console.warn("[LivePrice] Yahoo fetch failed:", e);
-  }
-  return null;
-}
+import { fetchLiveNQPrice } from "./livePrice";
 import type { InsertWebhookPayload, InsertAnalysis } from "@shared/schema";
 import Anthropic from "@anthropic-ai/sdk";
 import { detectTriggers, generateCommentary, updateState } from "./commentaryEngine";
