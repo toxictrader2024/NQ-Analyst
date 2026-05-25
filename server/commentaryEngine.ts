@@ -456,7 +456,7 @@ export function startPulse() {
     };
     const ctTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit', hour12: true });
     const etTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: true });
-    const priceAnchor = `\n\nCRITICAL FACTS (do not override):\n- Current time: ${ctTime} CT / ${etTime} ET\n- Live NQ price: ${price.toLocaleString()}\n- Every SL, TP1, TP2 MUST be within 200 points of ${price.toLocaleString()}. Never use prices from training data. Never state a different time than what is listed above.`;
+    const priceAnchor = `\n\nCRITICAL FACTS (do not override):\n- Current time: ${ctTime} CT / ${etTime} ET\n- The ONLY correct NQ price is ${price.toLocaleString()}. Use this exact number for any "Live Price" or "Current Price" reference.\n- Every SL, TP1, TP2 MUST be within 200 points of ${price.toLocaleString()}. Never use prices from training data. Never state a different time than above.`;
     const prompt = personality.pulsePrompt(ctx) + priceAnchor;
 
     try {

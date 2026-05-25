@@ -45,8 +45,9 @@ export async function fetchLiveNQPrice(): Promise<number | null> {
   const webhookClose = webhooks[0]?.close;
   const webhookAge = webhooks[0] ? Date.now() - webhooks[0].receivedAt : Infinity;
 
-  // If webhook is fresh (< 30 min old) and in valid range, use it
-  if (webhookClose && webhookClose > 20000 && webhookClose < 40000 && webhookAge < 30 * 60 * 1000) {
+  // If webhook is recent (< 6 hours old) and in valid range, use it
+  // 6 hours covers overnight/weekend gaps when market is closed
+  if (webhookClose && webhookClose > 20000 && webhookClose < 40000 && webhookAge < 6 * 60 * 60 * 1000) {
     console.log(`[LivePrice] Using webhook price: ${webhookClose} (age: ${Math.round(webhookAge/1000)}s)`);
     return webhookClose;
   }

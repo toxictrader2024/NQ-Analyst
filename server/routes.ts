@@ -274,7 +274,9 @@ Focus: ICT kill zone entries. Use the London sweep direction as confirmation. Lo
 
 CRITICAL RULES (never override these):
 - Current time: ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit', hour12: true })} CT / ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: true })} ET
-- Every price level (entry, stop, TP1, TP2, support, resistance) MUST be within 200 points of the live price of ${priceStr}. Never use prices from training data or memory.
+- The ONLY correct NQ price right now is ${priceStr}. Use this exact number whenever you write "Live Price", "Current Price", or any price reference.
+- Every price level (entry, stop, TP1, TP2, support, resistance) MUST be within 200 points of ${priceStr}. Never use prices from training data or memory.
+- Do NOT invent or estimate a different price. The price is ${priceStr}. Period.
 
 CURRENT MARKET DATA:
 - Instrument: NQ Futures (NQ1!)
