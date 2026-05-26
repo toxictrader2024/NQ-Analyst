@@ -11,6 +11,7 @@ import PersonalitySelector from "@/components/PersonalitySelector";
 import SessionToggle from "@/components/SessionToggle";
 import TradeLog from "@/components/TradeLog";
 import MuzziAnalyzer from "@/components/MuzziAnalyzer";
+import SimTradeLog from "@/components/SimTradeLog";
 import {
   RefreshCw, Zap, TrendingUp, TrendingDown, Minus,
   AlertTriangle, CheckCircle2, Clock, Loader2, FlaskConical,
@@ -37,7 +38,7 @@ interface DashboardData {
 }
 
 // Left-column tab switcher — ICT mode vs Muzzi Analyzer mode
-type LeftTab = "ict" | "muzzi";
+type LeftTab = "ict" | "muzzi" | "sim";
 
 export default function Dashboard() {
   const { toast } = useToast();
@@ -169,6 +170,12 @@ export default function Dashboard() {
               <Target className="w-3 h-3" />
               Muzzi Analyzer
             </button>
+              <button
+                onClick={() => setLeftTab("sim")}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${leftTab === "sim" ? "bg-primary text-primary-foreground" : "bg-secondary text-muted-foreground hover:text-foreground"}`}
+              >
+                <BarChart3 className="w-3 h-3" /> Sim P&L
+              </button>
           </div>
 
           {/* ── FEED STATUS BANNER ──────────────────────────────────────── */}
@@ -381,6 +388,20 @@ export default function Dashboard() {
           {/* ── MUZZI ANALYZER TAB ──────────────────────────────────────── */}
           {leftTab === "muzzi" && (
             <MuzziAnalyzer />
+          )}
+
+          {/* ── SIM P&L TAB ─────────────────────────────────────────────── */}
+          {leftTab === "sim" && (
+            <div className="flex flex-col gap-4">
+              <div>
+                <h2 className="text-sm font-semibold">Muzzi Sim P&L Tracker</h2>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Every Muzzi signal shadow-tracked against live price — no real orders.
+                  Add <span className="text-cyan-400 font-mono">NQ_Muzzi_Sim</span> to your NinjaTrader chart to start.
+                </p>
+              </div>
+              <SimTradeLog />
+            </div>
           )}
         </div>
 

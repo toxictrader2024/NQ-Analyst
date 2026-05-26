@@ -1032,7 +1032,101 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
   });
 
-    // ── GET /api/scorecard — Full scorecard history + stats ───────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+  // SIM TRADES — paper-tracking of every Muzzi signal (NQ_Muzzi_Sim.cs posts here)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  const simTrades: any[] = [];   // in-memory, max 500, newest first
+  const MAX_SIM = 500;
+
+  // POST /api/sim-trades — receive a sim trade open or update from NT
+  app.post("/api/sim-trades", (req, res) => {
+    try {
+      const trade = req.body;
+      if (!trade || !trade.id) return res.status(400).json({ error: "Missing trade id" });
+
+      // Upsert: update if id exists, insert if new
+      const idx = simTrades.findIndex(t => t.id === trade.id);
+      if (idx >= 0) {
+        simTrades[idx] = { ...simTrades[idx], ...trade, updatedAt: Date.now() };
+      } else {
+        simTrades.unshift({ ...trade, receivedAt: Date.now() });
+        if (simTrades.length > MAX_SIM) simTrades.splice(MAX_SIM);
+      }
+      return res.json({ ok: true });
+    } catch (err) {
+      return res.status(500).json({ error: "Failed to store sim trade" });
+    }
+  });
+
+  // GET /api/sim-trades — return trades + stats for dashboard
+  app.get("/api/sim-trades", (req, res) => {
+    try {
+      const limit = parseInt(String(req.query.limit ?? "100"));
+      const recent = simTrades.slice(0, limit);
+
+      // Stats — closed trades only
+      const closed = simTrades.filter(t => t.result && t.result !== "OPEN");
+      const wins   = closed.filter(t => t.result === "TP1" || t.result === "TP2");
+      const losses = closed.filter(t => t.result === "STOPPED");
+      const totalPnlPts = closed.reduce((s: number, t: any) => s + (t.pnlPoints ?? 0), 0);
+
+      // Stats by grade
+      const byGrade: Record<string, { wins: number; total: number; pnl: number }> = {};
+      for (const t of closed) {
+        const g = t.grade ?? "?";
+        if (!byGrade[g]) byGrade[g] = { wins: 0, total: 0, pnl: 0 };
+        byGrade[g].total++;
+        byGrade[g].pnl += t.pnlPoints ?? 0;
+        if (t.result === "TP1" || t.result === "TP2") byGrade[g].wins++;
+      }
+
+      // Stats by gravity score
+      const byGravity: Record<number, { wins: number; total: number; pnl: number }> = {};
+      for (const t of closed) {
+        const g = t.gravityScore ?? 0;
+        if (!byGravity[g]) byGravity[g] = { wins: 0, total: 0, pnl: 0 };
+        byGravity[g].total++;
+        byGravity[g].pnl += t.pnlPoints ?? 0;
+        if (t.result === "TP1" || t.result === "TP2") byGravity[g].wins++;
+      }
+
+      // Open trades
+      const open = simTrades.filter(t => t.result === "OPEN");
+
+      return res.json({
+        trades: recent,
+        open,
+        stats: {
+          total     : closed.length,
+          wins      : wins.length,
+          losses    : losses.length,
+          winRate   : closed.length ? Math.round(wins.length / closed.length * 100) : 0,
+          totalPnlPts: parseFloat(totalPnlPts.toFixed(2)),
+          totalPnlDollars: parseFloat((totalPnlPts * 20).toFixed(2)),
+          avgPnlPts : closed.length ? parseFloat((totalPnlPts / closed.length).toFixed(2)) : 0,
+          byGrade   : Object.entries(byGrade).map(([grade, d]) => ({
+            grade,
+            wins    : d.wins,
+            total   : d.total,
+            winRate : d.total ? Math.round(d.wins / d.total * 100) : 0,
+            pnl     : parseFloat(d.pnl.toFixed(2)),
+          })).sort((a, b) => b.winRate - a.winRate),
+          byGravity : Object.entries(byGravity).map(([g, d]) => ({
+            gravity : parseInt(g),
+            wins    : d.wins,
+            total   : d.total,
+            winRate : d.total ? Math.round(d.wins / d.total * 100) : 0,
+            pnl     : parseFloat(d.pnl.toFixed(2)),
+          })).sort((a, b) => a.gravity - b.gravity),
+        },
+      });
+    } catch (err) {
+      return res.status(500).json({ error: "Failed to load sim trades" });
+    }
+  });
+
+  // ── GET /api/scorecard — Full scorecard history + stats ───────────────────
   app.get("/api/scorecard", (req, res) => {
     const limit = parseInt(String(req.query.limit || "60"));
     const entries = storage.getRecentScorecard(limit);

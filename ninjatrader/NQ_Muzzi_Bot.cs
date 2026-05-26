@@ -843,9 +843,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             try
             {
-                Draw.Text(this, tag + labelIndex++, text, barsAgo, price,
-                    new SimpleFont("Arial", 10), TextAlignment.Center, color,
-                    Brushes.Transparent, 0);
+                Draw.Text(this, tag + labelIndex++, text, barsAgo, price, color);
             }
             catch { }
         }
