@@ -5,62 +5,162 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 
 const PINE_SCRIPT_TEMPLATE = `//@version=5
-indicator("NQ ICT Signals → Webhook", overlay=true)
+indicator("NQ Muzzi Signals → Webhook", overlay=true)
 
-// ══ Inputs ═══════════════════════════════════════════════
+// ══ Inputs ════════════════════════════════════════════════════════════════════
 webhook_url = input.string("YOUR_WEBHOOK_URL_HERE", "Webhook URL")
 ticker      = input.string("NQ1!", "Ticker")
 
-// ══ VWAP ══════════════════════════════════════════════════
-[v, _, _] = ta.vwap(high, low, close, volume)
+// ══ SESSION-ANCHORED VWAP ═════════════════════════════════════════════════════
+// All times in UTC. NQ futures sessions:
+//   RTH (Regular Trading Hours) = 13:30–20:00 UTC  (8:30am–3pm CT)
+//   Asia session                = 22:00–07:00 UTC  (5pm–2am CT previous day)
+//   London session              = 07:00–13:30 UTC  (2am–8:30am CT)
+//
+// VWAP is reset at the start of each session so it anchors correctly.
+// RTH VWAP resets at 13:30 UTC. Asia VWAP resets at 22:00 UTC.
+// London VWAP resets at 07:00 UTC.
+//
+// The active VWAP sent in the payload is whichever session is currently live.
 
-// ══ Kill Zones (CT timezone = UTC-5/6) ════════════════════
-utc_hour = hour(time, "UTC")
-london_open = (utc_hour >= 7 and utc_hour < 10)   // 2-5am CT
-ny_open     = (utc_hour >= 12 and utc_hour < 15)  // 7-10am CT
-ny_close    = (utc_hour >= 18 and utc_hour < 20)  // 1-3pm CT
-killzone = london_open ? "london_open" : ny_open ? "ny_open" : ny_close ? "ny_close" : ""
+utc_h = hour(time, "UTC")
+utc_m = minute(time, "UTC")
+utc_mins = utc_h * 60 + utc_m   // total minutes into the UTC day
 
-// ══ Market Structure (simplified BOS/CHoCH) ════════════════
+// Session boundary flags (fires true on the FIRST bar of each session)
+is_rth_start    = (utc_h == 13 and utc_m == 30)
+is_asia_start   = (utc_h == 22 and utc_m == 0)
+is_london_start = (utc_h == 7  and utc_m == 0)
+
+// ── RTH VWAP (anchored 13:30 UTC = 8:30am CT) ─────────────────────────────
+// Reset numerator/denominator at RTH open each day
+var float rth_num = 0.0
+var float rth_den = 0.0
+if is_rth_start
+    rth_num := 0.0
+    rth_den := 0.0
+typical_price = (high + low + close) / 3
+rth_num := rth_num + typical_price * volume
+rth_den := rth_den + volume
+rth_vwap = rth_den > 0 ? rth_num / rth_den : close
+
+// ── Asia VWAP (anchored 22:00 UTC = 5pm CT) ───────────────────────────────
+var float asia_num = 0.0
+var float asia_den = 0.0
+if is_asia_start
+    asia_num := 0.0
+    asia_den := 0.0
+asia_num := asia_num + typical_price * volume
+asia_den := asia_den + volume
+asia_vwap = asia_den > 0 ? asia_num / asia_den : close
+
+// ── London VWAP (anchored 07:00 UTC = 2am CT) ─────────────────────────────
+var float lon_num = 0.0
+var float lon_den = 0.0
+if is_london_start
+    lon_num := 0.0
+    lon_den := 0.0
+lon_num := lon_num + typical_price * volume
+lon_den := lon_den + volume
+lon_vwap = lon_den > 0 ? lon_num / lon_den : close
+
+// ── Pick the active session VWAP ──────────────────────────────────────────
+// RTH: 13:30–20:00 UTC | London: 07:00–13:30 UTC | Asia: 22:00–07:00 UTC
+is_rth    = (utc_mins >= 810 and utc_mins < 1200)   // 13:30–20:00
+is_london = (utc_mins >= 420 and utc_mins < 810)    // 07:00–13:30
+is_asia   = (utc_mins >= 1320 or utc_mins < 420)    // 22:00–07:00 (wraps midnight)
+
+// Active VWAP = RTH for NY, London for London, Asia for Asia
+active_vwap = is_rth ? rth_vwap : is_london ? lon_vwap : asia_vwap
+active_session_name = is_rth ? "RTH" : is_london ? "London" : "Asia"
+
+// Plot all three for visual reference
+plot(rth_vwap,    title="RTH VWAP",    color=color.new(color.blue,   20), linewidth=2)
+plot(lon_vwap,    title="London VWAP", color=color.new(color.orange,  30), linewidth=1)
+plot(asia_vwap,   title="Asia VWAP",   color=color.new(color.purple,  40), linewidth=1)
+
+// ══ KILL ZONES ════════════════════════════════════════════════════════════════
+// Muzzi kill zones in UTC:
+//   London Open: 07:00–10:00 UTC (2–5am CT)
+//   NY Open:     13:30–16:00 UTC (8:30–11am CT)  ← primary
+//   NY PM:       18:30–19:30 UTC (1:30–2:30pm CT) ← secondary
+//   Asia:        22:00–00:00 UTC (5–7pm CT)
+kz_london  = (utc_mins >= 420  and utc_mins < 600)    // 07:00–10:00
+kz_ny_open = (utc_mins >= 810  and utc_mins < 960)    // 13:30–16:00
+kz_ny_pm   = (utc_mins >= 1110 and utc_mins < 1170)   // 18:30–19:30
+kz_asia    = (utc_mins >= 1320 or  utc_mins < 120)    // 22:00–02:00
+
+// Wrecking Ball: 13:30–13:35 UTC (09:30–09:35 ET) — flag but DO NOT trade
+wrecking_ball = (utc_h == 13 and utc_m >= 30 and utc_m <= 35)
+
+killzone_str = kz_ny_open and not wrecking_ball ? "ny_open" :
+               kz_london  ? "london_open" :
+               kz_ny_pm   ? "ny_pm" :
+               kz_asia    ? "asia" :
+               wrecking_ball ? "wrecking_ball" : ""
+
+// ══ MARKET STRUCTURE (BOS / CHOCH) ════════════════════════════════════════════
 swing_hi = ta.pivothigh(high, 5, 5)
-swing_lo  = ta.pivotlow(low, 5, 5)
+swing_lo  = ta.pivotlow(low,  5, 5)
 prev_hi   = ta.valuewhen(not na(swing_hi), swing_hi, 0)
 prev_lo   = ta.valuewhen(not na(swing_lo), swing_lo, 0)
-ms = close > prev_hi ? "BOS_bull" : close < prev_lo ? "BOS_bear" : ""
+ms_str    = close > prev_hi ? "BOS_bull" : close < prev_lo ? "BOS_bear" : ""
 
-// ══ Fair Value Gaps ════════════════════════════════════════
+// ══ FAIR VALUE GAPS ════════════════════════════════════════════════════════════
 fvg_bull = low > high[2] and close[1] > high[2]
 fvg_bear = high < low[2] and close[1] < low[2]
 
-// ══ Liquidity Sweeps ══════════════════════════════════════
-sweep_hi = high > ta.highest(high[1], 20)[1] and close < ta.highest(high[1], 20)[1]
-sweep_lo = low < ta.lowest(low[1], 20)[1] and close > ta.lowest(low[1], 20)[1]
+// ══ LIQUIDITY SWEEPS ══════════════════════════════════════════════════════════
+// Use session high/low of last 20 bars (tighter than arbitrary 20-bar lookback)
+sweep_hi = high > ta.highest(high[1], 20) and close < ta.highest(high[1], 20)
+sweep_lo = low  < ta.lowest(low[1],  20) and close > ta.lowest(low[1],  20)
 
-// ══ Premium / Discount (equilibrium midpoint) ══════════════
+// ══ PREMIUM / DISCOUNT (dealing range) ════════════════════════════════════════
+// 50-bar dealing range — equilibrium at 0.5
 range_hi = ta.highest(high, 50)
-range_lo  = ta.lowest(low, 50)
-eq        = (range_hi + range_lo) / 2
-premium  = close > eq
-discount = close < eq
+range_lo  = ta.lowest(low,  50)
+eq        = (range_hi + range_lo) / 2.0
+premium   = close > eq
+discount  = close < eq
 
-// ══ Webhook payload ═══════════════════════════════════════
+// ══ VWAP STANDARD DEVIATIONS (for extended targets) ══════════════════════════
+// 1SD above/below active VWAP — marks extended zones
+var float sq_sum = 0.0
+var float sq_den = 0.0
+if is_rth_start or is_london_start or is_asia_start
+    sq_sum := 0.0
+    sq_den := 0.0
+sq_sum := sq_sum + math.pow(typical_price - active_vwap, 2) * volume
+sq_den := sq_den + volume
+vwap_sd = sq_den > 0 ? math.sqrt(sq_sum / sq_den) : 0.0
+vwap_1sd_hi = active_vwap + vwap_sd
+vwap_1sd_lo = active_vwap - vwap_sd
+
+// ══ WEBHOOK PAYLOAD ════════════════════════════════════════════════════════════
 if barstate.isconfirmed
-    payload = '{"ticker":"' + ticker + '",' +
-              '"timeframe":"' + str.tostring(timeframe.period) + '",' +
-              '"open":' + str.tostring(open) + ',' +
-              '"high":' + str.tostring(high) + ',' +
-              '"low":' + str.tostring(low) + ',' +
-              '"close":' + str.tostring(close) + ',' +
-              '"volume":' + str.tostring(volume) + ',' +
-              '"vwap":' + str.tostring(v) + ',' +
-              '"killzone":"' + killzone + '",' +
-              '"market_structure":"' + ms + '",' +
-              '"fvg_bull":' + (fvg_bull ? "1" : "0") + ',' +
-              '"fvg_bear":' + (fvg_bear ? "1" : "0") + ',' +
-              '"sweep_high":' + (sweep_hi ? "1" : "0") + ',' +
-              '"sweep_low":' + (sweep_lo ? "1" : "0") + ',' +
-              '"premium":' + (premium ? "1" : "0") + ',' +
-              '"discount":' + (discount ? "1" : "0") + '}'
+    payload = '{"ticker":"'       + ticker                              + '",' +
+              '"timeframe":'      + '"' + str.tostring(timeframe.period) + '",' +
+              '"open":'           + str.tostring(open)                  + ',' +
+              '"high":'           + str.tostring(high)                  + ',' +
+              '"low":'            + str.tostring(low)                   + ',' +
+              '"close":'          + str.tostring(close)                 + ',' +
+              '"volume":'         + str.tostring(volume)                + ',' +
+              '"vwap":'           + str.tostring(active_vwap)           + ',' +
+              '"vwap_rth":'       + str.tostring(rth_vwap)              + ',' +
+              '"vwap_london":'    + str.tostring(lon_vwap)              + ',' +
+              '"vwap_asia":'      + str.tostring(asia_vwap)             + ',' +
+              '"vwap_1sd_hi":'    + str.tostring(vwap_1sd_hi)           + ',' +
+              '"vwap_1sd_lo":'    + str.tostring(vwap_1sd_lo)           + ',' +
+              '"active_session":"'+ active_session_name                 + '",' +
+              '"killzone":"'      + killzone_str                        + '",' +
+              '"wrecking_ball":'  + (wrecking_ball ? "1" : "0")         + ',' +
+              '"market_structure":"' + ms_str                           + '",' +
+              '"fvg_bull":'       + (fvg_bull  ? "1" : "0")            + ',' +
+              '"fvg_bear":'       + (fvg_bear  ? "1" : "0")            + ',' +
+              '"sweep_high":'     + (sweep_hi  ? "1" : "0")            + ',' +
+              '"sweep_low":'      + (sweep_lo  ? "1" : "0")            + ',' +
+              '"premium":'        + (premium   ? "1" : "0")            + ',' +
+              '"discount":'       + (discount  ? "1" : "0")            + '}'
     alert(payload, alert.freq_once_per_bar_close)`;
 
 export default function Setup() {
@@ -166,14 +266,18 @@ export default function Setup() {
               </thead>
               <tbody className="divide-y divide-border">
                 {[
-                  ["Kill Zone active", "killzone", "+15 pts (shared bull/bear)"],
-                  ["Market Structure BOS/CHoCH", "market_structure", "+20 pts dominant side"],
-                  ["Fair Value Gap", "fvg_bull / fvg_bear", "+15 pts"],
-                  ["Order Block", "ob_bull / ob_bear", "+12 pts"],
-                  ["Liquidity Sweep", "sweep_high / sweep_low", "+18 pts"],
-                  ["Premium/Discount Zone", "premium / discount", "+12 pts"],
-                  ["VWAP relationship", "vwap + close", "+8 pts"],
-                  ["Multi-bar structure trend", "auto-calculated", "+10 pts"],
+                  ["Active Session VWAP",     "vwap",            "Session-anchored: RTH/London/Asia"],
+                  ["RTH VWAP (8:30am CT)",    "vwap_rth",        "Resets at 8:30am CT every day"],
+                  ["London VWAP (2am CT)",     "vwap_london",     "Resets at 2am CT"],
+                  ["Asia VWAP (5pm CT)",       "vwap_asia",       "Resets at 5pm CT"],
+                  ["VWAP ±1SD bands",          "vwap_1sd_hi/lo",  "Extension targets / reversal zones"],
+                  ["Active session name",      "active_session",  "RTH | London | Asia"],
+                  ["Kill Zone",               "killzone",         "ny_open / london_open / ny_pm / asia"],
+                  ["Wrecking Ball flag",       "wrecking_ball",   "1 = 09:30–09:35 NY — NO entry"],
+                  ["Market Structure",        "market_structure", "BOS_bull / BOS_bear"],
+                  ["Fair Value Gap",          "fvg_bull/fvg_bear","1 = FVG present"],
+                  ["Liquidity Sweep",         "sweep_high/low",   "1 = session H/L swept"],
+                  ["Premium / Discount Zone", "premium/discount", "1 = price above/below EQ"],
                 ].map(([sig, key, pts]) => (
                   <tr key={sig}>
                     <td className="py-2 pr-6 text-foreground">{sig}</td>
