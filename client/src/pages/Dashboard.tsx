@@ -27,6 +27,13 @@ interface DashboardData {
   latestAnalysis: any;
   recentAnalyses: any[];
   totalSignals: number;
+  // Feed freshness
+  tvFresh?: boolean;
+  scFresh?: boolean;
+  tvAgeMin?: number | null;
+  scAgeMin?: number | null;
+  hasTVData?: boolean;
+  hasSCData?: boolean;
 }
 
 // Left-column tab switcher — ICT mode vs Muzzi Analyzer mode
@@ -70,6 +77,14 @@ export default function Dashboard() {
 
   const d = data!;
   const lw = d.latestWebhook;
+  // Feed status
+  const tvFresh  = d.tvFresh  ?? false;
+  const scFresh  = d.scFresh  ?? false;
+  const tvAgeMin = d.tvAgeMin ?? null;
+  const scAgeMin = d.scAgeMin ?? null;
+  const hasTVData = d.hasTVData ?? !!lw?.killzone;
+  const hasSCData = d.hasSCData ?? false;
+  const feedOk = tvFresh || scFresh;
   // Don't show analyses older than 4 hours — stale data causes price confusion
   const MAX_ANALYSIS_AGE_MS = 4 * 60 * 60 * 1000;
   const rawLa = d.latestAnalysis;
@@ -155,6 +170,33 @@ export default function Dashboard() {
               Muzzi Analyzer
             </button>
           </div>
+
+          {/* ── FEED STATUS BANNER ──────────────────────────────────────── */}
+          {!feedOk && (
+            <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl px-4 py-3 flex items-start gap-2.5">
+              <AlertTriangle className="w-4 h-4 text-yellow-500 flex-shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <p className="text-xs font-semibold text-yellow-400">FEED STATUS</p>
+                <p className="text-xs text-yellow-300/80 mt-0.5 leading-relaxed">
+                  {!tvFresh && (
+                    <span>
+                      {hasTVData
+                        ? `TradingView last seen ${tvAgeMin}m ago — check your NQ1! alert is active. `
+                        : "TradingView not connected — add the Pine Script alert pointing to your webhook URL. "}
+                    </span>
+                  )}
+                  {!scFresh && (
+                    <span>
+                      {hasSCData
+                        ? `Sierra Chart last seen ${scAgeMin}m ago — confirm NQ Analyst Bridge study is running. `
+                        : "Sierra Chart not connected — ensure the bridge study is active. "}
+                    </span>
+                  )}
+                  Analysis is anchored to live NQ price.
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* ── ICT TAB ─────────────────────────────────────────────────── */}
           {leftTab === "ict" && (

@@ -8,6 +8,13 @@ import Anthropic from "@anthropic-ai/sdk";
 import { detectTriggers, generateCommentary, updateState } from "./commentaryEngine";
 import { getPersonality, setPersonality, isTrashTalk, buildVwapRel, type MarketContext, type PersonalityId } from "./personalities";
 import {
+  buildMuzziSignal,
+  recordTrade,
+  getInsights,
+  getWeights,
+  getRecentLearningEntries,
+} from "./learningKernel";
+import {
   evaluateSignal,
   clearExpiredSignals,
   getPendingSignal,
@@ -32,6 +39,9 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   warnings: string[];
   hasOrderFlow: boolean;
   tvLatest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;
+  tv15Latest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;
+  tv5Latest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;
+  tv1Latest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;
   scLatest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;
   tvFresh: boolean;
   scFresh: boolean;
@@ -46,14 +56,29 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   let ofBullPoints = 0;
   let ofBearPoints = 0;
 
-  // Split streams — ICT data from TradingView, order flow from Sierra Chart
+  // ── Split streams ──────────────────────────────────────────────────────────
+  // TradingView sends ICT signals; Sierra Chart sends order flow.
+  // Within TradingView we further split by timeframe:
+  //   15m → session bias (trend direction)
+  //   5m  → setup confirmation (structure / FVG / OB)
+  //   1m  → trigger execution (MSS, delta flip, 3-bar play)
   const tvWebhooks = webhooks.filter(w => w.source === 'tradingview' || (!w.source && w.killzone !== null));
   const scWebhooks = webhooks.filter(w => w.source === 'sierra_chart' || w.source === 'bookmap_cme');
 
-  // Use most recent TradingView webhook for ICT signals (up to 30 min old)
-  const tvLatest = tvWebhooks[0] ?? null;
+  // Timeframe sub-streams from TradingView
+  const tv15 = tvWebhooks.filter(w => String(w.timeframe) === "15" || String(w.timeframe) === "15m");
+  const tv5  = tvWebhooks.filter(w => String(w.timeframe) === "5"  || String(w.timeframe) === "5m");
+  const tv1  = tvWebhooks.filter(w => String(w.timeframe) === "1"  || String(w.timeframe) === "1m");
+
+  // Most recent per timeframe (fall back to general tvWebhooks if specific TF absent)
+  const tv15Latest = tv15[0] ?? null;
+  const tv5Latest  = tv5[0]  ?? null;
+  const tv1Latest  = tv1[0]  ?? null;
+
+  // tvLatest = best available for general ICT scoring (prefer 5m for setup, fall back to 15m)
+  const tvLatest = tv5Latest ?? tv15Latest ?? tvWebhooks[0] ?? null;
   const tvAge = tvLatest ? Date.now() - tvLatest.receivedAt : Infinity;
-  const tvFresh = tvAge < 30 * 60 * 1000; // 30 min
+  const tvFresh = tvAge < 4 * 60 * 60 * 1000; // 4 hours — TV only fires on bar close, may be silent between sessions
 
   // Use most recent Sierra Chart webhook for order flow (up to 5 min old)
   const scLatest = scWebhooks[0] ?? null;
@@ -63,12 +88,16 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   // Price: prefer SC (most current tick), fall back to TV
   const priceSource = scLatest ?? tvLatest ?? webhooks[0];
 
-  if (!priceSource) return { score: 0, ictScore: 0, orderFlowScore: 0, bias: "NEUTRAL", confluences: ["No data received yet"], orderFlowConfluences: [], warnings: [], hasOrderFlow: false, tvLatest: null, scLatest: null, tvFresh: false, scFresh: false, tvAge: Infinity, scAge: Infinity };
+  if (!priceSource) return { score: 0, ictScore: 0, orderFlowScore: 0, bias: "NEUTRAL", confluences: ["No data received yet"], orderFlowConfluences: [], warnings: [], hasOrderFlow: false, tvLatest: null, tv15Latest: null, tv5Latest: null, tv1Latest: null, scLatest: null, tvFresh: false, scFresh: false, tvAge: Infinity, scAge: Infinity };
 
   // ── ICT Signals (from TradingView) ─────────────────────────────────────────
 
   if (!tvFresh) {
-    warnings.push("TradingView ICT signals stale (>30min) — order flow only");
+    const tvAgeHours = tvAge === Infinity ? null : (tvAge / 3600000).toFixed(1);
+    warnings.push(tvAgeHours
+      ? `TradingView ICT signals stale (${tvAgeHours}h) — check TV alert is active on your NQ chart`
+      : "TradingView ICT signals not received — check TV alert is active and pointing to webhook URL"
+    );
   }
 
   // Killzone check
@@ -81,28 +110,56 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
     warnings.push("No active killzone — off-session trade");
   }
 
-  // Market structure
-  if (tvLatest?.marketStructure) {
-    if (tvLatest.marketStructure.includes("bull")) {
-      confluences.push(`Bullish Market Structure: ${tvLatest.marketStructure.replace(/_/g, " ").toUpperCase()}`);
-      bullPoints += 20;
-    } else if (tvLatest.marketStructure.includes("bear")) {
-      confluences.push(`Bearish Market Structure: ${tvLatest.marketStructure.replace(/_/g, " ").toUpperCase()}`);
-      bearPoints += 20;
+  // Market structure — 15m drives bias (highest weight), 5m confirms setup
+  // 15m bias: strongest signal — session direction
+  const ms15 = tv15Latest?.marketStructure || "";
+  if (ms15) {
+    if (ms15.includes("bull")) {
+      confluences.push(`15m Bullish Structure: ${ms15.replace(/_/g, " ").toUpperCase()} — session bias LONG`);
+      bullPoints += 25;
+    } else if (ms15.includes("bear")) {
+      confluences.push(`15m Bearish Structure: ${ms15.replace(/_/g, " ").toUpperCase()} — session bias SHORT`);
+      bearPoints += 25;
     }
   }
+  // 5m setup: confirms the trade structure
+  const ms5 = tv5Latest?.marketStructure || "";
+  if (ms5) {
+    if (ms5.includes("bull")) {
+      confluences.push(`5m Bullish Setup: ${ms5.replace(/_/g, " ").toUpperCase()} — entry structure confirmed`);
+      bullPoints += 18;
+    } else if (ms5.includes("bear")) {
+      confluences.push(`5m Bearish Setup: ${ms5.replace(/_/g, " ").toUpperCase()} — entry structure confirmed`);
+      bearPoints += 18;
+    }
+  }
+  // 1m trigger: execution-level MSS (lighter weight — confirmation only)
+  const ms1 = tv1Latest?.marketStructure || tvLatest?.marketStructure || "";
+  if (ms1 && !ms15 && !ms5) {
+    // Only use 1m if no higher TF data present
+    if (ms1.includes("bull")) { confluences.push(`1m Bullish Trigger: ${ms1.replace(/_/g, " ").toUpperCase()}`); bullPoints += 12; }
+    else if (ms1.includes("bear")) { confluences.push(`1m Bearish Trigger: ${ms1.replace(/_/g, " ").toUpperCase()}`); bearPoints += 12; }
+  }
 
-  // FVG
-  if (tvLatest?.fvgBull) { confluences.push("Bullish Fair Value Gap present"); bullPoints += 15; }
-  if (tvLatest?.fvgBear) { confluences.push("Bearish Fair Value Gap present"); bearPoints += 15; }
+  // FVG — prefer 5m (setup timeframe) then fall back to latest
+  const fvgSrc = tv5Latest ?? tvLatest;
+  if (fvgSrc?.fvgBull) { confluences.push("5m Bullish Fair Value Gap — setup zone active"); bullPoints += 15; }
+  if (fvgSrc?.fvgBear) { confluences.push("5m Bearish Fair Value Gap — setup zone active"); bearPoints += 15; }
+  // 1m FVG as additional confluence (not primary)
+  if (tv1Latest?.fvgBull && !fvgSrc?.fvgBull) { confluences.push("1m Bullish FVG — trigger-level gap"); bullPoints += 8; }
+  if (tv1Latest?.fvgBear && !fvgSrc?.fvgBear) { confluences.push("1m Bearish FVG — trigger-level gap"); bearPoints += 8; }
 
-  // Order Blocks
-  if (tvLatest?.obBull) { confluences.push("Bullish Order Block in range"); bullPoints += 12; }
-  if (tvLatest?.obBear) { confluences.push("Bearish Order Block in range"); bearPoints += 12; }
+  // Order Blocks — 5m OBs carry more weight than 1m
+  if (fvgSrc?.obBull) { confluences.push("5m Bullish Order Block in range"); bullPoints += 12; }
+  if (fvgSrc?.obBear) { confluences.push("5m Bearish Order Block in range"); bearPoints += 12; }
 
-  // Liquidity sweeps
-  if (tvLatest?.sweepLow) { confluences.push("Recent low swept — bullish setup likely"); bullPoints += 18; }
-  if (tvLatest?.sweepHigh) { confluences.push("Recent high swept — bearish setup likely"); bearPoints += 18; }
+  // Liquidity sweeps — 15m sweep = manipulation leg complete (highest confidence)
+  const sweepSrc = tv15Latest ?? tvLatest;
+  if (sweepSrc?.sweepLow)  { confluences.push("15m Low swept — Manipulation leg done, bullish reversal likely"); bullPoints += 20; }
+  if (sweepSrc?.sweepHigh) { confluences.push("15m High swept — Manipulation leg done, bearish reversal likely"); bearPoints += 20; }
+  // 5m sweeps also valid
+  if (tv5Latest?.sweepLow  && !sweepSrc?.sweepLow)  { confluences.push("5m Low swept — Turtle Soup setup possible"); bullPoints += 14; }
+  if (tv5Latest?.sweepHigh && !sweepSrc?.sweepHigh) { confluences.push("5m High swept — Silver Bullet fade possible"); bearPoints += 14; }
 
   // Premium / Discount
   if (tvLatest?.discount) { confluences.push("Price in discount zone (below EQ) — long bias"); bullPoints += 12; }
@@ -115,11 +172,17 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
     else { confluences.push("Price below VWAP — bearish intraday"); bearPoints += 8; }
   }
 
-  // Trend consistency across recent TradingView bars
-  const bullBars = tvWebhooks.filter(w => (w.marketStructure || "").includes("bull")).length;
-  const bearBars = tvWebhooks.filter(w => (w.marketStructure || "").includes("bear")).length;
-  if (bullBars > bearBars + 2) { confluences.push("Consistent bullish structure (multi-bar)"); bullPoints += 10; }
-  if (bearBars > bullBars + 2) { confluences.push("Consistent bearish structure (multi-bar)"); bearPoints += 10; }
+  // Trend consistency — weight by timeframe cascade
+  // 15m consistency = strongest (multiple 15m bars bullish = confirmed bias)
+  const bull15 = tv15.filter(w => (w.marketStructure || "").includes("bull")).length;
+  const bear15 = tv15.filter(w => (w.marketStructure || "").includes("bear")).length;
+  if (bull15 >= 2) { confluences.push(`${bull15}x 15m bullish bars — strong session bias LONG`);  bullPoints += 15; }
+  if (bear15 >= 2) { confluences.push(`${bear15}x 15m bearish bars — strong session bias SHORT`); bearPoints += 15; }
+  // 5m consistency = setup confirmation
+  const bull5 = tv5.filter(w => (w.marketStructure || "").includes("bull")).length;
+  const bear5 = tv5.filter(w => (w.marketStructure || "").includes("bear")).length;
+  if (bull5 >= 2) { confluences.push(`${bull5}x 5m bullish bars — setup structure confirmed`);  bullPoints += 10; }
+  if (bear5 >= 2) { confluences.push(`${bear5}x 5m bearish bars — setup structure confirmed`); bearPoints += 10; }
 
   // ── Order Flow Signals (Sierra Chart / Bookmap CME) ────────────────────────
   const hasOrderFlow = scFresh && !!scLatest;
@@ -226,7 +289,7 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   const ictScore = Math.min(100, Math.round((Math.max(bullPoints - ofBullPoints, bearPoints - ofBearPoints) / ictMax) * 100));
   const orderFlowScore = hasOrderFlow ? Math.min(100, Math.round((Math.max(ofBullPoints, ofBearPoints) / ofMax) * 100)) : 0;
 
-  return { score, ictScore, orderFlowScore, bias, confluences, orderFlowConfluences, warnings, hasOrderFlow, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge };
+  return { score, ictScore, orderFlowScore, bias, confluences, orderFlowConfluences, warnings, hasOrderFlow, tvLatest, tv15Latest, tv5Latest, tv1Latest, scLatest, tvFresh, scFresh, tvAge, scAge };
 }
 
 // ── Build AI context prompt ──────────────────────────────────────────────────
@@ -567,10 +630,17 @@ export function registerRoutes(httpServer: Server, app: Express) {
     const webhooks = storage.getRecentWebhooks(20);
     const latestAnalysis = storage.getLatestAnalysis();
     const recentAnalyses = storage.getRecentAnalyses(5);
-    const { score, ictScore, bias, confluences, warnings } = scoreSetup(webhooks);
+    const { score, ictScore, bias, confluences, warnings, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge } = scoreSetup(webhooks);
+
+    // latestWebhook for MuzziAnalyzer — prefer tvLatest (has ICT fields) over SC (order flow only)
+    // Fall back to any non-bookmap webhook if TV hasn't sent yet
+    const latestWebhook = tvLatest ?? webhooks.find((w: any) => w.source !== "bookmap_cme") ?? null;
+
+    const tvAgeMin = tvAge !== Infinity ? Math.round(tvAge / 60000) : null;
+    const scAgeMin = scAge !== Infinity ? Math.round(scAge / 60000) : null;
 
     return res.json({
-      latestWebhook: webhooks.find((w: any) => w.source !== "bookmap_cme") || null,
+      latestWebhook,
       score,
       ictScore,
       bias,
@@ -579,6 +649,13 @@ export function registerRoutes(httpServer: Server, app: Express) {
       latestAnalysis,
       recentAnalyses,
       totalSignals: webhooks.length,
+      // Feed freshness — used by dashboard status banner
+      tvFresh,
+      scFresh,
+      tvAgeMin,   // minutes since last TV webhook (null = never received)
+      scAgeMin,   // minutes since last SC webhook
+      hasTVData: !!tvLatest,
+      hasSCData: !!scLatest,
     });
   });
 
@@ -895,7 +972,67 @@ export function registerRoutes(httpServer: Server, app: Express) {
     return res.json({ url: `${proto}://${host}/api/webhook` });
   });
 
-  // ── GET /api/scorecard — Full scorecard history + stats ───────────────────
+  // ── GET /api/muzzi-signal — Muzzi checklist evaluation for NinjaTrader bot ──
+  app.get("/api/muzzi-signal", (_req, res) => {
+    try {
+      const freshWebhooks = storage.getRecentWebhooks(20);
+      const scored = scoreSetup(freshWebhooks);
+      const { tvLatest, scLatest, bias } = scored as any;
+
+      if (!tvLatest && !scLatest) {
+        return res.json({ direction: "WAIT", grade: "WAIT", coachingNote: "No live data — both TradingView and Sierra Chart feeds are silent." });
+      }
+
+      const mergedData = {
+        tv  : tvLatest  || {},
+        tv15: (scored as any).tv15Latest || null,
+        tv5 : (scored as any).tv5Latest  || null,
+        tv1 : (scored as any).tv1Latest  || null,
+        sc  : scLatest  || {},
+        bias: bias       || "NEUTRAL",
+      };
+
+      const muzziSig = buildMuzziSignal(mergedData);
+      if (!muzziSig) {
+        return res.json({ direction: "WAIT", grade: "WAIT", coachingNote: "Insufficient market data for Muzzi evaluation." });
+      }
+
+      return res.json(muzziSig);
+    } catch (err) {
+      console.error("[muzzi-signal] Error:", err);
+      return res.status(500).json({ error: "Muzzi signal evaluation failed" });
+    }
+  });
+
+  // ── POST /api/learning-kernel/feed — Receive completed trade result from NT bot ──
+  app.post("/api/learning-kernel/feed", (req, res) => {
+    try {
+      const entry = req.body;
+      if (!entry || !entry.signalId) {
+        return res.status(400).json({ error: "Missing signalId in payload" });
+      }
+      recordTrade(entry);
+      return res.json({ ok: true, message: "Learning kernel updated" });
+    } catch (err) {
+      console.error("[learning-kernel/feed] Error:", err);
+      return res.status(500).json({ error: "Failed to record trade in learning kernel" });
+    }
+  });
+
+  // ── GET /api/learning-kernel/insights — Win rates, feature weights, recent trades ──
+  app.get("/api/learning-kernel/insights", (_req, res) => {
+    try {
+      return res.json({
+        insights: getInsights(),
+        weights : getWeights(),
+        recent  : getRecentLearningEntries(20),
+      });
+    } catch (err) {
+      return res.status(500).json({ error: "Failed to load learning kernel insights" });
+    }
+  });
+
+    // ── GET /api/scorecard — Full scorecard history + stats ───────────────────
   app.get("/api/scorecard", (req, res) => {
     const limit = parseInt(String(req.query.limit || "60"));
     const entries = storage.getRecentScorecard(limit);
