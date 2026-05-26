@@ -1,0 +1,10 @@
+{
+  "phases": {
+    "install": {
+      "cmds": ["npm install --production"]
+    }
+  },
+  "start": {
+    "cmd": "NODE_ENV=production node dist/index.cjs"
+  }
+}

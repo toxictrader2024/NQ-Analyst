@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+
+[phases.install]
+cmds = ["npm install --omit=dev"]
+
+[phases.build]
+cmds = []
+
+[start]
+cmd = "NODE_ENV=production node dist/index.cjs"

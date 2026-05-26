@@ -1,0 +1,568 @@
+//@version=5
+indicator("NQ ICT Signals v3", overlay=true, max_bars_back=500, max_boxes_count=400, max_labels_count=400, max_lines_count=100)
+
+// ══ Inputs ════════════════════════════════════════════════
+ticker       = input.string("NQ1!", "Ticker")
+fvg_extend   = input.int(60,  "FVG Extend (bars)",    minval=1)
+ob_extend    = input.int(60,  "OB Extend (bars)",     minval=1)
+ob_lookback  = input.int(10,  "OB Lookback",          minval=3, maxval=50)
+delta_len    = input.int(3,   "Delta Block Length",   minval=2, maxval=10)
+show_fvg     = input.bool(true, "Show FVGs / IFVGs")
+show_ob      = input.bool(true, "Show Order Blocks / Breakers")
+show_delta   = input.bool(true, "Show Delta Blocks")
+show_ote     = input.bool(true, "Show OTE Zone")
+show_struct  = input.bool(true, "Show Structure (HH/HL/LH/LL)")
+show_cisd    = input.bool(true, "Show CISD")
+show_sweep   = input.bool(true, "Show Sweeps / SFP")
+show_kz      = input.bool(true, "Show Kill Zones")
+show_signals = input.bool(true, "Show BUY/SELL Signals")
+
+// ══ Signal Confluence Thresholds ══════════════════════════
+// A signal fires when enough confluences align in a killzone
+min_conf_long  = input.int(2, "Min Confluences for LONG",  minval=1, maxval=5, tooltip="How many ICT confluences required for a long signal")
+min_conf_short = input.int(2, "Min Confluences for SHORT", minval=1, maxval=5, tooltip="How many ICT confluences required for a short signal")
+
+// ══ Colors ════════════════════════════════════════════════
+col_fvg_bull     = color.new(color.green,  80)
+col_fvg_bear     = color.new(color.red,    80)
+col_ifvg_bull    = color.new(color.red,    80)   // bull FVG mitigated → red IFVG
+col_ifvg_bear    = color.new(color.green,  80)   // bear FVG mitigated → green IFVG
+col_ob_bull      = color.new(color.teal,   70)
+col_ob_bear      = color.new(color.red,    70)
+col_bb_bull      = color.new(color.red,    70)   // bull OB broken → breaker
+col_bb_bear      = color.new(color.green,  70)   // bear OB broken → breaker
+col_delta_bull   = color.new(color.teal,   65)
+col_delta_bear   = color.new(color.red,    65)
+
+// ══ Kill Zones ════════════════════════════════════════════
+utc_hour    = hour(time, "UTC")
+// Asia AMD: 11pm–2am UTC (6pm–9pm ET)
+asia_sess   = utc_hour >= 23 or utc_hour < 2
+// London KZ: 7am–10am UTC (2am–5am ET) — Asia sweep + Silver Bullet
+london_open = utc_hour >= 7  and utc_hour < 10
+// NY Open KZ: 1:30pm–4pm UTC (8:30am–11am ET)
+ny_open     = utc_hour >= 13 and utc_hour < 16
+// NY Close KZ: 6pm–8pm UTC (1pm–3pm ET)
+ny_close    = utc_hour >= 18 and utc_hour < 20
+
+in_killzone = london_open or ny_open or ny_close
+
+bgcolor(show_kz and asia_sess   ? color.new(color.purple, 93) : na, title="Asia AMD")
+bgcolor(show_kz and london_open ? color.new(color.blue,   93) : na, title="London KZ")
+bgcolor(show_kz and ny_open     ? color.new(color.green,  93) : na, title="NY Open KZ")
+bgcolor(show_kz and ny_close    ? color.new(color.orange, 93) : na, title="NY Close KZ")
+
+killzone = asia_sess ? "asia" : london_open ? "london_open" : ny_open ? "ny_open" : ny_close ? "ny_close" : ""
+
+// ══ Multi-Timeframe Bias (15m = bias, 5m = setup, 1m = trigger) ══════════
+// Fetch 15m market structure shift regardless of chart timeframe
+// so every webhook (1m or 5m chart) also carries the session bias
+htf_close  = request.security(syminfo.tickerid, "15", close,      lookahead=barmerge.lookahead_off)
+htf_high   = request.security(syminfo.tickerid, "15", high,       lookahead=barmerge.lookahead_off)
+htf_low    = request.security(syminfo.tickerid, "15", low,        lookahead=barmerge.lookahead_off)
+htf_ph     = request.security(syminfo.tickerid, "15", ta.pivothigh(high, 5, 5), lookahead=barmerge.lookahead_off)
+htf_pl     = request.security(syminfo.tickerid, "15", ta.pivotlow(low,   5, 5), lookahead=barmerge.lookahead_off)
+
+// 15m bias: price above recent 15m high = bullish, below recent 15m low = bearish
+var float htf_prev_hi = na
+var float htf_prev_lo = na
+if not na(htf_ph)
+    htf_prev_hi := htf_ph
+if not na(htf_pl)
+    htf_prev_lo := htf_pl
+
+htf_bias = na(htf_prev_hi) or na(htf_prev_lo) ? "neutral" :
+     htf_close > htf_prev_hi ? "bullish" :
+     htf_close < htf_prev_lo ? "bearish" : "neutral"
+
+// 15m EQ and zone
+htf_eq     = na(htf_prev_hi) or na(htf_prev_lo) ? close : (htf_prev_hi + htf_prev_lo) / 2
+htf_prem   = htf_close > htf_eq ? 1 : 0
+htf_disc   = htf_close < htf_eq ? 1 : 0
+
+// Label this bar's timeframe so the server can route to the correct tier
+bar_tf = timeframe.period   // "1", "5", or "15" depending on chart
+
+// ══ VWAP + 2 Std Dev Bands ════════════════════════════════
+v       = ta.vwap(close)
+v_src   = (high + low + close) / 3
+v_dev   = ta.stdev(v_src, 20)
+v_upper = v + 2 * v_dev
+v_lower = v - 2 * v_dev
+plot(v,       title="VWAP",     color=color.new(color.yellow, 40), linewidth=1)
+plot(v_upper, title="VWAP +2σ", color=color.new(color.yellow, 65), linewidth=1)
+plot(v_lower, title="VWAP -2σ", color=color.new(color.yellow, 65), linewidth=1)
+p1 = plot(v_upper, display=display.none)
+p2 = plot(v_lower, display=display.none)
+fill(p1, p2, color=color.new(color.yellow, 93), title="VWAP Band Fill")
+
+// ══ Equilibrium ═══════════════════════════════════════════
+range_hi = ta.highest(high, 50)
+range_lo  = ta.lowest(low,  50)
+eq        = (range_hi + range_lo) / 2
+premium   = close > eq
+discount  = close < eq
+plot(eq, title="Equilibrium", color=color.new(color.white, 70), linewidth=1, style=plot.style_circles)
+
+// ══ Market Structure ══════════════════════════════════════
+swing_len = 5
+swing_hi  = ta.pivothigh(high, swing_len, swing_len)
+swing_lo  = ta.pivotlow(low,   swing_len, swing_len)
+
+var float last_hi = na
+var float last_lo = na
+var string ms_state = "neutral"
+
+if show_struct
+    if not na(swing_hi)
+        lbl_text = na(last_hi) ? "HH" : swing_hi > last_hi ? "HH" : "LH"
+        label.new(bar_index[swing_len], swing_hi,
+             text=lbl_text, xloc=xloc.bar_index, yloc=yloc.price,
+             style=label.style_none, textcolor=color.new(color.white, 20), size=size.small)
+        last_hi := swing_hi
+
+    if not na(swing_lo)
+        lbl_text = na(last_lo) ? "LL" : swing_lo < last_lo ? "LL" : "HL"
+        label.new(bar_index[swing_len], swing_lo,
+             text=lbl_text, xloc=xloc.bar_index, yloc=yloc.price,
+             style=label.style_none, textcolor=color.new(color.white, 20), size=size.small)
+        last_lo := swing_lo
+
+prev_hi  = ta.valuewhen(not na(swing_hi), swing_hi, 0)
+prev_lo  = ta.valuewhen(not na(swing_lo), swing_lo, 0)
+bos_bull = ta.crossover(close,  prev_hi)
+bos_bear = ta.crossunder(close, prev_lo)
+ms       = close > prev_hi ? "BOS_bull" : close < prev_lo ? "BOS_bear" : ""
+
+if show_struct and bos_bull
+    label.new(bar_index, low - (high - low) * 0.3,
+         text="MSS ↑", style=label.style_none,
+         textcolor=color.new(color.lime, 10), size=size.tiny)
+
+if show_struct and bos_bear
+    label.new(bar_index, high + (high - low) * 0.3,
+         text="MSS ↓", style=label.style_none,
+         textcolor=color.new(color.red, 10), size=size.tiny)
+
+// ══ Sweeps / SFP ══════════════════════════════════════════
+sweep_hi = high > ta.highest(high[1], 20)[1] and close < ta.highest(high[1], 20)[1]
+sweep_lo = low  < ta.lowest(low[1],   20)[1] and close > ta.lowest(low[1],   20)[1]
+
+if show_sweep and sweep_hi
+    label.new(bar_index, high, text="SFP", style=label.style_none,
+         textcolor=color.new(color.red, 10), size=size.tiny)
+
+if show_sweep and sweep_lo
+    label.new(bar_index, low, text="SFP", style=label.style_none,
+         textcolor=color.new(color.lime, 10), size=size.tiny)
+
+// ══ CISD ══════════════════════════════════════════════════
+cisd_bull = close[1] < open[1] and close > open and close > open[1]
+cisd_bear = close[1] > open[1] and close < open and close < open[1]
+
+if show_cisd and cisd_bull
+    label.new(bar_index, low, text="CISD", style=label.style_none,
+         textcolor=color.new(color.red, 10), size=size.tiny)
+
+if show_cisd and cisd_bear
+    label.new(bar_index, high, text="CISD", style=label.style_none,
+         textcolor=color.new(color.green, 10), size=size.tiny)
+
+// ══════════════════════════════════════════════════════════
+// FAIR VALUE GAPS
+// Bull FVG: candle[2] high < candle[0] low  → green box
+// Bear FVG: candle[2] low  > candle[0] high → red box
+// Mitigation: price closes inside the gap → flip to IFVG, freeze box
+// ══════════════════════════════════════════════════════════
+var box[]   fvg_boxes     = array.new_box()
+var label[] fvg_labels    = array.new_label()
+var bool[]  fvg_is_bull   = array.new_bool()
+var bool[]  fvg_mitigated = array.new_bool()
+
+fvg_bull_raw = low[0]  > high[2]
+fvg_bear_raw = high[0] < low[2]
+
+// Track if price is currently inside an active FVG for confluence
+var bool in_bull_fvg = false
+var bool in_bear_fvg = false
+
+if show_fvg and barstate.isconfirmed
+    if fvg_bull_raw
+        top_p = low[0]
+        bot_p = high[2]
+        mid_p = (top_p + bot_p) / 2
+        b = box.new(bar_index - 2, top_p, bar_index + fvg_extend, bot_p,
+             bgcolor=col_fvg_bull,
+             border_color=color.new(color.green, 55), border_width=1)
+        l = label.new(bar_index + math.round(fvg_extend / 2), mid_p,
+             text="FVG", style=label.style_none,
+             textcolor=color.new(color.green, 20), size=size.tiny)
+        array.push(fvg_boxes,     b)
+        array.push(fvg_labels,    l)
+        array.push(fvg_is_bull,   true)
+        array.push(fvg_mitigated, false)
+
+    if fvg_bear_raw
+        top_p = low[2]
+        bot_p = high[0]
+        mid_p = (top_p + bot_p) / 2
+        b = box.new(bar_index - 2, top_p, bar_index + fvg_extend, bot_p,
+             bgcolor=col_fvg_bear,
+             border_color=color.new(color.red, 55), border_width=1)
+        l = label.new(bar_index + math.round(fvg_extend / 2), mid_p,
+             text="FVG", style=label.style_none,
+             textcolor=color.new(color.red, 20), size=size.tiny)
+        array.push(fvg_boxes,     b)
+        array.push(fvg_labels,    l)
+        array.push(fvg_is_bull,   false)
+        array.push(fvg_mitigated, false)
+
+// Check if price touches an unmitigated FVG (confluence for entries)
+in_bull_fvg := false
+in_bear_fvg := false
+
+if show_fvg and array.size(fvg_boxes) > 0
+    for i = 0 to array.size(fvg_boxes) - 1
+        b       = array.get(fvg_boxes,     i)
+        l       = array.get(fvg_labels,    i)
+        is_bull = array.get(fvg_is_bull,   i)
+        mit     = array.get(fvg_mitigated, i)
+        top_val = box.get_top(b)
+        bot_val = box.get_bottom(b)
+        mid_val = (top_val + bot_val) / 2
+
+        if not mit
+            // Extend right and keep label centered
+            box.set_right(b, bar_index + fvg_extend)
+            label.set_x(l,   bar_index + math.round(fvg_extend / 2))
+            label.set_y(l,   mid_val)
+
+            // Flag if price is touching this FVG (entry confluence)
+            if is_bull and low <= top_val and low >= bot_val
+                in_bull_fvg := true
+            if not is_bull and high >= bot_val and high <= top_val
+                in_bear_fvg := true
+
+            // Mitigation check → flip to IFVG, freeze, update label
+            if is_bull and close < top_val
+                box.set_bgcolor(b,      col_ifvg_bull)
+                box.set_border_color(b, color.new(color.red, 55))
+                label.set_text(l,       "IFVG")
+                label.set_textcolor(l,  color.new(color.red, 20))
+                array.set(fvg_mitigated, i, true)
+            if not is_bull and close > bot_val
+                box.set_bgcolor(b,      col_ifvg_bear)
+                box.set_border_color(b, color.new(color.green, 55))
+                label.set_text(l,       "IFVG")
+                label.set_textcolor(l,  color.new(color.green, 20))
+                array.set(fvg_mitigated, i, true)
+
+// ══════════════════════════════════════════════════════════
+// ORDER BLOCKS
+// Bull OB: last bearish candle before a bullish impulse break
+// Bear OB: last bullish candle before a bearish impulse break
+// Flip to Breaker when price breaks through, dashed border, freeze
+// ══════════════════════════════════════════════════════════
+var box[]   ob_boxes   = array.new_box()
+var bool[]  ob_is_bull = array.new_bool()
+var bool[]  ob_broken  = array.new_bool()
+var label[] ob_labels  = array.new_label()
+
+bull_impulse = close > ta.highest(high, ob_lookback)[1]
+bear_impulse = close < ta.lowest(low,   ob_lookback)[1]
+bull_ob_bar  = bull_impulse and close[1] < open[1]
+bear_ob_bar  = bear_impulse and close[1] > open[1]
+
+// Track if price is currently at an active OB (confluence for entries)
+var bool at_bull_ob = false
+var bool at_bear_ob = false
+
+if show_ob and barstate.isconfirmed
+    if bull_ob_bar
+        top_p = math.max(open[1], close[1])
+        bot_p = math.min(open[1], close[1])
+        mid_p = (top_p + bot_p) / 2
+        b = box.new(bar_index - 1, top_p, bar_index + ob_extend, bot_p,
+             bgcolor=col_ob_bull,
+             border_color=color.new(color.teal, 40), border_width=1)
+        l = label.new(bar_index + math.round(ob_extend / 2), mid_p,
+             text="OB", style=label.style_none,
+             textcolor=color.new(color.teal, 10), size=size.small)
+        array.push(ob_boxes,   b)
+        array.push(ob_is_bull, true)
+        array.push(ob_broken,  false)
+        array.push(ob_labels,  l)
+
+    if bear_ob_bar
+        top_p = math.max(open[1], close[1])
+        bot_p = math.min(open[1], close[1])
+        mid_p = (top_p + bot_p) / 2
+        b = box.new(bar_index - 1, top_p, bar_index + ob_extend, bot_p,
+             bgcolor=col_ob_bear,
+             border_color=color.new(color.red, 40), border_width=1)
+        l = label.new(bar_index + math.round(ob_extend / 2), mid_p,
+             text="OB", style=label.style_none,
+             textcolor=color.new(color.red, 10), size=size.small)
+        array.push(ob_boxes,   b)
+        array.push(ob_is_bull, false)
+        array.push(ob_broken,  false)
+        array.push(ob_labels,  l)
+
+at_bull_ob := false
+at_bear_ob := false
+
+if show_ob and array.size(ob_boxes) > 0
+    for i = 0 to array.size(ob_boxes) - 1
+        b       = array.get(ob_boxes,   i)
+        l       = array.get(ob_labels,  i)
+        is_bull = array.get(ob_is_bull, i)
+        broken  = array.get(ob_broken,  i)
+        top_val = box.get_top(b)
+        bot_val = box.get_bottom(b)
+        mid_val = (top_val + bot_val) / 2
+        zone_h  = top_val - bot_val
+
+        if not broken
+            // Extend and keep label centered
+            box.set_right(b, bar_index + ob_extend)
+            label.set_x(l,   bar_index + math.round(ob_extend / 2))
+            label.set_y(l,   mid_val)
+
+            // Flag if price is touching/inside this OB
+            if is_bull and low <= top_val and low >= bot_val
+                at_bull_ob := true
+            if not is_bull and high >= bot_val and high <= top_val
+                at_bear_ob := true
+
+            // Calculate % of OB tested and show in label
+            if is_bull
+                pct_tested = zone_h > 0 ? math.round((top_val - math.max(low, bot_val)) / zone_h * 100) : 0
+                label.set_text(l, "OB  " + str.tostring(pct_tested) + "%")
+            else
+                pct_tested = zone_h > 0 ? math.round((math.min(high, top_val) - bot_val) / zone_h * 100) : 0
+                label.set_text(l, "OB  " + str.tostring(pct_tested) + "%")
+
+            // Bull OB → Breaker when price closes below the OB low
+            if is_bull and close < bot_val
+                box.set_bgcolor(b,       col_bb_bull)
+                box.set_border_color(b,  color.new(color.red, 30))
+                box.set_border_style(b,  line.style_dashed)
+                label.set_text(l,        "Breaker")
+                label.set_textcolor(l,   color.new(color.red, 10))
+                array.set(ob_broken, i,  true)
+
+            // Bear OB → Breaker when price closes above the OB high
+            if not is_bull and close > top_val
+                box.set_bgcolor(b,       col_bb_bear)
+                box.set_border_color(b,  color.new(color.green, 30))
+                box.set_border_style(b,  line.style_dashed)
+                label.set_text(l,        "Breaker")
+                label.set_textcolor(l,   color.new(color.green, 10))
+                array.set(ob_broken, i,  true)
+
+// ══════════════════════════════════════════════════════════
+// DELTA BLOCKS
+// ══════════════════════════════════════════════════════════
+var box[]  db_boxes   = array.new_box()
+var bool[] db_is_bull = array.new_bool()
+var bool[] db_closed  = array.new_bool()
+
+bull_streak = true
+bear_streak = true
+for k = 0 to delta_len - 1
+    if close[k] <= open[k]
+        bull_streak := false
+    if close[k] >= open[k]
+        bear_streak := false
+
+delta_bull_block = bull_streak
+delta_bear_block = bear_streak
+
+if show_delta and barstate.isconfirmed
+    if delta_bull_block
+        top_p = ta.highest(high, delta_len)
+        bot_p = ta.lowest(low,   delta_len)
+        b = box.new(bar_index - (delta_len - 1), top_p, bar_index + ob_extend, bot_p,
+             bgcolor=col_delta_bull,
+             border_color=color.new(color.teal, 40), border_width=1)
+        label.new(bar_index + math.round(ob_extend / 2), (top_p + bot_p) / 2,
+             text="Δ Bull", style=label.style_none,
+             textcolor=color.new(color.teal, 10), size=size.tiny)
+        array.push(db_boxes,   b)
+        array.push(db_is_bull, true)
+        array.push(db_closed,  false)
+
+    if delta_bear_block
+        top_p = ta.highest(high, delta_len)
+        bot_p = ta.lowest(low,   delta_len)
+        b = box.new(bar_index - (delta_len - 1), top_p, bar_index + ob_extend, bot_p,
+             bgcolor=col_delta_bear,
+             border_color=color.new(color.red, 40), border_width=1)
+        label.new(bar_index + math.round(ob_extend / 2), (top_p + bot_p) / 2,
+             text="Δ Bear", style=label.style_none,
+             textcolor=color.new(color.red, 10), size=size.tiny)
+        array.push(db_boxes,   b)
+        array.push(db_is_bull, false)
+        array.push(db_closed,  false)
+
+if show_delta and array.size(db_boxes) > 0
+    for i = 0 to array.size(db_boxes) - 1
+        b      = array.get(db_boxes,   i)
+        is_b   = array.get(db_is_bull, i)
+        closed = array.get(db_closed,  i)
+        top_v  = box.get_top(b)
+        bot_v  = box.get_bottom(b)
+        if not closed
+            box.set_right(b, bar_index + ob_extend)
+            if is_b  and close < bot_v
+                array.set(db_closed, i, true)
+            if not is_b and close > top_v
+                array.set(db_closed, i, true)
+
+// ══ OTE Zone (62–79% fib of last swing) ══════════════════
+var float ote_hi  = na
+var float ote_lo  = na
+var float ote_top = na
+var float ote_bot = na
+var box   ote_box = na
+
+if not na(swing_hi) and not na(swing_lo)
+    if swing_hi > swing_lo
+        ote_hi  := swing_hi
+        ote_lo  := swing_lo
+        ote_top := ote_lo + (ote_hi - ote_lo) * 0.79
+        ote_bot := ote_lo + (ote_hi - ote_lo) * 0.62
+    if not na(ote_top) and show_ote
+        if na(ote_box)
+            ote_box := box.new(bar_index, ote_top, bar_index + ob_extend, ote_bot,
+                 bgcolor=color.new(color.blue, 85),
+                 border_color=color.new(color.blue, 50), border_width=1)
+            label.new(bar_index + math.round(ob_extend / 2), (ote_top + ote_bot) / 2,
+                 text="OTE Zone", style=label.style_none,
+                 textcolor=color.new(color.blue, 10), size=size.tiny)
+        else
+            box.set_right(ote_box, bar_index + ob_extend)
+
+// ══════════════════════════════════════════════════════════
+// ██████  SIGNAL ENGINE  ██████████████████████████████████
+//
+// LONG signal requires ALL of:
+//   1. In an active killzone (London or NY)
+//   2. Price in DISCOUNT zone (below equilibrium)
+//   3. N confluences from: FVG touch, OB touch, sweep_lo,
+//      CISD bullish, BOS bull, discount confirmed
+//
+// SHORT signal requires ALL of:
+//   1. In an active killzone (London or NY)
+//   2. Price in PREMIUM zone (above equilibrium)
+//   3. N confluences from: FVG touch, OB touch, sweep_hi,
+//      CISD bearish, BOS bear, premium confirmed
+//
+// Signals fire once-per-bar-close (confirmed candle only)
+// ══════════════════════════════════════════════════════════
+
+// Count bullish confluences
+long_conf = 0
+long_conf := long_conf + (in_bull_fvg ? 1 : 0)     // Price touching bull FVG
+long_conf := long_conf + (at_bull_ob  ? 1 : 0)     // Price touching bull OB
+long_conf := long_conf + (sweep_lo    ? 1 : 0)     // Sweep of recent low (SFP long)
+long_conf := long_conf + (cisd_bull   ? 1 : 0)     // CISD bullish shift
+long_conf := long_conf + (bos_bull    ? 1 : 0)     // Break of structure bullish
+long_conf := long_conf + (discount    ? 1 : 0)     // Price in discount zone
+
+// Count bearish confluences
+short_conf = 0
+short_conf := short_conf + (in_bear_fvg ? 1 : 0)   // Price touching bear FVG
+short_conf := short_conf + (at_bear_ob  ? 1 : 0)   // Price touching bear OB
+short_conf := short_conf + (sweep_hi    ? 1 : 0)   // Sweep of recent high (SFP short)
+short_conf := short_conf + (cisd_bear   ? 1 : 0)   // CISD bearish shift
+short_conf := short_conf + (bos_bear    ? 1 : 0)   // Break of structure bearish
+short_conf := short_conf + (premium     ? 1 : 0)   // Price in premium zone
+
+// Signal conditions
+long_signal  = barstate.isconfirmed and show_signals and in_killzone and discount and long_conf  >= min_conf_long
+short_signal = barstate.isconfirmed and show_signals and in_killzone and premium  and short_conf >= min_conf_short
+
+// Prevent simultaneous long and short (long wins if both somehow fire)
+long_signal  := long_signal  and not short_signal
+
+// ── Plot buy/sell arrows ──────────────────────────────────
+plotshape(long_signal,
+     title="BUY Signal",
+     location=location.belowbar,
+     style=shape.triangleup,
+     size=size.normal,
+     color=color.new(color.lime, 0),
+     text="BUY",
+     textcolor=color.new(color.lime, 0))
+
+plotshape(short_signal,
+     title="SELL Signal",
+     location=location.abovebar,
+     style=shape.triangledown,
+     size=size.normal,
+     color=color.new(color.red, 0),
+     text="SELL",
+     textcolor=color.new(color.red, 0))
+
+// ── Optional: confluence strength label ──────────────────
+if long_signal
+    label.new(bar_index, low - (high - low) * 0.5,
+         text="▲ LONG " + str.tostring(long_conf) + " conf",
+         style=label.style_label_up,
+         color=color.new(color.lime, 20),
+         textcolor=color.white,
+         size=size.small)
+
+if short_signal
+    label.new(bar_index, high + (high - low) * 0.5,
+         text="▼ SHORT " + str.tostring(short_conf) + " conf",
+         style=label.style_label_down,
+         color=color.new(color.red, 20),
+         textcolor=color.white,
+         size=size.small)
+
+// ══ Webhook Payload ═══════════════════════════════════════
+// Sends on every confirmed bar (data) + extra signal field
+fvg_bull_sig  = fvg_bull_raw     ? 1 : 0
+fvg_bear_sig  = fvg_bear_raw     ? 1 : 0
+ob_bull_sig   = bull_ob_bar      ? 1 : 0
+ob_bear_sig   = bear_ob_bar      ? 1 : 0
+cisd_bull_sig = cisd_bull        ? 1 : 0
+cisd_bear_sig = cisd_bear        ? 1 : 0
+delta_bull_s  = delta_bull_block ? 1 : 0
+delta_bear_s  = delta_bear_block ? 1 : 0
+long_sig_int  = long_signal      ? 1 : 0
+short_sig_int = short_signal     ? 1 : 0
+
+if barstate.isconfirmed
+    payload = '{"ticker":"' + ticker + '",' +
+              '"timeframe":"' + bar_tf + '",' +
+              '"htf_bias":"' + htf_bias + '",' +
+              '"htf_premium":' + str.tostring(htf_prem) + ',' +
+              '"htf_discount":' + str.tostring(htf_disc) + ',' +
+              '"open":' + str.tostring(open) + ',' +
+              '"high":' + str.tostring(high) + ',' +
+              '"low":' + str.tostring(low) + ',' +
+              '"close":' + str.tostring(close) + ',' +
+              '"volume":' + str.tostring(volume) + ',' +
+              '"vwap":' + str.tostring(v) + ',' +
+              '"killzone":"' + killzone + '",' +
+              '"market_structure":"' + ms + '",' +
+              '"fvg_bull":' + str.tostring(fvg_bull_sig) + ',' +
+              '"fvg_bear":' + str.tostring(fvg_bear_sig) + ',' +
+              '"ob_bull":' + str.tostring(ob_bull_sig) + ',' +
+              '"ob_bear":' + str.tostring(ob_bear_sig) + ',' +
+              '"cisd_bull":' + str.tostring(cisd_bull_sig) + ',' +
+              '"cisd_bear":' + str.tostring(cisd_bear_sig) + ',' +
+              '"delta_bull":' + str.tostring(delta_bull_s) + ',' +
+              '"delta_bear":' + str.tostring(delta_bear_s) + ',' +
+              '"sweep_high":' + (sweep_hi ? "1" : "0") + ',' +
+              '"sweep_low":' + (sweep_lo ? "1" : "0") + ',' +
+              '"premium":' + (premium ? "1" : "0") + ',' +
+              '"discount":' + (discount ? "1" : "0") + ',' +
+              '"long_signal":' + str.tostring(long_sig_int) + ',' +
+              '"short_signal":' + str.tostring(short_sig_int) + ',' +
+              '"long_conf":' + str.tostring(long_conf) + ',' +
+              '"short_conf":' + str.tostring(short_conf) + '}' 
+        alert(payload, alert.freq_once_per_bar_close)

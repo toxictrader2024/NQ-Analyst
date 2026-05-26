@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: nq-analyst
+    runtime: node
+    buildCommand: npm install --omit=dev
+    startCommand: NODE_ENV=production node dist/index.cjs
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+    disk:
+      name: nq-data
+      mountPath: /data
+      sizeGB: 1

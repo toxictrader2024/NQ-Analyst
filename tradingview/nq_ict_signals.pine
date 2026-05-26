@@ -1,0 +1,77 @@
+//@version=5
+indicator("NQ ICT Signals → Webhook", overlay=true, max_bars_back=500)
+
+// ══ Inputs ═══════════════════════════════════════════════
+ticker = input.string("NQ1!", "Ticker")
+
+// ══ VWAP ══════════════════════════════════════════════════
+v = ta.vwap(close)
+plot(v, title="VWAP", color=color.yellow, linewidth=2)
+
+// ══ Kill Zones (CT timezone) ══════════════════════════════
+utc_hour = hour(time, "UTC")
+london_open = (utc_hour >= 7  and utc_hour < 10)   // 2–5am CT
+ny_open     = (utc_hour >= 12 and utc_hour < 15)   // 7–10am CT
+ny_close    = (utc_hour >= 18 and utc_hour < 20)   // 1–3pm CT
+
+bgcolor(london_open ? color.new(color.blue,   88) : na, title="London KZ")
+bgcolor(ny_open     ? color.new(color.green,  88) : na, title="NY Open KZ")
+bgcolor(ny_close    ? color.new(color.orange, 88) : na, title="NY Close KZ")
+
+killzone = london_open ? "london_open" : ny_open ? "ny_open" : ny_close ? "ny_close" : ""
+
+// ══ Market Structure (BOS / CHoCH) ════════════════════════
+swing_hi = ta.pivothigh(high, 5, 5)
+swing_lo  = ta.pivotlow(low,  5, 5)
+prev_hi   = ta.valuewhen(not na(swing_hi), swing_hi, 0)
+prev_lo   = ta.valuewhen(not na(swing_lo), swing_lo, 0)
+
+bos_bull  = close > prev_hi
+bos_bear  = close < prev_lo
+ms = bos_bull ? "BOS_bull" : bos_bear ? "BOS_bear" : ""
+
+plotshape(ta.crossover(close, prev_hi),  title="BOS Bull", location=location.belowbar, style=shape.triangleup,   color=color.lime,  size=size.small, text="BOS↑")
+plotshape(ta.crossunder(close, prev_lo), title="BOS Bear", location=location.abovebar, style=shape.triangledown, color=color.red,   size=size.small, text="BOS↓")
+
+// ══ Fair Value Gaps ════════════════════════════════════════
+fvg_bull = low[0] > high[2] and close[1] > high[2]
+fvg_bear = high[0] < low[2] and close[1] < low[2]
+
+plotshape(fvg_bull, title="FVG Bull", location=location.belowbar, style=shape.circle, color=color.new(color.lime, 30), size=size.tiny, text="FVG")
+plotshape(fvg_bear, title="FVG Bear", location=location.abovebar, style=shape.circle, color=color.new(color.red,  30), size=size.tiny, text="FVG")
+
+// ══ Liquidity Sweeps ══════════════════════════════════════
+sweep_hi = high > ta.highest(high[1], 20)[1] and close < ta.highest(high[1], 20)[1]
+sweep_lo = low  < ta.lowest(low[1],   20)[1] and close > ta.lowest(low[1],   20)[1]
+
+plotshape(sweep_hi, title="Sweep High", location=location.abovebar, style=shape.xcross, color=color.red,  size=size.small, text="SWEEP")
+plotshape(sweep_lo, title="Sweep Low",  location=location.belowbar, style=shape.xcross, color=color.lime, size=size.small, text="SWEEP")
+
+// ══ Premium / Discount ════════════════════════════════════
+range_hi = ta.highest(high, 50)
+range_lo  = ta.lowest(low,  50)
+eq        = (range_hi + range_lo) / 2
+premium   = close > eq
+discount  = close < eq
+
+plot(eq, title="Equilibrium", color=color.new(color.white, 60), linewidth=1, style=plot.style_circles)
+
+// ══ Webhook payload (fires on bar close) ══════════════════
+if barstate.isconfirmed
+    payload = '{"ticker":"' + ticker + '",' +
+              '"timeframe":"' + str.tostring(timeframe.period) + '",' +
+              '"open":'       + str.tostring(open)   + ',' +
+              '"high":'       + str.tostring(high)   + ',' +
+              '"low":'        + str.tostring(low)    + ',' +
+              '"close":'      + str.tostring(close)  + ',' +
+              '"volume":'     + str.tostring(volume) + ',' +
+              '"vwap":'       + str.tostring(v)      + ',' +
+              '"killzone":"'  + killzone             + '",' +
+              '"market_structure":"' + ms            + '",' +
+              '"fvg_bull":'   + (fvg_bull  ? "1" : "0") + ',' +
+              '"fvg_bear":'   + (fvg_bear  ? "1" : "0") + ',' +
+              '"sweep_high":' + (sweep_hi  ? "1" : "0") + ',' +
+              '"sweep_low":'  + (sweep_lo  ? "1" : "0") + ',' +
+              '"premium":'    + (premium   ? "1" : "0") + ',' +
+              '"discount":'   + (discount  ? "1" : "0") + '}'
+    alert(payload, alert.freq_once_per_bar_close)

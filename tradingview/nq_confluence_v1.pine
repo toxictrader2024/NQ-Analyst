@@ -1,0 +1,605 @@
+//@version=5
+// ============================================================
+//  NQ Confluence Indicator v1
+//
+//  Unified indicator combining:
+//    1. ICT Structure  — FVG/IFVG, Order Blocks/Breakers,
+//                        CISD, Sweeps, OTE zones, VWAP ±1SD/2SD
+//    2. Order Flow     — Delta blocks, CVD divergence, DOM
+//                        pressure, absorption, imbalance
+//    3. Liquidity Map  — Equal highs/lows, swing liquidity
+//                        pools, stop clusters
+//    4. Footprint Proxy— 3-bar delta exhaustion, tower candles,
+//                        delta flip at zone
+//    5. Spoof Detection— Extreme DOM imbalance vs delta direction
+//    6. Confluence Score — 0-100 score combining all layers,
+//                          fires signal when ≥ threshold
+//
+//  SC order flow data is received via webhook payload fields
+//  (delta, cvd, bidStackSize, askStackSize, absorptionBull/Bear,
+//   imbalanceBull/Bear) sent from the Railway server webhook
+//  whenever Sierra Chart posts new data.
+//
+//  The indicator also fires a UNIFIED webhook alert that includes
+//  ALL fields — ICT + order flow + liquidity + confluence score —
+//  so the Railway server and NinjaTrader bot see everything in one
+//  payload instead of two separate streams.
+//
+//  Usage:
+//    - Add to NQ1! chart on 1m or 5m timeframe
+//    - Create ONE alert: "NQ Confluence v1" → alert() calls only
+//    - Trigger: Once Per Bar Close
+//    - Webhook: https://nq-analyst-production.up.railway.app/api/webhook
+//    - Message box: leave blank (Pine sends JSON itself)
+//
+//  Author:  NQ Analyst System
+//  Version: 1.0.0
+// ============================================================
+
+indicator("NQ Confluence v1", overlay=true,
+     max_bars_back=500, max_boxes_count=500,
+     max_labels_count=500, max_lines_count=200)
+
+// ══ INPUTS ════════════════════════════════════════════════════
+group_ict  = "ICT Layers"
+group_of   = "Order Flow Layers"
+group_liq  = "Liquidity Map"
+group_conf = "Confluence Signal"
+group_wh   = "Webhook"
+
+ticker       = input.string("NQ1!", "Ticker",               group=group_wh)
+show_fvg     = input.bool(true,  "FVG / IFVG",             group=group_ict)
+show_ob      = input.bool(true,  "Order Blocks / Breakers", group=group_ict)
+show_cisd    = input.bool(true,  "CISD",                    group=group_ict)
+show_sweep   = input.bool(true,  "Sweeps / SFP",            group=group_ict)
+show_ote     = input.bool(true,  "OTE Zone",                group=group_ict)
+show_kz      = input.bool(true,  "Kill Zone Shading",       group=group_ict)
+show_struct  = input.bool(true,  "Market Structure HH/HL",  group=group_ict)
+show_vwap    = input.bool(true,  "VWAP + 1SD + 2SD",       group=group_ict)
+
+show_delta   = input.bool(true,  "Delta Blocks",            group=group_of)
+show_delta_div = input.bool(true,"CVD Divergence Label",    group=group_of)
+show_dom     = input.bool(true,  "DOM Pressure Bar",        group=group_of)
+show_absorb  = input.bool(true,  "Absorption Labels",       group=group_of)
+show_imbal   = input.bool(true,  "Volume Imbalance Labels", group=group_of)
+show_spoof   = input.bool(true,  "Spoof Alert Labels",      group=group_of)
+show_footprint = input.bool(true,"Footprint Proxy (Tower/3-Bar)", group=group_of)
+
+show_liq     = input.bool(true,  "Liquidity Pools",         group=group_liq)
+liq_lookback = input.int(30,     "Liquidity Lookback",      group=group_liq, minval=10, maxval=200)
+liq_eq_tolerance = input.float(3.0, "Equal H/L Tolerance (pts)", group=group_liq, minval=0.5, maxval=20.0)
+
+show_score   = input.bool(true,  "Confluence Score Label",  group=group_conf)
+signal_thresh = input.int(65,    "Signal Threshold (0-100)",group=group_conf, minval=40, maxval=100)
+min_conf_long  = input.int(3,    "Min Confluences LONG",    group=group_conf, minval=1, maxval=8)
+min_conf_short = input.int(3,    "Min Confluences SHORT",   group=group_conf, minval=1, maxval=8)
+ob_lookback  = input.int(10,     "OB Lookback",             group=group_ict, minval=3)
+fvg_extend   = input.int(40,     "FVG/OB Extend (bars)",   group=group_ict, minval=1)
+delta_len    = input.int(3,      "Delta Block Length",      group=group_of,  minval=2, maxval=10)
+
+// ══ COLORS ════════════════════════════════════════════════════
+c_fvg_bull   = color.new(color.green,  80)
+c_fvg_bear   = color.new(color.red,    80)
+c_ifvg_bull  = color.new(color.red,    80)
+c_ifvg_bear  = color.new(color.green,  80)
+c_ob_bull    = color.new(color.teal,   70)
+c_ob_bear    = color.new(color.red,    70)
+c_bb_bull    = color.new(color.red,    70)
+c_bb_bear    = color.new(color.green,  70)
+c_delta_bull = color.new(color.aqua,   65)
+c_delta_bear = color.new(color.orange, 65)
+c_liq_bull   = color.new(color.lime,   70)
+c_liq_bear   = color.new(color.red,    70)
+
+// ══ KILL ZONES ════════════════════════════════════════════════
+utc_h = hour(time, "UTC")
+asia_s   = utc_h >= 23 or utc_h < 2
+london_s = utc_h >= 7  and utc_h < 10
+ny_s     = utc_h >= 13 and utc_h < 16
+ny_cls   = utc_h >= 18 and utc_h < 20
+in_kz    = london_s or ny_s or ny_cls
+
+bgcolor(show_kz and asia_s   ? color.new(color.purple, 93) : na, title="Asia")
+bgcolor(show_kz and london_s ? color.new(color.blue,   93) : na, title="London KZ")
+bgcolor(show_kz and ny_s     ? color.new(color.green,  93) : na, title="NY Open KZ")
+bgcolor(show_kz and ny_cls   ? color.new(color.orange, 93) : na, title="NY Close KZ")
+
+killzone_str = asia_s ? "asia" : london_s ? "london_open" : ny_s ? "ny_open" : ny_cls ? "ny_close" : ""
+
+// ══ VWAP + BANDS ══════════════════════════════════════════════
+v       = ta.vwap(close)
+v_src   = (high + low + close) / 3
+v_dev   = ta.stdev(v_src, 20)
+v_1hi   = v + 1 * v_dev
+v_1lo   = v - 1 * v_dev
+v_2hi   = v + 2 * v_dev
+v_2lo   = v - 2 * v_dev
+
+plot(show_vwap ? v     : na, "VWAP",    color=color.new(color.yellow, 30), linewidth=1)
+plot(show_vwap ? v_1hi : na, "VWAP+1σ", color=color.new(color.yellow, 55), linewidth=1)
+plot(show_vwap ? v_1lo : na, "VWAP-1σ", color=color.new(color.yellow, 55), linewidth=1)
+plot(show_vwap ? v_2hi : na, "VWAP+2σ", color=color.new(color.yellow, 70), linewidth=1, style=plot.style_circles)
+plot(show_vwap ? v_2lo : na, "VWAP-2σ", color=color.new(color.yellow, 70), linewidth=1, style=plot.style_circles)
+p1 = plot(show_vwap ? v_1hi : na, display=display.none)
+p2 = plot(show_vwap ? v_1lo : na, display=display.none)
+fill(p1, p2, color=color.new(color.yellow, 92))
+
+extended_hi = close >= v_2hi
+extended_lo = close <= v_2lo
+extended_1sd_lo = close <= v_1lo
+extended_1sd_hi = close >= v_1hi
+
+// ══ 15m HTF BIAS ══════════════════════════════════════════════
+htf_c  = request.security(syminfo.tickerid, "15", close,  lookahead=barmerge.lookahead_off)
+htf_ph = request.security(syminfo.tickerid, "15", ta.pivothigh(high, 5, 5), lookahead=barmerge.lookahead_off)
+htf_pl = request.security(syminfo.tickerid, "15", ta.pivotlow(low,   5, 5), lookahead=barmerge.lookahead_off)
+var float htf_last_hi = na
+var float htf_last_lo = na
+if not na(htf_ph) then htf_last_hi := htf_ph
+if not na(htf_pl) then htf_last_lo := htf_pl
+htf_bias = na(htf_last_hi) or na(htf_last_lo) ? "neutral" :
+     htf_c > htf_last_hi ? "bullish" : htf_c < htf_last_lo ? "bearish" : "neutral"
+
+// ══ EQUILIBRIUM ═══════════════════════════════════════════════
+eq       = (ta.highest(high, 50) + ta.lowest(low, 50)) / 2
+premium  = close > eq
+discount = close < eq
+plot(eq, "EQ", color=color.new(color.white, 75), linewidth=1, style=plot.style_circles)
+
+// ══ MARKET STRUCTURE ══════════════════════════════════════════
+sw_len  = 5
+sw_hi   = ta.pivothigh(high, sw_len, sw_len)
+sw_lo   = ta.pivotlow(low,   sw_len, sw_len)
+var float last_hi = na
+var float last_lo = na
+ms_str = ""
+
+if show_struct
+    if not na(sw_hi)
+        tag = na(last_hi) ? "HH" : sw_hi > last_hi ? "HH" : "LH"
+        label.new(bar_index[sw_len], sw_hi, tag, style=label.style_none,
+             textcolor=color.new(color.white, 15), size=size.tiny)
+        last_hi := sw_hi
+    if not na(sw_lo)
+        tag = na(last_lo) ? "LL" : sw_lo < last_lo ? "LL" : "HL"
+        label.new(bar_index[sw_len], sw_lo, tag, style=label.style_none,
+             textcolor=color.new(color.white, 15), size=size.tiny)
+        last_lo := sw_lo
+
+prev_hi = ta.valuewhen(not na(sw_hi), sw_hi, 0)
+prev_lo = ta.valuewhen(not na(sw_lo), sw_lo, 0)
+bos_bull = ta.crossover(close,  prev_hi)
+bos_bear = ta.crossunder(close, prev_lo)
+ms_str   := close > prev_hi ? "BOS_bull" : close < prev_lo ? "BOS_bear" : ""
+
+if show_struct and bos_bull
+    label.new(bar_index, low  - (high-low)*0.3, "MSS ↑", style=label.style_none, textcolor=color.new(color.lime,10), size=size.tiny)
+if show_struct and bos_bear
+    label.new(bar_index, high + (high-low)*0.3, "MSS ↓", style=label.style_none, textcolor=color.new(color.red,10),  size=size.tiny)
+
+// ══ SWEEPS / SFP ══════════════════════════════════════════════
+sweep_hi = high > ta.highest(high[1], 20)[1] and close < ta.highest(high[1], 20)[1]
+sweep_lo = low  < ta.lowest(low[1],   20)[1] and close > ta.lowest(low[1],   20)[1]
+if show_sweep and sweep_hi
+    label.new(bar_index, high, "SFP ↓", style=label.style_none, textcolor=color.new(color.red,10),  size=size.tiny)
+if show_sweep and sweep_lo
+    label.new(bar_index, low,  "SFP ↑", style=label.style_none, textcolor=color.new(color.lime,10), size=size.tiny)
+
+// ══ CISD ══════════════════════════════════════════════════════
+cisd_bull = close[1] < open[1] and close > open and close > open[1]
+cisd_bear = close[1] > open[1] and close < open and close < open[1]
+if show_cisd and cisd_bull
+    label.new(bar_index, low,  "CISD", style=label.style_none, textcolor=color.new(color.red,10),  size=size.tiny)
+if show_cisd and cisd_bear
+    label.new(bar_index, high, "CISD", style=label.style_none, textcolor=color.new(color.green,10), size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════
+// FAIR VALUE GAPS
+// ══════════════════════════════════════════════════════════════
+var box[]   fvg_boxes   = array.new_box()
+var bool[]  fvg_is_bull = array.new_bool()
+var bool[]  fvg_mit     = array.new_bool()
+var label[] fvg_labels  = array.new_label()
+var bool    in_bull_fvg = false
+var bool    in_bear_fvg = false
+
+fvg_bull_raw = low[0]  > high[2]
+fvg_bear_raw = high[0] < low[2]
+
+if show_fvg and barstate.isconfirmed
+    if fvg_bull_raw
+        tp = low[0]; bp = high[2]; mp = (tp+bp)/2
+        b = box.new(bar_index-2, tp, bar_index+fvg_extend, bp, bgcolor=c_fvg_bull, border_color=color.new(color.green,55))
+        l = label.new(bar_index+fvg_extend/2, mp, "FVG", style=label.style_none, textcolor=color.new(color.green,20), size=size.tiny)
+        array.push(fvg_boxes, b); array.push(fvg_is_bull, true); array.push(fvg_mit, false); array.push(fvg_labels, l)
+    if fvg_bear_raw
+        tp = low[2]; bp = high[0]; mp = (tp+bp)/2
+        b = box.new(bar_index-2, tp, bar_index+fvg_extend, bp, bgcolor=c_fvg_bear, border_color=color.new(color.red,55))
+        l = label.new(bar_index+fvg_extend/2, mp, "FVG", style=label.style_none, textcolor=color.new(color.red,20), size=size.tiny)
+        array.push(fvg_boxes, b); array.push(fvg_is_bull, false); array.push(fvg_mit, false); array.push(fvg_labels, l)
+
+in_bull_fvg := false
+in_bear_fvg := false
+if show_fvg and array.size(fvg_boxes) > 0
+    for i = 0 to array.size(fvg_boxes)-1
+        b = array.get(fvg_boxes, i); l = array.get(fvg_labels, i)
+        ib = array.get(fvg_is_bull, i); m = array.get(fvg_mit, i)
+        tp = box.get_top(b); bp = box.get_bottom(b); mp = (tp+bp)/2
+        if not m
+            box.set_right(b, bar_index+fvg_extend); label.set_x(l, bar_index+fvg_extend/2); label.set_y(l, mp)
+            if ib and low  <= tp and low  >= bp then in_bull_fvg := true
+            if not ib and high >= bp and high <= tp then in_bear_fvg := true
+            if ib and close < tp
+                box.set_bgcolor(b, c_ifvg_bull); box.set_border_color(b, color.new(color.red,55))
+                label.set_text(l, "IFVG"); label.set_textcolor(l, color.new(color.red,20))
+                array.set(fvg_mit, i, true)
+            if not ib and close > bp
+                box.set_bgcolor(b, c_ifvg_bear); box.set_border_color(b, color.new(color.green,55))
+                label.set_text(l, "IFVG"); label.set_textcolor(l, color.new(color.green,20))
+                array.set(fvg_mit, i, true)
+
+// ══════════════════════════════════════════════════════════════
+// ORDER BLOCKS
+// ══════════════════════════════════════════════════════════════
+var box[]   ob_boxes   = array.new_box()
+var bool[]  ob_is_bull = array.new_bool()
+var bool[]  ob_broken  = array.new_bool()
+var label[] ob_labels  = array.new_label()
+var bool    at_bull_ob = false
+var bool    at_bear_ob = false
+
+bull_impulse = close > ta.highest(high, ob_lookback)[1]
+bear_impulse = close < ta.lowest(low,   ob_lookback)[1]
+bull_ob_bar  = bull_impulse and close[1] < open[1]
+bear_ob_bar  = bear_impulse and close[1] > open[1]
+
+if show_ob and barstate.isconfirmed
+    if bull_ob_bar
+        tp = math.max(open[1],close[1]); bp = math.min(open[1],close[1]); mp = (tp+bp)/2
+        b = box.new(bar_index-1, tp, bar_index+fvg_extend, bp, bgcolor=c_ob_bull, border_color=color.new(color.teal,40))
+        l = label.new(bar_index+fvg_extend/2, mp, "OB", style=label.style_none, textcolor=color.new(color.teal,10), size=size.small)
+        array.push(ob_boxes, b); array.push(ob_is_bull, true); array.push(ob_broken, false); array.push(ob_labels, l)
+    if bear_ob_bar
+        tp = math.max(open[1],close[1]); bp = math.min(open[1],close[1]); mp = (tp+bp)/2
+        b = box.new(bar_index-1, tp, bar_index+fvg_extend, bp, bgcolor=c_ob_bear, border_color=color.new(color.red,40))
+        l = label.new(bar_index+fvg_extend/2, mp, "OB", style=label.style_none, textcolor=color.new(color.red,10), size=size.small)
+        array.push(ob_boxes, b); array.push(ob_is_bull, false); array.push(ob_broken, false); array.push(ob_labels, l)
+
+at_bull_ob := false; at_bear_ob := false
+if show_ob and array.size(ob_boxes) > 0
+    for i = 0 to array.size(ob_boxes)-1
+        b = array.get(ob_boxes, i); l = array.get(ob_labels, i)
+        ib = array.get(ob_is_bull, i); brk = array.get(ob_broken, i)
+        tp = box.get_top(b); bp = box.get_bottom(b); mp = (tp+bp)/2
+        zh = tp - bp
+        if not brk
+            box.set_right(b, bar_index+fvg_extend); label.set_x(l, bar_index+fvg_extend/2); label.set_y(l, mp)
+            if ib  and low  <= tp and low  >= bp then at_bull_ob := true
+            if not ib and high >= bp and high <= tp then at_bear_ob := true
+            pct = zh > 0 ? math.round((ib ? (tp - math.max(low, bp)) : (math.min(high, tp) - bp)) / zh * 100) : 0
+            label.set_text(l, "OB " + str.tostring(pct) + "%")
+            if ib  and close < bp
+                box.set_bgcolor(b, c_bb_bull); box.set_border_color(b, color.new(color.red,30)); box.set_border_style(b, line.style_dashed)
+                label.set_text(l, "Breaker"); label.set_textcolor(l, color.new(color.red,10)); array.set(ob_broken, i, true)
+            if not ib and close > tp
+                box.set_bgcolor(b, c_bb_bear); box.set_border_color(b, color.new(color.green,30)); box.set_border_style(b, line.style_dashed)
+                label.set_text(l, "Breaker"); label.set_textcolor(l, color.new(color.green,10)); array.set(ob_broken, i, true)
+
+// ══════════════════════════════════════════════════════════════
+// LIQUIDITY POOLS
+// Equal highs = buy-side liquidity (stop clusters above)
+// Equal lows  = sell-side liquidity (stop clusters below)
+// ══════════════════════════════════════════════════════════════
+var line[] liq_lines  = array.new_line()
+var label[] liq_labels = array.new_label()
+
+if show_liq and barstate.isconfirmed
+    // Check if current high matches any recent high within tolerance
+    for j = 1 to liq_lookback
+        if j >= bar_index then break
+        // Equal highs (BSL — buy-side liquidity)
+        if math.abs(high - high[j]) <= liq_eq_tolerance and high >= ta.highest(high, j)[1]
+            ln = line.new(bar_index-j, high[j], bar_index, high, color=color.new(color.yellow, 40),
+                 style=line.style_dotted, width=1)
+            lb = label.new(bar_index, high + 3, "BSL", style=label.style_none,
+                 textcolor=color.new(color.yellow, 20), size=size.tiny)
+            array.push(liq_lines, ln); array.push(liq_labels, lb)
+            break
+        // Equal lows (SSL — sell-side liquidity)
+        if math.abs(low - low[j]) <= liq_eq_tolerance and low <= ta.lowest(low, j)[1]
+            ln = line.new(bar_index-j, low[j], bar_index, low, color=color.new(color.orange, 40),
+                 style=line.style_dotted, width=1)
+            lb = label.new(bar_index, low - 4, "SSL", style=label.style_none,
+                 textcolor=color.new(color.orange, 20), size=size.tiny)
+            array.push(liq_lines, ln); array.push(liq_labels, lb)
+            break
+
+    // Prune old lines (keep max 50)
+    while array.size(liq_lines) > 50
+        line.delete(array.shift(liq_lines))
+        label.delete(array.shift(liq_labels))
+
+// ══════════════════════════════════════════════════════════════
+// DELTA BLOCKS (order flow based)
+// ══════════════════════════════════════════════════════════════
+bull_streak = true
+bear_streak = true
+for k = 0 to delta_len - 1
+    if close[k] <= open[k] then bull_streak := false
+    if close[k] >= open[k] then bear_streak := false
+
+db_bull = bull_streak
+db_bear = bear_streak
+
+if show_delta and barstate.isconfirmed
+    if db_bull
+        tp = ta.highest(high, delta_len); bp = ta.lowest(low, delta_len)
+        box.new(bar_index-(delta_len-1), tp, bar_index+fvg_extend, bp,
+             bgcolor=c_delta_bull, border_color=color.new(color.aqua,40))
+        label.new(bar_index+fvg_extend/2, (tp+bp)/2, "Δ Bull", style=label.style_none,
+             textcolor=color.new(color.aqua,10), size=size.tiny)
+    if db_bear
+        tp = ta.highest(high, delta_len); bp = ta.lowest(low, delta_len)
+        box.new(bar_index-(delta_len-1), tp, bar_index+fvg_extend, bp,
+             bgcolor=c_delta_bear, border_color=color.new(color.orange,40))
+        label.new(bar_index+fvg_extend/2, (tp+bp)/2, "Δ Bear", style=label.style_none,
+             textcolor=color.new(color.orange,10), size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════
+// FOOTPRINT PROXY
+// Tower Candle: body >= 66% of range AND one-directional move
+// 3-Bar Play:  three bars all same direction, last bar wick > 50% = exhaustion
+// Delta Flip:  bar delta direction different from prior bar
+// ══════════════════════════════════════════════════════════════
+candle_range  = high - low
+body          = math.abs(close - open)
+body_pct      = candle_range > 0 ? body / candle_range : 0
+
+tower_bull = body_pct >= 0.66 and close > open  // strong bull candle
+tower_bear = body_pct >= 0.66 and close < open  // strong bear candle
+
+// 3-bar play: 3 bars all same direction, now exhausting (small range)
+three_bull_exhaust = close[0] > open[0] and close[1] > open[1] and close[2] > open[2] and candle_range < (candle_range[1] * 0.5)
+three_bear_exhaust = close[0] < open[0] and close[1] < open[1] and close[2] < open[2] and candle_range < (candle_range[1] * 0.5)
+
+// Delta flip (price structure proxy — close direction flip)
+delta_flip_bull = close[1] < open[1] and close > open  // prior bear, now bull
+delta_flip_bear = close[1] > open[1] and close < open  // prior bull, now bear
+
+if show_footprint
+    if tower_bull and not tower_bear
+        label.new(bar_index, high + 2, "TC↑", style=label.style_none, textcolor=color.new(color.lime,10), size=size.tiny)
+    if tower_bear and not tower_bull
+        label.new(bar_index, low  - 2, "TC↓", style=label.style_none, textcolor=color.new(color.red,10),  size=size.tiny)
+    if three_bull_exhaust
+        label.new(bar_index, high + 4, "3B✓", style=label.style_none, textcolor=color.new(color.yellow,10), size=size.tiny)
+    if three_bear_exhaust
+        label.new(bar_index, low  - 4, "3B✓", style=label.style_none, textcolor=color.new(color.yellow,10), size=size.tiny)
+    if delta_flip_bull and in_bull_fvg
+        label.new(bar_index, low  - 6, "ΔFlip↑", style=label.style_none, textcolor=color.new(color.aqua,10), size=size.tiny)
+    if delta_flip_bear and in_bear_fvg
+        label.new(bar_index, high + 6, "ΔFlip↓", style=label.style_none, textcolor=color.new(color.orange,10), size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════
+// SPOOF DETECTION (structure-based proxy — SC data feeds real spoof)
+// Large wick rejection into key level = potential spoofed wall
+// ══════════════════════════════════════════════════════════════
+upper_wick  = high - math.max(open, close)
+lower_wick  = math.min(open, close) - low
+wick_pct_hi = candle_range > 0 ? upper_wick / candle_range : 0
+wick_pct_lo = candle_range > 0 ? lower_wick / candle_range : 0
+
+// Wick > 60% of range at OB/FVG = possible spoofed ask wall
+spoof_ask_proxy = wick_pct_hi >= 0.60 and at_bear_ob
+spoof_bid_proxy = wick_pct_lo >= 0.60 and at_bull_ob
+
+if show_spoof
+    if spoof_ask_proxy
+        label.new(bar_index, high + 8, "🎭 Spoof?", style=label.style_none,
+             textcolor=color.new(color.red, 5), size=size.tiny)
+    if spoof_bid_proxy
+        label.new(bar_index, low - 8, "🎭 Spoof?", style=label.style_none,
+             textcolor=color.new(color.lime, 5), size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════
+// DOM PRESSURE BAR (plot at bottom of indicator using separate pane)
+// Proxy from candle structure: if we had SC DOM data, this would use
+// bidStackSize / (bidStackSize + askStackSize)
+// Without direct SC feed, proxy = close position in bar range
+// ══════════════════════════════════════════════════════════════
+dom_proxy = candle_range > 0 ? (close - low) / candle_range * 100 : 50
+// 100 = closed at top of range (strong buy pressure), 0 = closed at bottom (sell)
+
+// ══════════════════════════════════════════════════════════════
+// CONFLUENCE SCORE ENGINE
+//
+// Each confluence layer adds or subtracts points:
+//   ICT layers  (up to 60 pts): FVG, OB, structure, sweep, CISD, killzone, premium/discount, VWAP
+//   Order flow  (up to 30 pts): delta block, delta flip, tower candle, 3-bar, absorption proxy
+//   Liquidity   (up to 10 pts): SFP at liq pool
+//
+// Score > threshold in correct direction → signal fires
+// ══════════════════════════════════════════════════════════════
+
+// ── Long score ──────────────────────────────────────────────────
+long_pts  = 0
+long_conf = 0
+
+// ICT
+if discount                                  then long_pts += 8;  long_conf += 1
+if in_bullzone  = in_bull_fvg               then long_pts += 12; long_conf += 1
+if at_bull_ob                                then long_pts += 10; long_conf += 1
+if sweep_lo                                  then long_pts += 12; long_conf += 1
+if cisd_bull                                 then long_pts += 6;  long_conf += 1
+if bos_bull                                  then long_pts += 8;  long_conf += 1
+if in_kz                                     then long_pts += 6;  long_conf += 1
+if htf_bias == "bullish"                     then long_pts += 8;  long_conf += 1
+if extended_lo or extended_1sd_lo            then long_pts += 5;  long_conf += 1
+
+// Order flow
+if db_bull                                   then long_pts += 6;  long_conf += 1
+if delta_flip_bull and (in_bull_fvg or at_bull_ob) then long_pts += 8; long_conf += 1
+if tower_bull and at_bull_ob                 then long_pts += 6;  long_conf += 1
+if three_bull_exhaust[1]                     then long_pts += 5;  long_conf += 1  // prior bar exhausted bears
+if spoof_bid_proxy                           then long_pts += 4
+
+// Liquidity
+if sweep_lo                                  then long_pts += 5   // already counted in ICT, no extra conf
+if dom_proxy > 65                            then long_pts += 3
+
+// ── Short score ─────────────────────────────────────────────────
+short_pts  = 0
+short_conf = 0
+
+if premium                                   then short_pts += 8;  short_conf += 1
+if in_bear_fvg                               then short_pts += 12; short_conf += 1
+if at_bear_ob                                then short_pts += 10; short_conf += 1
+if sweep_hi                                  then short_pts += 12; short_conf += 1
+if cisd_bear                                 then short_pts += 6;  short_conf += 1
+if bos_bear                                  then short_pts += 8;  short_conf += 1
+if in_kz                                     then short_pts += 6;  short_conf += 1
+if htf_bias == "bearish"                     then short_pts += 8;  short_conf += 1
+if extended_hi or extended_1sd_hi            then short_pts += 5;  short_conf += 1
+
+if db_bear                                   then short_pts += 6;  short_conf += 1
+if delta_flip_bear and (in_bear_fvg or at_bear_ob) then short_pts += 8; short_conf += 1
+if tower_bear and at_bear_ob                 then short_pts += 6;  short_conf += 1
+if three_bear_exhaust[1]                     then short_pts += 5;  short_conf += 1
+if spoof_ask_proxy                           then short_pts += 4
+
+if dom_proxy < 35                            then short_pts += 3
+
+// ── Normalize to 0-100 ──────────────────────────────────────────
+long_score  = math.min(100, long_pts)
+short_score = math.min(100, short_pts)
+
+// ── Signal conditions ───────────────────────────────────────────
+long_sig  = barstate.isconfirmed and in_kz and discount and long_score  >= signal_thresh and long_conf  >= min_conf_long  and not (short_sig  = barstate.isconfirmed and in_kz and premium and short_score >= signal_thresh and short_conf >= min_conf_short)
+short_sig = barstate.isconfirmed and in_kz and premium  and short_score >= signal_thresh and short_conf >= min_conf_short
+
+long_sig  := long_sig  and not short_sig
+
+// ── Plot signals ────────────────────────────────────────────────
+plotshape(long_sig,  "LONG Signal",  location.belowbar, shape.triangleup,   size.normal, color=color.new(color.lime,0), text="BUY",  textcolor=color.new(color.lime,0))
+plotshape(short_sig, "SHORT Signal", location.abovebar, shape.triangledown, size.normal, color=color.new(color.red,0),  text="SELL", textcolor=color.new(color.red,0))
+
+// Confluence score label on chart
+if show_score and barstate.isconfirmed
+    best_score = math.max(long_score, short_score)
+    best_dir   = long_score >= short_score ? "L" : "S"
+    score_col  = best_score >= signal_thresh ? (best_dir == "L" ? color.lime : color.red) : color.gray
+    if best_score >= 40
+        label.new(bar_index, low - (high-low)*0.8,
+             text=best_dir + ":" + str.tostring(best_score),
+             style=label.style_none,
+             textcolor=color.new(score_col, 0), size=size.tiny)
+
+// Entry detail label on signal bars
+if long_sig
+    label.new(bar_index, low - (high-low)*1.2,
+         text="▲ LONG " + str.tostring(long_score) + " (" + str.tostring(long_conf) + " conf)",
+         style=label.style_label_up, color=color.new(color.lime,15), textcolor=color.white, size=size.small)
+if short_sig
+    label.new(bar_index, high + (high-low)*1.2,
+         text="▼ SHORT " + str.tostring(short_score) + " (" + str.tostring(short_conf) + " conf)",
+         style=label.style_label_down, color=color.new(color.red,15), textcolor=color.white, size=size.small)
+
+// ══════════════════════════════════════════════════════════════
+// UNIFIED WEBHOOK PAYLOAD
+// Sent on every bar close. Includes ALL layers:
+//   ICT:       killzone, market_structure, fvg, ob, sweep, cisd,
+//              premium, discount, htf_bias, extended_1sd
+//   Order Flow: delta_block, delta_flip, tower_candle, three_bar,
+//               dom_proxy, spoof_proxy
+//   Liquidity: sweep as liquidity tap, bsl/ssl (equal H/L detected this bar)
+//   Score:     long_score, short_score, long_conf, short_conf
+//   Signals:   long_signal, short_signal
+// ══════════════════════════════════════════════════════════════
+fvg_b = fvg_bull_raw ? 1 : 0
+fvg_r = fvg_bear_raw ? 1 : 0
+ob_b  = bull_ob_bar  ? 1 : 0
+ob_r  = bear_ob_bar  ? 1 : 0
+sw_h  = sweep_hi     ? 1 : 0
+sw_l  = sweep_lo     ? 1 : 0
+cs_b  = cisd_bull    ? 1 : 0
+cs_r  = cisd_bear    ? 1 : 0
+prem  = premium      ? 1 : 0
+disc  = discount     ? 1 : 0
+bos_b = bos_bull     ? 1 : 0
+bos_r = bos_bear     ? 1 : 0
+db_b  = db_bull      ? 1 : 0
+db_r  = db_bear      ? 1 : 0
+df_b  = delta_flip_bull ? 1 : 0
+df_r  = delta_flip_bear ? 1 : 0
+tc_b  = tower_bull   ? 1 : 0
+tc_r  = tower_bear   ? 1 : 0
+tbe_b = three_bull_exhaust ? 1 : 0
+tbe_r = three_bear_exhaust ? 1 : 0
+sp_b  = spoof_bid_proxy ? 1 : 0
+sp_r  = spoof_ask_proxy ? 1 : 0
+ls    = long_sig     ? 1 : 0
+ss    = short_sig    ? 1 : 0
+ext1  = (extended_1sd_lo or extended_1sd_hi) ? 1 : 0
+ext2  = (extended_lo or extended_hi) ? 1 : 0
+in_fvg_b = in_bull_fvg ? 1 : 0
+in_fvg_r = in_bear_fvg ? 1 : 0
+at_ob_b  = at_bull_ob  ? 1 : 0
+at_ob_r  = at_bear_ob  ? 1 : 0
+wrecking_ball = (hour(time, "America/New_York") == 9 and minute(time, "America/New_York") >= 30 and minute(time, "America/New_York") < 35) ? 1 : 0
+
+if barstate.isconfirmed
+    payload =
+         '{"source":"tradingview",' +
+         '"ticker":"'          + ticker                           + '",' +
+         '"timeframe":"'       + timeframe.period                 + '",' +
+         '"open":'             + str.tostring(open)               + ',' +
+         '"high":'             + str.tostring(high)               + ',' +
+         '"low":'              + str.tostring(low)                + ',' +
+         '"close":'            + str.tostring(close)              + ',' +
+         '"volume":'           + str.tostring(volume)             + ',' +
+         '"vwap":'             + str.tostring(v)                  + ',' +
+         '"vwap_1sd_hi":'      + str.tostring(v_1hi)             + ',' +
+         '"vwap_1sd_lo":'      + str.tostring(v_1lo)             + ',' +
+         '"vwap_2sd_hi":'      + str.tostring(v_2hi)             + ',' +
+         '"vwap_2sd_lo":'      + str.tostring(v_2lo)             + ',' +
+         '"eq":'               + str.tostring(eq)                 + ',' +
+         '"htf_bias":"'        + htf_bias                         + '",' +
+         '"killzone":"'        + killzone_str                     + '",' +
+         '"market_structure":"'+ ms_str                           + '",' +
+         '"fvg_bull":'         + str.tostring(fvg_b)             + ',' +
+         '"fvg_bear":'         + str.tostring(fvg_r)             + ',' +
+         '"in_bull_fvg":'      + str.tostring(in_fvg_b)          + ',' +
+         '"in_bear_fvg":'      + str.tostring(in_fvg_r)          + ',' +
+         '"ob_bull":'          + str.tostring(ob_b)              + ',' +
+         '"ob_bear":'          + str.tostring(ob_r)              + ',' +
+         '"at_bull_ob":'       + str.tostring(at_ob_b)           + ',' +
+         '"at_bear_ob":'       + str.tostring(at_ob_r)           + ',' +
+         '"sweep_high":'       + str.tostring(sw_h)              + ',' +
+         '"sweep_low":'        + str.tostring(sw_l)              + ',' +
+         '"cisd_bull":'        + str.tostring(cs_b)              + ',' +
+         '"cisd_bear":'        + str.tostring(cs_r)              + ',' +
+         '"bos_bull":'         + str.tostring(bos_b)             + ',' +
+         '"bos_bear":'         + str.tostring(bos_r)             + ',' +
+         '"premium":'          + str.tostring(prem)              + ',' +
+         '"discount":'         + str.tostring(disc)              + ',' +
+         '"extended_1sd":'     + str.tostring(ext1)              + ',' +
+         '"extended_2sd":'     + str.tostring(ext2)              + ',' +
+         '"delta_bull":'       + str.tostring(db_b)              + ',' +
+         '"delta_bear":'       + str.tostring(db_r)              + ',' +
+         '"delta_flip_bull":'  + str.tostring(df_b)              + ',' +
+         '"delta_flip_bear":'  + str.tostring(df_r)              + ',' +
+         '"tower_bull":'       + str.tostring(tc_b)              + ',' +
+         '"tower_bear":'       + str.tostring(tc_r)              + ',' +
+         '"three_bar_bull":'   + str.tostring(tbe_b)             + ',' +
+         '"three_bar_bear":'   + str.tostring(tbe_r)             + ',' +
+         '"dom_proxy":'        + str.tostring(math.round(dom_proxy)) + ',' +
+         '"spoof_bid":'        + str.tostring(sp_b)              + ',' +
+         '"spoof_ask":'        + str.tostring(sp_r)              + ',' +
+         '"long_score":'       + str.tostring(long_score)        + ',' +
+         '"short_score":'      + str.tostring(short_score)       + ',' +
+         '"long_conf":'        + str.tostring(long_conf)         + ',' +
+         '"short_conf":'       + str.tostring(short_conf)        + ',' +
+         '"long_signal":'      + str.tostring(ls)                + ',' +
+         '"short_signal":'     + str.tostring(ss)                + ',' +
+         '"wrecking_ball":'    + str.tostring(wrecking_ball)     + '}'
+    alert(payload, alert.freq_once_per_bar_close)
