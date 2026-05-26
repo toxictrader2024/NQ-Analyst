@@ -197,8 +197,8 @@ function evaluateMuzziChecklist(d: DashboardData): MuzziResult {
   const checklist: ChecklistItem[] = [
     {
       id: 1,
-      label: "HTF Bias (Daily + 4H)",
-      detail: `Current bias: ${bias}. Confirm Daily + 4H before session.`,
+      label: "15m Bias — Bullish or Bearish (Session Direction),",
+      detail: `15m bias: ${bias}. This is your session direction — all entries must align with the 15m trend.`,
       status: bias !== "NEUTRAL" ? "pass" : "fail",
       weight: "primary",
     },
@@ -233,7 +233,7 @@ function evaluateMuzziChecklist(d: DashboardData): MuzziResult {
     },
     {
       id: 5,
-      label: "MSS / CHOCH Confirmed (1m or 5m)",
+      label: "5m Setup — MSS / CHOCH Confirmed (Structure Shift on 5m Chart)",
       detail: mssPresent
         ? `✓ ${w.marketStructure?.replace(/_/g, " ").toUpperCase()} — ${mssAligned ? "aligned with bias" : "⚠ check alignment"}`
         : "✗ No Market Structure Shift detected",
@@ -273,21 +273,21 @@ function evaluateMuzziChecklist(d: DashboardData): MuzziResult {
     },
     {
       id: 8,
-      label: "Three-Bar Play Complete OR Tower Candle 66% Fill (97.4% exhaustion)",
-      detail: "Manual confirmation required — check 1m chart for three-candle exhaustion sequence or Tower Candle 66% rule.",
+      label: "1m Trigger — Three-Bar Play or Tower Candle 66% Fill (97.4% exhaustion)",
+      detail: "1m TRIGGER: Three-bar exhaustion sequence or Tower Candle body 66% filled on the 1m chart. This is your pull-the-trigger signal.",
       status: "unknown",
       weight: "secondary",
     },
     {
       id: 9,
-      label: "Delta Flip at Zone — The 'Right Now' Execution Signal",
-      detail: "Manual confirmation required — verify delta flipped from sell to buy (long) or buy to sell (short) at your zone.",
+      label: "1m Trigger — Delta Flip at Zone (Execution Signal)",
+      detail: "1m TRIGGER: Delta flipped from sell → buy (long) or buy → sell (short) at your zone. This is the 'right now' execution signal — Sierra Chart confirms.",
       status: "unknown",
       weight: "secondary",
     },
     {
       id: 10,
-      label: "No Body Close Inside Propulsion Candle (or retest complete)",
+      label: "1m Trigger — No Body Close Inside Propulsion Candle (retest complete)",
       detail: "Manual confirmation required — body of entry candle must NOT close inside the propulsion candle's body.",
       status: "unknown",
       weight: "secondary",
@@ -310,11 +310,11 @@ function evaluateMuzziChecklist(d: DashboardData): MuzziResult {
 
   if (passPrimary >= totalPrimary && passSecondary >= 1 && gravityFinal >= 2) {
     grade = "A+";
-    coachingNote = "A+ setup — Institutional Gravity confirmed. This is the trade. Execute with conviction. Size up within your risk plan.";
+    coachingNote = "A+ setup — 15m bias aligned, 5m structure confirmed, 1m trigger ready. Execute with conviction. Institutional Gravity confirmed.";
     statEdge = vwapAligned ? "Mean Reversion edge active — 82% win rate when price is extended from VWAP + 20 EMA simultaneously." : null;
   } else if (passPrimary >= 4) {
     grade = "A";
-    coachingNote = "Strong A setup — core criteria met. Delta Flip or Three-Bar Play not yet confirmed. Wait for item 8 or 9 before pulling the trigger. Patience is the trade.";
+    coachingNote = "Strong A setup — 15m bias + 5m structure confirmed. Waiting for 1m trigger: Delta Flip (item 9) or Three-Bar Play (item 8). Patience is the trade.";
   } else if (passPrimary >= 3) {
     grade = "B";
     coachingNote = "B setup — structure is building but Institutional Gravity is not there yet. Stay on the sideline and let price come to your zone. The market pays for discipline.";
@@ -347,11 +347,11 @@ function evaluateMuzziChecklist(d: DashboardData): MuzziResult {
 
 function buildEmptyChecklist(): ChecklistItem[] {
   const labels = [
-    ["HTF Bias (Daily + 4H)", "primary"],
+    ["15m Bias — Session Direction", "primary"],
     ["Dealing Range — Discount (Long) / Premium (Short)", "primary"],
     ["Kill Zone Active", "primary"],
     ["Session H/L Swept — Manipulation Leg Complete", "primary"],
-    ["MSS / CHOCH Confirmed (1m or 5m)", "primary"],
+    ["5m Setup — MSS / CHOCH Structure Shift", "primary"],
     ["Confluence Zone — OB / BB / FVG / OTE", "primary"],
     ["VWAP + 20 EMA Aligned", "secondary"],
     ["Three-Bar Play or Tower Candle 66% Fill", "secondary"],
@@ -590,8 +590,8 @@ export default function MuzziAnalyzer() {
           ))}
         </div>
         <p className="text-[10px] text-muted-foreground mt-3 leading-relaxed border-t border-border/40 pt-2">
-          Grey items (1m / 5m) require manual verification on chart. Auto-detected items use live
-          TradingView webhook data. Complete all 10 before entry.
+          15m = bias/direction | 5m = setup structure | 1m = trigger execution.
+          Grey items require manual chart verification. Auto-detected items use live TradingView + Sierra Chart data.
         </p>
       </div>
 

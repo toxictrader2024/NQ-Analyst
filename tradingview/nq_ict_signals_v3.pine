@@ -54,6 +54,35 @@ bgcolor(show_kz and ny_close    ? color.new(color.orange, 93) : na, title="NY Cl
 
 killzone = asia_sess ? "asia" : london_open ? "london_open" : ny_open ? "ny_open" : ny_close ? "ny_close" : ""
 
+// ══ Multi-Timeframe Bias (15m = bias, 5m = setup, 1m = trigger) ══════════
+// Fetch 15m market structure shift regardless of chart timeframe
+// so every webhook (1m or 5m chart) also carries the session bias
+htf_close  = request.security(syminfo.tickerid, "15", close,      lookahead=barmerge.lookahead_off)
+htf_high   = request.security(syminfo.tickerid, "15", high,       lookahead=barmerge.lookahead_off)
+htf_low    = request.security(syminfo.tickerid, "15", low,        lookahead=barmerge.lookahead_off)
+htf_ph     = request.security(syminfo.tickerid, "15", ta.pivothigh(high, 5, 5), lookahead=barmerge.lookahead_off)
+htf_pl     = request.security(syminfo.tickerid, "15", ta.pivotlow(low,   5, 5), lookahead=barmerge.lookahead_off)
+
+// 15m bias: price above recent 15m high = bullish, below recent 15m low = bearish
+var float htf_prev_hi = na
+var float htf_prev_lo = na
+if not na(htf_ph)
+    htf_prev_hi := htf_ph
+if not na(htf_pl)
+    htf_prev_lo := htf_pl
+
+htf_bias = na(htf_prev_hi) or na(htf_prev_lo) ? "neutral" :
+     htf_close > htf_prev_hi ? "bullish" :
+     htf_close < htf_prev_lo ? "bearish" : "neutral"
+
+// 15m EQ and zone
+htf_eq     = na(htf_prev_hi) or na(htf_prev_lo) ? close : (htf_prev_hi + htf_prev_lo) / 2
+htf_prem   = htf_close > htf_eq ? 1 : 0
+htf_disc   = htf_close < htf_eq ? 1 : 0
+
+// Label this bar's timeframe so the server can route to the correct tier
+bar_tf = timeframe.period   // "1", "5", or "15" depending on chart
+
 // ══ VWAP + 2 Std Dev Bands ════════════════════════════════
 v       = ta.vwap(close)
 v_src   = (high + low + close) / 3
@@ -507,30 +536,33 @@ long_sig_int  = long_signal      ? 1 : 0
 short_sig_int = short_signal     ? 1 : 0
 
 if barstate.isconfirmed
-    payload = '{"ticker":"'          + ticker                        + '",' +
-              '"timeframe":"'         + str.tostring(timeframe.period) + '",' +
-              '"open":'               + str.tostring(open)            + ',' +
-              '"high":'               + str.tostring(high)            + ',' +
-              '"low":'                + str.tostring(low)             + ',' +
-              '"close":'              + str.tostring(close)           + ',' +
-              '"volume":'             + str.tostring(volume)          + ',' +
-              '"vwap":'               + str.tostring(v)               + ',' +
-              '"killzone":"'          + killzone                      + '",' +
-              '"market_structure":"'  + ms                            + '",' +
-              '"fvg_bull":'           + str.tostring(fvg_bull_sig)    + ',' +
-              '"fvg_bear":'           + str.tostring(fvg_bear_sig)    + ',' +
-              '"ob_bull":'            + str.tostring(ob_bull_sig)     + ',' +
-              '"ob_bear":'            + str.tostring(ob_bear_sig)     + ',' +
-              '"cisd_bull":'          + str.tostring(cisd_bull_sig)   + ',' +
-              '"cisd_bear":'          + str.tostring(cisd_bear_sig)   + ',' +
-              '"delta_bull":'         + str.tostring(delta_bull_s)    + ',' +
-              '"delta_bear":'         + str.tostring(delta_bear_s)    + ',' +
-              '"sweep_high":'         + (sweep_hi ? "1" : "0")        + ',' +
-              '"sweep_low":'          + (sweep_lo ? "1" : "0")        + ',' +
-              '"premium":'            + (premium  ? "1" : "0")        + ',' +
-              '"discount":'           + (discount ? "1" : "0")        + ',' +
-              '"long_signal":'        + str.tostring(long_sig_int)    + ',' +
-              '"short_signal":'       + str.tostring(short_sig_int)   + ',' +
-              '"long_conf":'          + str.tostring(long_conf)       + ',' +
-              '"short_conf":'         + str.tostring(short_conf)      + '}'
-    alert(payload, alert.freq_once_per_bar_close)
+    payload = '{"ticker":"' + ticker + '",' +
+              '"timeframe":"' + bar_tf + '",' +
+              '"htf_bias":"' + htf_bias + '",' +
+              '"htf_premium":' + str.tostring(htf_prem) + ',' +
+              '"htf_discount":' + str.tostring(htf_disc) + ',' +
+              '"open":' + str.tostring(open) + ',' +
+              '"high":' + str.tostring(high) + ',' +
+              '"low":' + str.tostring(low) + ',' +
+              '"close":' + str.tostring(close) + ',' +
+              '"volume":' + str.tostring(volume) + ',' +
+              '"vwap":' + str.tostring(v) + ',' +
+              '"killzone":"' + killzone + '",' +
+              '"market_structure":"' + ms + '",' +
+              '"fvg_bull":' + str.tostring(fvg_bull_sig) + ',' +
+              '"fvg_bear":' + str.tostring(fvg_bear_sig) + ',' +
+              '"ob_bull":' + str.tostring(ob_bull_sig) + ',' +
+              '"ob_bear":' + str.tostring(ob_bear_sig) + ',' +
+              '"cisd_bull":' + str.tostring(cisd_bull_sig) + ',' +
+              '"cisd_bear":' + str.tostring(cisd_bear_sig) + ',' +
+              '"delta_bull":' + str.tostring(delta_bull_s) + ',' +
+              '"delta_bear":' + str.tostring(delta_bear_s) + ',' +
+              '"sweep_high":' + (sweep_hi ? "1" : "0") + ',' +
+              '"sweep_low":' + (sweep_lo ? "1" : "0") + ',' +
+              '"premium":' + (premium ? "1" : "0") + ',' +
+              '"discount":' + (discount ? "1" : "0") + ',' +
+              '"long_signal":' + str.tostring(long_sig_int) + ',' +
+              '"short_signal":' + str.tostring(short_sig_int) + ',' +
+              '"long_conf":' + str.tostring(long_conf) + ',' +
+              '"short_conf":' + str.tostring(short_conf) + '}' 
+        alert(payload, alert.freq_once_per_bar_close)
