@@ -8,6 +8,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { detectTriggers, generateCommentary, updateState } from "./commentaryEngine";
 import { getPersonality, setPersonality, isTrashTalk, buildVwapRel, type MarketContext, type PersonalityId } from "./personalities";
 import {
+  evaluateSignal,
+  clearExpiredSignals,
   getPendingSignal,
   confirmSignal,
   updateSignalResult,
@@ -29,6 +31,12 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   orderFlowConfluences: string[];
   warnings: string[];
   hasOrderFlow: boolean;
+  tvLatest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;
+  scLatest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;
+  tvFresh: boolean;
+  scFresh: boolean;
+  tvAge: number;
+  scAge: number;
 } {
   const confluences: string[] = [];
   const orderFlowConfluences: string[] = [];
@@ -38,16 +46,34 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   let ofBullPoints = 0;
   let ofBearPoints = 0;
 
-  const recent = webhooks.slice(0, 10);
-  const latest = recent[0];
+  // Split streams — ICT data from TradingView, order flow from Sierra Chart
+  const tvWebhooks = webhooks.filter(w => w.source === 'tradingview' || (!w.source && w.killzone !== null));
+  const scWebhooks = webhooks.filter(w => w.source === 'sierra_chart' || w.source === 'bookmap_cme');
 
-  if (!latest) return { score: 0, ictScore: 0, orderFlowScore: 0, bias: "NEUTRAL", confluences: ["No data received yet"], orderFlowConfluences: [], warnings: [], hasOrderFlow: false };
+  // Use most recent TradingView webhook for ICT signals (up to 30 min old)
+  const tvLatest = tvWebhooks[0] ?? null;
+  const tvAge = tvLatest ? Date.now() - tvLatest.receivedAt : Infinity;
+  const tvFresh = tvAge < 30 * 60 * 1000; // 30 min
 
-  // ── ICT Signals ────────────────────────────────────────────────────────────
+  // Use most recent Sierra Chart webhook for order flow (up to 5 min old)
+  const scLatest = scWebhooks[0] ?? null;
+  const scAge = scLatest ? Date.now() - scLatest.receivedAt : Infinity;
+  const scFresh = scAge < 5 * 60 * 1000; // 5 min
+
+  // Price: prefer SC (most current tick), fall back to TV
+  const priceSource = scLatest ?? tvLatest ?? webhooks[0];
+
+  if (!priceSource) return { score: 0, ictScore: 0, orderFlowScore: 0, bias: "NEUTRAL", confluences: ["No data received yet"], orderFlowConfluences: [], warnings: [], hasOrderFlow: false, tvLatest: null, scLatest: null, tvFresh: false, scFresh: false, tvAge: Infinity, scAge: Infinity };
+
+  // ── ICT Signals (from TradingView) ─────────────────────────────────────────
+
+  if (!tvFresh) {
+    warnings.push("TradingView ICT signals stale (>30min) — order flow only");
+  }
 
   // Killzone check
-  if (latest.killzone) {
-    const kzLabel = latest.killzone.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+  if (tvLatest?.killzone) {
+    const kzLabel = tvLatest.killzone.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
     confluences.push(`Active Killzone: ${kzLabel}`);
     bullPoints += 8;
     bearPoints += 8;
@@ -56,52 +82,51 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   }
 
   // Market structure
-  if (latest.marketStructure) {
-    if (latest.marketStructure.includes("bull")) {
-      confluences.push(`Bullish Market Structure: ${latest.marketStructure.replace(/_/g, " ").toUpperCase()}`);
+  if (tvLatest?.marketStructure) {
+    if (tvLatest.marketStructure.includes("bull")) {
+      confluences.push(`Bullish Market Structure: ${tvLatest.marketStructure.replace(/_/g, " ").toUpperCase()}`);
       bullPoints += 20;
-    } else if (latest.marketStructure.includes("bear")) {
-      confluences.push(`Bearish Market Structure: ${latest.marketStructure.replace(/_/g, " ").toUpperCase()}`);
+    } else if (tvLatest.marketStructure.includes("bear")) {
+      confluences.push(`Bearish Market Structure: ${tvLatest.marketStructure.replace(/_/g, " ").toUpperCase()}`);
       bearPoints += 20;
     }
   }
 
   // FVG
-  if (latest.fvgBull) { confluences.push("Bullish Fair Value Gap present"); bullPoints += 15; }
-  if (latest.fvgBear) { confluences.push("Bearish Fair Value Gap present"); bearPoints += 15; }
+  if (tvLatest?.fvgBull) { confluences.push("Bullish Fair Value Gap present"); bullPoints += 15; }
+  if (tvLatest?.fvgBear) { confluences.push("Bearish Fair Value Gap present"); bearPoints += 15; }
 
   // Order Blocks
-  if (latest.obBull) { confluences.push("Bullish Order Block in range"); bullPoints += 12; }
-  if (latest.obBear) { confluences.push("Bearish Order Block in range"); bearPoints += 12; }
+  if (tvLatest?.obBull) { confluences.push("Bullish Order Block in range"); bullPoints += 12; }
+  if (tvLatest?.obBear) { confluences.push("Bearish Order Block in range"); bearPoints += 12; }
 
   // Liquidity sweeps
-  if (latest.sweepLow) { confluences.push("Recent low swept — bullish setup likely"); bullPoints += 18; }
-  if (latest.sweepHigh) { confluences.push("Recent high swept — bearish setup likely"); bearPoints += 18; }
+  if (tvLatest?.sweepLow) { confluences.push("Recent low swept — bullish setup likely"); bullPoints += 18; }
+  if (tvLatest?.sweepHigh) { confluences.push("Recent high swept — bearish setup likely"); bearPoints += 18; }
 
   // Premium / Discount
-  if (latest.discount) { confluences.push("Price in discount zone (below EQ) — long bias"); bullPoints += 12; }
-  if (latest.premium) { confluences.push("Price in premium zone (above EQ) — short bias"); bearPoints += 12; }
+  if (tvLatest?.discount) { confluences.push("Price in discount zone (below EQ) — long bias"); bullPoints += 12; }
+  if (tvLatest?.premium) { confluences.push("Price in premium zone (above EQ) — short bias"); bearPoints += 12; }
 
-  // VWAP relationship
-  if (latest.vwap && latest.close) {
-    if (latest.close > latest.vwap) { confluences.push("Price above VWAP — bullish intraday"); bullPoints += 8; }
+  // VWAP relationship (prefer TV for VWAP context, priceSource for close)
+  const vwapSource = tvLatest ?? priceSource;
+  if (vwapSource.vwap && priceSource.close) {
+    if (priceSource.close > vwapSource.vwap) { confluences.push("Price above VWAP — bullish intraday"); bullPoints += 8; }
     else { confluences.push("Price below VWAP — bearish intraday"); bearPoints += 8; }
   }
 
-  // Trend consistency across recent bars
-  const bullBars = recent.filter(w => (w.marketStructure || "").includes("bull")).length;
-  const bearBars = recent.filter(w => (w.marketStructure || "").includes("bear")).length;
+  // Trend consistency across recent TradingView bars
+  const bullBars = tvWebhooks.filter(w => (w.marketStructure || "").includes("bull")).length;
+  const bearBars = tvWebhooks.filter(w => (w.marketStructure || "").includes("bear")).length;
   if (bullBars > bearBars + 2) { confluences.push("Consistent bullish structure (multi-bar)"); bullPoints += 10; }
   if (bearBars > bullBars + 2) { confluences.push("Consistent bearish structure (multi-bar)"); bearPoints += 10; }
 
-  // ── Order Flow Signals (Bookmap CME) ───────────────────────────────────────
-  // Find the most recent Bookmap signal
-  const ofLatest = recent.find(w => w.source === "bookmap_cme");
-  const hasOrderFlow = !!ofLatest;
+  // ── Order Flow Signals (Sierra Chart / Bookmap CME) ────────────────────────
+  const hasOrderFlow = scFresh && !!scLatest;
 
-  if (ofLatest) {
+  if (scLatest) {
     const { delta, bidStackSize, askStackSize, absorptionBull, absorptionBear,
-            imbalanceBull, imbalanceBear, largeBuyCount, largeSellCount, vapPoc, close } = ofLatest;
+            imbalanceBull, imbalanceBear, largeBuyCount, largeSellCount, vapPoc, close } = scLatest;
 
     // Delta (buy vol - sell vol) — strongest signal
     if (delta !== null && delta !== undefined) {
@@ -182,8 +207,8 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   }
 
   // Warnings from price action
-  if (latest.close && latest.high && latest.low) {
-    const range = latest.high - latest.low;
+  if (priceSource.close && priceSource.high && priceSource.low) {
+    const range = priceSource.high - priceSource.low;
     if (range < 10) warnings.push("Tight range bar — low momentum");
     if (range > 80) warnings.push("Extended range — potential exhaustion");
   }
@@ -201,7 +226,7 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   const ictScore = Math.min(100, Math.round((Math.max(bullPoints - ofBullPoints, bearPoints - ofBearPoints) / ictMax) * 100));
   const orderFlowScore = hasOrderFlow ? Math.min(100, Math.round((Math.max(ofBullPoints, ofBearPoints) / ofMax) * 100)) : 0;
 
-  return { score, ictScore, orderFlowScore, bias, confluences, orderFlowConfluences, warnings, hasOrderFlow };
+  return { score, ictScore, orderFlowScore, bias, confluences, orderFlowConfluences, warnings, hasOrderFlow, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge };
 }
 
 // ── Build AI context prompt ──────────────────────────────────────────────────
@@ -213,7 +238,13 @@ function buildAnalysisPrompt(
   warnings: string[],
   userQuestion?: string,
   session?: string,
-  livePrice?: number | null
+  livePrice?: number | null,
+  tvLatest?: ReturnType<typeof storage.getRecentWebhooks>[number] | null,
+  scLatest?: ReturnType<typeof storage.getRecentWebhooks>[number] | null,
+  tvFresh?: boolean,
+  scFresh?: boolean,
+  tvAge?: number,
+  scAge?: number
 ): string {
   const latest = webhooks[0];
   // Prefer live Yahoo Finance price over stale webhook close
@@ -251,6 +282,11 @@ ${ofLatest.delta !== null && ofLatest.delta! > 0 && ofLatest.close !== null && o
 ${ofLatest.delta !== null && ofLatest.delta! < 0 && ofLatest.close !== null && ofLatest.close! > (ofLatest.vwap ?? 0) ? "→ Negative delta above VWAP = distribution in premium — potential short setup" : ""}
 ` : "ORDER FLOW: Sierra Chart not yet connected. Install NQ_Analyst_Bridge.cpp study in Sierra Chart to enable live delta, DOM, and absorption data.";
 
+  const tvFreshFlag = tvFresh ?? false;
+  const scFreshFlag = scFresh ?? false;
+  const tvAgeMin = tvAge !== undefined && tvAge !== Infinity ? Math.round(tvAge / 60000) : null;
+  const scAgeMin = scAge !== undefined && scAge !== Infinity ? Math.round(scAge / 60000) : null;
+
   const systemPrompt = `You are an elite NQ futures quant analyst combining ICT (Inner Circle Trader) methodology with live order flow analysis from Sierra Chart CME data.
 You analyze NQ (Nasdaq 100 E-mini futures) using: kill zones (London Open 2-5am CT, NY Open 7-10am CT, NY Close 1-3pm CT), 
 market structure (BOS/CHoCH), fair value gaps, order blocks, liquidity sweeps, premium/discount zones, VWAP, and 15-min bias with 1-min entries.
@@ -286,6 +322,10 @@ CURRENT MARKET DATA:
 - Session Bias: ${bias}
 - ICT Confluences: ${confluences.join("; ")}
 - Warnings: ${warnings.length ? warnings.join("; ") : "None"}
+- TradingView ICT Data: ${tvFreshFlag ? `LIVE (${tvAgeMin}min ago)` : 'STALE/DISCONNECTED'}
+- Sierra Chart Order Flow: ${scFreshFlag ? `LIVE (${scAgeMin}min ago)` : 'STALE/DISCONNECTED'}
+- ICT: killzone=${tvLatest?.killzone||'none'} | structure=${tvLatest?.marketStructure||'none'} | fvgBull=${tvLatest?.fvgBull||0} fvgBear=${tvLatest?.fvgBear||0} | obBull=${tvLatest?.obBull||0} obBear=${tvLatest?.obBear||0} | sweepHigh=${tvLatest?.sweepHigh||0} sweepLow=${tvLatest?.sweepLow||0} | premium=${tvLatest?.premium||0} discount=${tvLatest?.discount||0}
+- OrderFlow: delta=${scLatest?.delta??'n/a'} | bid=${scLatest?.bidStackSize??'n/a'} ask=${scLatest?.askStackSize??'n/a'} | absorbBull=${scLatest?.absorptionBull||0} absorbBear=${scLatest?.absorptionBear||0}
 
 ${ofSection}
 
@@ -394,12 +434,12 @@ export function registerRoutes(httpServer: Server, app: Express) {
       // Auto-generate analysis on webhook if AI key is present
       if (process.env.ANTHROPIC_API_KEY) {
         const webhooks = storage.getRecentWebhooks(10);
-        const { score, ictScore, bias, confluences, warnings } = scoreSetup(webhooks);
+        const { score, ictScore, bias, confluences, warnings, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge } = scoreSetup(webhooks);
 
         if (score >= 40) {
           try {
             const livePrice = await fetchLiveNQPrice();
-            const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings, undefined, activeSession, livePrice);
+            const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings, undefined, activeSession, livePrice, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge);
             const msg = await anthropic.messages.create({
               model: "claude-opus-4-5",
               max_tokens: 800,
@@ -427,6 +467,42 @@ export function registerRoutes(httpServer: Server, app: Express) {
             console.error("AI analysis failed:", e);
           }
         }
+      }
+
+      // ── Signal Engine — evaluate for auto-trade signal ────────────────────
+      // Uses TV fast-path (long_signal/short_signal from Pine v3) or server scoring
+      try {
+        clearExpiredSignals();
+        // Only evaluate TV webhooks — SC sends too frequently with no ICT data
+        const isTVWebhook = !body.source || body.source === 'tradingview';
+        if (isTVWebhook) {
+          const freshWebhooks = storage.getRecentWebhooks(10);
+          const { score, bias, orderFlowScore, tvLatest, scLatest } = scoreSetup(freshWebhooks);
+
+          // Build merged marketData object — ICT from TV, order flow from SC
+          const mergedMarketData = {
+            close: tvLatest?.close ?? scLatest?.close ?? null,
+            delta: scLatest?.delta ?? null,
+            bias,
+            score,
+            orderFlowScore,
+            absorptionBull: scLatest?.absorptionBull ?? null,
+            absorptionBear: scLatest?.absorptionBear ?? null,
+            // Pine Script v3 direct signal fields
+            long_signal: body.long_signal ? Number(body.long_signal) : undefined,
+            short_signal: body.short_signal ? Number(body.short_signal) : undefined,
+            long_conf: body.long_conf ? Number(body.long_conf) : undefined,
+            short_conf: body.short_conf ? Number(body.short_conf) : undefined,
+            killzone: body.killzone || body.kz || null,
+          };
+
+          const newSignal = evaluateSignal(mergedMarketData, activeSession);
+          if (newSignal) {
+            console.log(`[Webhook] Auto-signal fired: ${newSignal.direction.toUpperCase()} @ ${newSignal.entry}`);
+          }
+        }
+      } catch (sigErr) {
+        console.error("[Signal] Evaluation error:", sigErr);
       }
 
       return res.json({ ok: true, id: saved.id });
@@ -515,7 +591,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
   // ── POST /api/analyze — Manual analysis trigger ───────────────────────────
   app.post("/api/analyze", async (req, res) => {
     const webhooks = storage.getRecentWebhooks(10);
-    const { score, ictScore, bias, confluences, warnings } = scoreSetup(webhooks);
+    const { score, ictScore, bias, confluences, warnings, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge } = scoreSetup(webhooks);
 
     if (!process.env.ANTHROPIC_API_KEY) {
       // Demo mode — use live price, never stale webhook close
@@ -545,7 +621,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
     try {
       const livePrice = await fetchLiveNQPrice();
-      const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings, undefined, activeSession, livePrice);
+      const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings, undefined, activeSession, livePrice, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge);
       const msg = await anthropic.messages.create({
         model: "claude-opus-4-5",
         max_tokens: 1000,

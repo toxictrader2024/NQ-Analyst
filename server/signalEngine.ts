@@ -4,6 +4,12 @@
  * Evaluates ICT conditions and generates automated trade signals.
  * Signals are stored in-memory (max 200) and are ephemeral — they do not
  * persist to SQLite to keep the schema untouched.
+ *
+ * v2 changes:
+ *  - Added London killzone support (was NY-only, missing all London signals)
+ *  - Added Pine Script v3 fast-path: if TV sends long_signal=1/short_signal=1,
+ *    trust it directly instead of re-scoring (TV already enforces confluence gates)
+ *  - Killzone now covers: London Open 2-5am ET, NY Open 9:30-11am ET, London Close 1:30-2pm ET
  */
 
 export interface TradeSignal {
@@ -39,22 +45,34 @@ function generateId(): string {
 }
 
 /**
- * Returns true when the current ET wall-clock time falls inside a NY killzone:
- *   - NY Open: 09:30 – 11:00 ET
- *   - London Close: 13:30 – 14:00 ET
+ * Returns true when current ET wall-clock time falls inside any active killzone:
+ *   - London Open:   02:00 – 05:00 ET  (Asia sweep / Silver Bullet / Turtle Soup)
+ *   - NY Open:       09:30 – 11:00 ET
+ *   - London Close:  13:30 – 14:00 ET
  */
-function isNYKillzone(): boolean {
+function isInKillzone(): { active: boolean; name: string } {
   const now = new Date();
-  // ET offset: UTC-5 standard / UTC-4 daylight; simplify via Intl
-  const etStr = now.toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false });
+  const etStr = now.toLocaleString('en-US', {
+    timeZone: 'America/New_York',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
   const [hStr, mStr] = etStr.split(':');
   const etMinutes = parseInt(hStr, 10) * 60 + parseInt(mStr, 10);
 
-  const nyOpen     = { start: 9 * 60 + 30,  end: 11 * 60 };       // 09:30–11:00
-  const londonClose = { start: 13 * 60 + 30, end: 14 * 60 };      // 13:30–14:00
+  const londonOpen  = { start: 2  * 60,       end: 5  * 60 };       // 02:00–05:00
+  const nyOpen      = { start: 9  * 60 + 30,  end: 11 * 60 };       // 09:30–11:00
+  const londonClose = { start: 13 * 60 + 30,  end: 14 * 60 };       // 13:30–14:00
 
-  return (etMinutes >= nyOpen.start     && etMinutes < nyOpen.end) ||
-         (etMinutes >= londonClose.start && etMinutes < londonClose.end);
+  if (etMinutes >= londonOpen.start  && etMinutes < londonOpen.end)
+    return { active: true, name: 'london_open' };
+  if (etMinutes >= nyOpen.start      && etMinutes < nyOpen.end)
+    return { active: true, name: 'ny_open' };
+  if (etMinutes >= londonClose.start && etMinutes < londonClose.end)
+    return { active: true, name: 'london_close' };
+
+  return { active: false, name: '' };
 }
 
 /** Returns true if any signal is currently active (pending or filled). */
@@ -68,8 +86,12 @@ function hasActiveSignal(): boolean {
  * Evaluates the latest market snapshot and returns a TradeSignal if all
  * ICT conditions are met, or null otherwise.
  *
- * @param marketData  Latest merged data point (from storage.getLatestWebhook / combined)
- * @param session     Active session string ('asia' | 'london' | 'ny')
+ * FAST PATH: If the TradingView webhook includes long_signal=1 or short_signal=1
+ * (set by Pine Script v3 which already enforces killzone + discount/premium +
+ * min 2 confluences), we trust it directly and skip server-side re-scoring.
+ *
+ * STANDARD PATH: Falls back to server-side ICT score gate (score >= 65,
+ * order flow >= 60, directional delta/absorption) when TV signal fields absent.
  */
 export function evaluateSignal(marketData: any, session: string): TradeSignal | null {
   if (!marketData) return null;
@@ -82,6 +104,12 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     orderFlowScore,
     absorptionBull,
     absorptionBear,
+    // Pine Script v3 signal fields (may be absent from older TV alerts)
+    long_signal,
+    short_signal,
+    long_conf,
+    short_conf,
+    killzone: tvKillzone,
   } = marketData as {
     close: number | null;
     delta: number | null;
@@ -90,35 +118,85 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     orderFlowScore: number;
     absorptionBull: number | boolean | null;
     absorptionBear: number | boolean | null;
+    long_signal?: number;
+    short_signal?: number;
+    long_conf?: number;
+    short_conf?: number;
+    killzone?: string;
   };
 
   // ── Gate 1: must have a usable price ────────────────────────────────────────
   if (!price) return null;
 
-  // ── Gate 2: strong ICT score ─────────────────────────────────────────────────
-  if (score < 65) return null;
-
-  // ── Gate 3: NY session only ──────────────────────────────────────────────────
-  if (session !== 'ny') return null;
-
-  // ── Gate 4: NY killzone time ─────────────────────────────────────────────────
-  if (!isNYKillzone()) return null;
-
-  // ── Gate 5: one trade at a time ──────────────────────────────────────────────
+  // ── Gate 2: one trade at a time ──────────────────────────────────────────────
   if (hasActiveSignal()) return null;
 
-  // ── Gate 6: order flow confirmation ─────────────────────────────────────────
+  // ════════════════════════════════════════════════════════════════════════════
+  // FAST PATH — Pine Script v3 already validated confluence + killzone on-chart
+  // ════════════════════════════════════════════════════════════════════════════
+  const tvLong  = long_signal  === 1;
+  const tvShort = short_signal === 1;
+
+  if (tvLong || tvShort) {
+    const isLong    = tvLong;
+    const confCount = isLong ? (long_conf ?? 2) : (short_conf ?? 2);
+    const kzLabel   = tvKillzone || session || 'killzone';
+
+    const entry = price;
+    const sl    = isLong ? entry - 20 : entry + 20;
+    const tp1   = isLong ? entry + 30 : entry - 30;
+    const tp2   = isLong ? entry + 75 : entry - 75;
+
+    const reason = [
+      `TV signal (${confCount} conf)`,
+      `${isLong ? 'LONG' : 'SHORT'}`,
+      `KZ: ${kzLabel}`,
+      `${isLong ? 'Discount zone' : 'Premium zone'}`,
+    ].join(' | ');
+
+    const signal: TradeSignal = {
+      id:         generateId(),
+      direction:  isLong ? 'long' : 'short',
+      entry,
+      sl,
+      tp1,
+      tp2,
+      qty:        1,
+      session:    kzLabel,
+      confidence: Math.min(100, 60 + confCount * 8), // approx confidence from conf count
+      reason,
+      createdAt:  Date.now(),
+      status:     'pending',
+    };
+
+    signals.unshift(signal);
+    if (signals.length > MAX_SIGNALS) signals.splice(MAX_SIGNALS);
+    console.log(`[SignalEngine][TV FastPath] ${signal.direction.toUpperCase()} @ ${entry} | ${reason}`);
+    return signal;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // STANDARD PATH — server-side ICT scoring gates
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // ── Gate 3: strong ICT score ─────────────────────────────────────────────────
+  if (score < 65) return null;
+
+  // ── Gate 4: must be in a killzone (London OR NY — not just NY) ───────────────
+  const kz = isInKillzone();
+  if (!kz.active) return null;
+
+  // ── Gate 5: order flow confirmation ─────────────────────────────────────────
   if ((orderFlowScore ?? 0) < 60) return null;
 
   // ── Determine direction from bias ────────────────────────────────────────────
   const biasUpper = (bias || '').toUpperCase();
   if (biasUpper === 'NEUTRAL') return null;
-
   const isLong = biasUpper === 'BULLISH';
 
-  // ── Gate 7: directional order flow filter ────────────────────────────────────
-  const absBull = absorptionBull === 1 || absorptionBull === true;
-  const absBear = absorptionBear === 1 || absorptionBear === true;
+  // ── Gate 6: directional order flow filter ────────────────────────────────────
+  const absBull  = absorptionBull === 1 || absorptionBull === true;
+  const absBear  = absorptionBear === 1 || absorptionBear === true;
   const deltaNum = delta ?? 0;
 
   if (isLong  && !absBull && !(deltaNum > 0)) return null;
@@ -126,41 +204,40 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
 
   // ── Build signal levels ───────────────────────────────────────────────────────
   const entry = price;
-  const sl   = isLong ? entry - 20 : entry + 20;
-  const tp1  = isLong ? entry + 30 : entry - 30;
-  const tp2  = isLong ? entry + 75 : entry - 75;
+  const sl    = isLong ? entry - 20 : entry + 20;
+  const tp1   = isLong ? entry + 30 : entry - 30;
+  const tp2   = isLong ? entry + 75 : entry - 75;
 
   // ── Build reason string ───────────────────────────────────────────────────────
   const parts: string[] = [
     `Score ${score}/100`,
     `${biasUpper.charAt(0) + biasUpper.slice(1).toLowerCase()} bias`,
+    `KZ: ${kz.name}`,
   ];
   if (deltaNum !== 0) parts.push(`Delta ${deltaNum > 0 ? '+' : ''}${deltaNum}`);
-  if (absBull) parts.push('Bull absorption active');
-  if (absBear) parts.push('Bear absorption active');
-  parts.push('NY killzone');
+  if (absBull) parts.push('Bull absorption');
+  if (absBear) parts.push('Bear absorption');
   const reason = parts.join(' | ');
 
   // ── Create & store the signal ─────────────────────────────────────────────────
   const signal: TradeSignal = {
-    id: generateId(),
-    direction: isLong ? 'long' : 'short',
+    id:         generateId(),
+    direction:  isLong ? 'long' : 'short',
     entry,
     sl,
     tp1,
     tp2,
-    qty: 1,
-    session,
+    qty:        1,
+    session:    kz.name,
     confidence: score,
     reason,
-    createdAt: Date.now(),
-    status: 'pending',
+    createdAt:  Date.now(),
+    status:     'pending',
   };
 
   signals.unshift(signal);
   if (signals.length > MAX_SIGNALS) signals.splice(MAX_SIGNALS);
-
-  console.log(`[SignalEngine] New ${signal.direction.toUpperCase()} signal @ ${entry} | ${reason}`);
+  console.log(`[SignalEngine][Standard] ${signal.direction.toUpperCase()} @ ${entry} | ${reason}`);
   return signal;
 }
 
@@ -168,10 +245,8 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
 
 /** Returns the oldest 'pending' signal, or null if none exists. */
 export function getPendingSignal(): TradeSignal | null {
-  // signals are stored newest-first; pending is typically the most recent
   const pending = signals.filter(s => s.status === 'pending');
   if (!pending.length) return null;
-  // return oldest pending (lowest createdAt)
   return pending.reduce((oldest, s) => s.createdAt < oldest.createdAt ? s : oldest);
 }
 
@@ -233,7 +308,6 @@ export function getSignalStats(): {
   const wins = closed.filter(s => s.result === 'TP1' || s.result === 'TP2').length;
   const pnlPts = closed.reduce((sum, s) => sum + (s.pnlPoints ?? 0), 0);
 
-  // Today's P&L (ET calendar day)
   const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
   const todaySignals = closed.filter(s => {
     const d = new Date(s.createdAt).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });

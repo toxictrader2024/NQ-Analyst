@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { Button } from "@/components/ui/button";
@@ -9,7 +10,12 @@ import CommentaryFeed from "@/components/CommentaryFeed";
 import PersonalitySelector from "@/components/PersonalitySelector";
 import SessionToggle from "@/components/SessionToggle";
 import TradeLog from "@/components/TradeLog";
-import { RefreshCw, Zap, TrendingUp, TrendingDown, Minus, AlertTriangle, CheckCircle2, Clock, Loader2, FlaskConical } from "lucide-react";
+import MuzziAnalyzer from "@/components/MuzziAnalyzer";
+import {
+  RefreshCw, Zap, TrendingUp, TrendingDown, Minus,
+  AlertTriangle, CheckCircle2, Clock, Loader2, FlaskConical,
+  Target, BarChart2,
+} from "lucide-react";
 
 interface DashboardData {
   latestWebhook: any;
@@ -23,9 +29,13 @@ interface DashboardData {
   totalSignals: number;
 }
 
+// Left-column tab switcher — ICT mode vs Muzzi Analyzer mode
+type LeftTab = "ict" | "muzzi";
+
 export default function Dashboard() {
   const { toast } = useToast();
   const qc = useQueryClient();
+  const [leftTab, setLeftTab] = useState<LeftTab>("ict");
 
   const { data, isLoading, refetch } = useQuery<DashboardData>({
     queryKey: ["/api/dashboard"],
@@ -118,165 +128,218 @@ export default function Dashboard() {
       {/* Main content */}
       <div className="flex-1 overflow-auto p-5 grid grid-cols-1 xl:grid-cols-3 gap-4">
 
-        {/* Left column — Score + signals */}
+        {/* Left column — ICT signals OR Muzzi Analyzer */}
         <div className="xl:col-span-2 space-y-4">
 
-          {/* Top row: score + key metrics */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            {/* Score Gauge */}
-            <div className="space-y-2">
-              <ScoreGauge score={d.score} bias={d.bias} />
-              <div className="bg-muted rounded-lg px-3 py-2 text-center">
-                <div className="text-xs text-muted-foreground">ICT Score</div>
-                <div className="font-mono text-sm font-bold text-primary">{d.ictScore}/100</div>
-              </div>
-            </div>
-
-            {/* Price + VWAP */}
-            <div className="bg-card border border-border rounded-xl p-5 space-y-3">
-              <div className="text-xs text-muted-foreground uppercase tracking-widest">Price</div>
-              <div className="font-mono text-2xl font-bold text-foreground" data-testid="text-price">
-                {lw?.close ? lw.close.toLocaleString(undefined, { minimumFractionDigits: 2 }) : "—"}
-              </div>
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-muted-foreground">VWAP</span>
-                  <span className="font-mono text-foreground">{lw?.vwap?.toLocaleString(undefined, { minimumFractionDigits: 2 }) || "—"}</span>
-                </div>
-                <div className="flex justify-between text-xs">
-                  <span className="text-muted-foreground">High</span>
-                  <span className="font-mono text-foreground">{lw?.high?.toLocaleString() || "—"}</span>
-                </div>
-                <div className="flex justify-between text-xs">
-                  <span className="text-muted-foreground">Low</span>
-                  <span className="font-mono text-foreground">{lw?.low?.toLocaleString() || "—"}</span>
-                </div>
-                <div className="flex justify-between text-xs">
-                  <span className="text-muted-foreground">Timeframe</span>
-                  <span className="font-mono text-foreground">{lw?.timeframe ? `${lw.timeframe}m` : "—"}</span>
-                </div>
-              </div>
-            </div>
-
-            {/* Status flags */}
-            <div className="bg-card border border-border rounded-xl p-5 space-y-3">
-              <div className="text-xs text-muted-foreground uppercase tracking-widest">ICT Signals</div>
-              <div className="space-y-2">
-                {[
-                  { label: "Killzone", value: killzoneLabel, active: !!lw?.killzone },
-                  { label: "Mkt Structure", value: lw?.marketStructure?.replace(/_/g, " ").toUpperCase() || null, active: !!lw?.marketStructure },
-                  { label: "FVG", value: lw?.fvgBull ? "BULL" : lw?.fvgBear ? "BEAR" : null, active: !!(lw?.fvgBull || lw?.fvgBear) },
-                  { label: "Liq Sweep", value: lw?.sweepHigh ? "HIGH SWEPT" : lw?.sweepLow ? "LOW SWEPT" : null, active: !!(lw?.sweepHigh || lw?.sweepLow) },
-                  { label: "Zone", value: lw?.premium ? "PREMIUM" : lw?.discount ? "DISCOUNT" : null, active: !!(lw?.premium || lw?.discount) },
-                ].map(({ label, value, active }) => (
-                  <div key={label} className="flex items-center justify-between text-xs">
-                    <span className="text-muted-foreground">{label}</span>
-                    {active && value
-                      ? <Badge variant="outline" className="text-xs h-5 font-mono text-primary border-primary/30 bg-primary/5">{value}</Badge>
-                      : <span className="text-muted-foreground font-mono">—</span>
-                    }
-                  </div>
-                ))}
-              </div>
-              <div className="pt-1 text-xs text-muted-foreground font-mono">{d.totalSignals} signals received</div>
-            </div>
+          {/* Tab switcher */}
+          <div className="flex gap-1 p-1 bg-muted rounded-lg w-fit">
+            <button
+              onClick={() => setLeftTab("ict")}
+              className={`text-xs px-3 py-1.5 rounded font-medium transition-colors ${
+                leftTab === "ict"
+                  ? "bg-card text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              ICT Dashboard
+            </button>
+            <button
+              onClick={() => setLeftTab("muzzi")}
+              className={`text-xs px-3 py-1.5 rounded font-medium transition-colors flex items-center gap-1.5 ${
+                leftTab === "muzzi"
+                  ? "bg-card text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Target className="w-3 h-3" />
+              Muzzi Analyzer
+            </button>
           </div>
 
-          {/* Confluences & Warnings */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="bg-card border border-border rounded-xl p-4">
-              <div className="flex items-center gap-2 mb-3">
-                <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
-                <span className="text-xs font-semibold uppercase tracking-wider text-foreground">Active Confluences</span>
-              </div>
-              <div className="space-y-1.5">
-                {d.confluences.length > 0 ? d.confluences.map((c, i) => (
-                  <div key={i} className="flex items-start gap-2 text-xs text-foreground">
-                    <span className="text-green-500 mt-0.5 flex-shrink-0">●</span>
-                    {c}
+          {/* ── ICT TAB ─────────────────────────────────────────────────── */}
+          {leftTab === "ict" && (
+            <>
+              {/* Top row: score + key metrics */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                {/* Score Gauge */}
+                <div className="space-y-2">
+                  <ScoreGauge score={d.score} bias={d.bias} />
+                  <div className="bg-muted rounded-lg px-3 py-2 text-center">
+                    <div className="text-xs text-muted-foreground">ICT Score</div>
+                    <div className="font-mono text-sm font-bold text-primary">{d.ictScore}/100</div>
                   </div>
-                )) : <p className="text-xs text-muted-foreground">No confluences detected</p>}
-              </div>
-            </div>
-            <div className="bg-card border border-border rounded-xl p-4">
-              <div className="flex items-center gap-2 mb-3">
-                <AlertTriangle className="w-3.5 h-3.5 text-yellow-500" />
-                <span className="text-xs font-semibold uppercase tracking-wider text-foreground">Risk Warnings</span>
-              </div>
-              <div className="space-y-1.5">
-                {d.warnings.length > 0 ? d.warnings.map((w, i) => (
-                  <div key={i} className="flex items-start gap-2 text-xs text-foreground">
-                    <span className="text-yellow-500 mt-0.5 flex-shrink-0">▲</span>
-                    {w}
-                  </div>
-                )) : <p className="text-xs text-muted-foreground">No warnings</p>}
-              </div>
-            </div>
-          </div>
+                </div>
 
-          {/* Latest AI Analysis */}
-          {la && (
-            <div className="bg-card border border-border rounded-xl p-5">
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2">
-                  <Zap className="w-4 h-4 text-primary" />
-                  <span className="text-sm font-semibold text-foreground">AI Trade Plan</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  {biasIcon}
-                  <span className={`text-sm font-bold font-mono ${dirColor}`} data-testid="text-direction">
-                    {la.tradeDirection}
-                  </span>
-                  <span className="text-xs text-muted-foreground font-mono">
-                    <Clock className="w-3 h-3 inline mr-1" />
-                    {new Date(la.createdAt).toLocaleTimeString('en-US', { timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit', hour12: true })} CT
-                  </span>
-                </div>
-              </div>
-              {/* Trade levels */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
-                {[
-                  { label: "Entry Zone", value: la.entryZone, color: "text-foreground" },
-                  { label: "Stop Loss", value: la.stopLoss, color: "text-red-400" },
-                  { label: "Target 1", value: la.target1, color: "text-green-400" },
-                  { label: "Target 2", value: la.target2, color: "text-green-300" },
-                ].map(({ label, value, color }) => (
-                  <div key={label} className="bg-muted rounded-lg p-3 text-center">
-                    <div className="text-xs text-muted-foreground mb-1">{label}</div>
-                    <div className={`font-mono text-sm font-bold ${color}`} data-testid={`text-${label.replace(/\s+/g, "-").toLowerCase()}`}>
-                      {value || "—"}
+                {/* Price + VWAP */}
+                <div className="bg-card border border-border rounded-xl p-5 space-y-3">
+                  <div className="text-xs text-muted-foreground uppercase tracking-widest">Price</div>
+                  <div className="font-mono text-2xl font-bold text-foreground" data-testid="text-price">
+                    {lw?.close ? lw.close.toLocaleString(undefined, { minimumFractionDigits: 2 }) : "—"}
+                  </div>
+                  <div className="space-y-1.5">
+                    {/* Session VWAP — show the active one prominently, others small */}
+                    <div className="flex justify-between text-xs">
+                      <span className="text-muted-foreground">
+                        {lw?.activeSession ? `${lw.activeSession} VWAP` : "VWAP"}
+                      </span>
+                      <span className="font-mono text-primary font-semibold">
+                        {lw?.vwap?.toLocaleString(undefined, { minimumFractionDigits: 2 }) || "—"}
+                      </span>
+                    </div>
+                    {/* Show the other two VWAPs as reference */}
+                    {lw?.vwapRth && lw.activeSession !== "RTH" && (
+                      <div className="flex justify-between text-xs">
+                        <span className="text-muted-foreground/70">RTH VWAP</span>
+                        <span className="font-mono text-muted-foreground">{lw.vwapRth.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                      </div>
+                    )}
+                    {lw?.vwapLondon && lw.activeSession !== "London" && (
+                      <div className="flex justify-between text-xs">
+                        <span className="text-muted-foreground/70">London VWAP</span>
+                        <span className="font-mono text-muted-foreground">{lw.vwapLondon.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between text-xs">
+                      <span className="text-muted-foreground">High</span>
+                      <span className="font-mono text-foreground">{lw?.high?.toLocaleString() || "—"}</span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-muted-foreground">Low</span>
+                      <span className="font-mono text-foreground">{lw?.low?.toLocaleString() || "—"}</span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-muted-foreground">Timeframe</span>
+                      <span className="font-mono text-foreground">{lw?.timeframe ? `${lw.timeframe}m` : "—"}</span>
                     </div>
                   </div>
-                ))}
+                </div>
+
+                {/* Status flags */}
+                <div className="bg-card border border-border rounded-xl p-5 space-y-3">
+                  <div className="text-xs text-muted-foreground uppercase tracking-widest">ICT Signals</div>
+                  <div className="space-y-2">
+                    {[
+                      { label: "Killzone", value: killzoneLabel, active: !!lw?.killzone },
+                      { label: "Mkt Structure", value: lw?.marketStructure?.replace(/_/g, " ").toUpperCase() || null, active: !!lw?.marketStructure },
+                      { label: "FVG", value: lw?.fvgBull ? "BULL" : lw?.fvgBear ? "BEAR" : null, active: !!(lw?.fvgBull || lw?.fvgBear) },
+                      { label: "Liq Sweep", value: lw?.sweepHigh ? "HIGH SWEPT" : lw?.sweepLow ? "LOW SWEPT" : null, active: !!(lw?.sweepHigh || lw?.sweepLow) },
+                      { label: "Zone", value: lw?.premium ? "PREMIUM" : lw?.discount ? "DISCOUNT" : null, active: !!(lw?.premium || lw?.discount) },
+                    ].map(({ label, value, active }) => (
+                      <div key={label} className="flex items-center justify-between text-xs">
+                        <span className="text-muted-foreground">{label}</span>
+                        {active && value
+                          ? <Badge variant="outline" className="text-xs h-5 font-mono text-primary border-primary/30 bg-primary/5">{value}</Badge>
+                          : <span className="text-muted-foreground font-mono">—</span>
+                        }
+                      </div>
+                    ))}
+                  </div>
+                  <div className="pt-1 text-xs text-muted-foreground font-mono">{d.totalSignals} signals received</div>
+                </div>
               </div>
-              {/* Narrative — render markdown as formatted HTML */}
-              <div className="bg-muted rounded-lg p-4">
-                <div
-                  className="text-xs text-foreground leading-relaxed prose prose-invert prose-sm max-w-none"
-                  data-testid="text-narrative"
-                  dangerouslySetInnerHTML={{
-                    __html: (la.narrative || "")
-                      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-                      .replace(/^### (.+)$/gm, "<h3 class='text-xs font-bold text-primary mt-3 mb-1'>$1</h3>")
-                      .replace(/^## (.+)$/gm,  "<h2 class='text-xs font-bold text-primary mt-4 mb-1 uppercase tracking-wide'>$1</h2>")
-                      .replace(/^# (.+)$/gm,   "<h1 class='text-sm font-bold text-primary mt-4 mb-2'>$1</h1>")
-                      .replace(/^---$/gm, "<hr class='border-border my-2'>")
-                      .replace(/\n/g, "<br>")
-                  }}
-                />
+
+              {/* Confluences & Warnings */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="bg-card border border-border rounded-xl p-4">
+                  <div className="flex items-center gap-2 mb-3">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
+                    <span className="text-xs font-semibold uppercase tracking-wider text-foreground">Active Confluences</span>
+                  </div>
+                  <div className="space-y-1.5">
+                    {d.confluences.length > 0 ? d.confluences.map((c, i) => (
+                      <div key={i} className="flex items-start gap-2 text-xs text-foreground">
+                        <span className="text-green-500 mt-0.5 flex-shrink-0">●</span>
+                        {c}
+                      </div>
+                    )) : <p className="text-xs text-muted-foreground">No confluences detected</p>}
+                  </div>
+                </div>
+                <div className="bg-card border border-border rounded-xl p-4">
+                  <div className="flex items-center gap-2 mb-3">
+                    <AlertTriangle className="w-3.5 h-3.5 text-yellow-500" />
+                    <span className="text-xs font-semibold uppercase tracking-wider text-foreground">Risk Warnings</span>
+                  </div>
+                  <div className="space-y-1.5">
+                    {d.warnings.length > 0 ? d.warnings.map((w, i) => (
+                      <div key={i} className="flex items-start gap-2 text-xs text-foreground">
+                        <span className="text-yellow-500 mt-0.5 flex-shrink-0">▲</span>
+                        {w}
+                      </div>
+                    )) : <p className="text-xs text-muted-foreground">No warnings</p>}
+                  </div>
+                </div>
               </div>
-            </div>
+
+              {/* Latest AI Analysis */}
+              {la && (
+                <div className="bg-card border border-border rounded-xl p-5">
+                  <div className="flex items-center justify-between mb-4">
+                    <div className="flex items-center gap-2">
+                      <Zap className="w-4 h-4 text-primary" />
+                      <span className="text-sm font-semibold text-foreground">AI Trade Plan</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {biasIcon}
+                      <span className={`text-sm font-bold font-mono ${dirColor}`} data-testid="text-direction">
+                        {la.tradeDirection}
+                      </span>
+                      <span className="text-xs text-muted-foreground font-mono">
+                        <Clock className="w-3 h-3 inline mr-1" />
+                        {new Date(la.createdAt).toLocaleTimeString('en-US', { timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit', hour12: true })} CT
+                      </span>
+                    </div>
+                  </div>
+                  {/* Trade levels */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+                    {[
+                      { label: "Entry Zone", value: la.entryZone, color: "text-foreground" },
+                      { label: "Stop Loss", value: la.stopLoss, color: "text-red-400" },
+                      { label: "Target 1", value: la.target1, color: "text-green-400" },
+                      { label: "Target 2", value: la.target2, color: "text-green-300" },
+                    ].map(({ label, value, color }) => (
+                      <div key={label} className="bg-muted rounded-lg p-3 text-center">
+                        <div className="text-xs text-muted-foreground mb-1">{label}</div>
+                        <div className={`font-mono text-sm font-bold ${color}`} data-testid={`text-${label.replace(/\s+/g, "-").toLowerCase()}`}>
+                          {value || "—"}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {/* Narrative */}
+                  <div className="bg-muted rounded-lg p-4">
+                    <div
+                      className="text-xs text-foreground leading-relaxed prose prose-invert prose-sm max-w-none"
+                      data-testid="text-narrative"
+                      dangerouslySetInnerHTML={{
+                        __html: (la.narrative || "")
+                          .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+                          .replace(/^### (.+)$/gm, "<h3 class='text-xs font-bold text-primary mt-3 mb-1'>$1</h3>")
+                          .replace(/^## (.+)$/gm,  "<h2 class='text-xs font-bold text-primary mt-4 mb-1 uppercase tracking-wide'>$1</h2>")
+                          .replace(/^# (.+)$/gm,   "<h1 class='text-sm font-bold text-primary mt-4 mb-2'>$1</h1>")
+                          .replace(/^---$/gm, "<hr class='border-border my-2'>")
+                          .replace(/\n/g, "<br>")
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {!la && (
+                <div className="bg-card border border-border border-dashed rounded-xl p-8 text-center">
+                  <Zap className="w-8 h-8 text-muted-foreground mx-auto mb-3" />
+                  <p className="text-sm text-muted-foreground">No analysis yet — click "Analyze Now" or inject a demo signal to get started.</p>
+                </div>
+              )}
+
+              {/* Bot Trade Log */}
+              <TradeLog />
+            </>
           )}
 
-          {!la && (
-            <div className="bg-card border border-border border-dashed rounded-xl p-8 text-center">
-              <Zap className="w-8 h-8 text-muted-foreground mx-auto mb-3" />
-              <p className="text-sm text-muted-foreground">No analysis yet — click "Analyze Now" or inject a demo signal to get started.</p>
-            </div>
+          {/* ── MUZZI ANALYZER TAB ──────────────────────────────────────── */}
+          {leftTab === "muzzi" && (
+            <MuzziAnalyzer />
           )}
-
-          {/* Bot Trade Log */}
-          <TradeLog />
         </div>
 
         {/* Right column — Personality + Commentary + Chat */}
