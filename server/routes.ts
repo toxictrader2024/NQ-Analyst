@@ -62,8 +62,10 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   //   15m → session bias (trend direction)
   //   5m  → setup confirmation (structure / FVG / OB)
   //   1m  → trigger execution (MSS, delta flip, 3-bar play)
-  const tvWebhooks = webhooks.filter(w => w.source === 'tradingview' || (!w.source && w.killzone !== null));
-  const scWebhooks = webhooks.filter(w => w.source === 'sierra_chart' || w.source === 'bookmap_cme');
+  // Filter out seed/demo data with unrealistic NQ prices (below 25000)
+  const validWebhooks = webhooks.filter(w => !w.close || w.close >= 25000);
+  const tvWebhooks = validWebhooks.filter(w => w.source === 'tradingview' || (!w.source && w.killzone !== null));
+  const scWebhooks = validWebhooks.filter(w => w.source === 'sierra_chart' || w.source === 'bookmap_cme');
 
   // Timeframe sub-streams from TradingView
   const tv15 = tvWebhooks.filter(w => String(w.timeframe) === "15" || String(w.timeframe) === "15m");
@@ -966,6 +968,17 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // ── GET /api/webhook-url — Return the webhook URL hint ───────────────────
+  // ── POST /api/clear-seed — purge demo/seed data with prices below 25000 ──
+  app.post("/api/clear-seed", (_req, res) => {
+    try {
+      const result = storage.clearSeedData();
+      console.log(`[clear-seed] Deleted ${result.deletedWebhooks} webhooks, ${result.deletedCommentary} commentary entries`);
+      return res.json({ ok: true, ...result });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
   app.get("/api/webhook-url", (req, res) => {
     const host = req.headers.host || "localhost:5000";
     const proto = req.headers["x-forwarded-proto"] || "http";
@@ -1123,6 +1136,88 @@ export function registerRoutes(httpServer: Server, app: Express) {
       });
     } catch (err) {
       return res.status(500).json({ error: "Failed to load sim trades" });
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // SC LATEST — serves Sierra Chart order flow to Pine Script via HTTP
+  // Pine Script uses a webhook trigger that includes SC data fields from server
+  // GET /api/sc-latest — latest SC order flow snapshot
+  // ══════════════════════════════════════════════════════════════════════════
+  app.get("/api/sc-latest", (_req, res) => {
+    try {
+      const webhooks = storage.getRecentWebhooks(30);
+      const sc = webhooks.find(w => w.source === "sierra_chart" || w.source === "bookmap_cme");
+      if (!sc) return res.json({ error: "No SC data", hasData: false });
+
+      const ageMs  = Date.now() - (sc.receivedAt ?? 0);
+      const ageSec = Math.round(ageMs / 1000);
+
+      // Compute spoofing score:
+      // Large bid stack that disappears quickly + sell delta = spoof attempt on bid
+      // Large ask stack + buy delta = spoof attempt on ask
+      const bidStack = sc.bidStackSize ?? 0;
+      const askStack = sc.askStackSize ?? 0;
+      const delta    = sc.delta ?? 0;
+      const stackImbalanceRatio = bidStack > 0 && askStack > 0
+        ? Math.max(bidStack / askStack, askStack / bidStack)
+        : 1;
+
+      // Spoof signal: extreme stack imbalance (>3:1) but delta going opposite direction
+      const spoofBid = bidStack > askStack * 3 && delta < 0;   // big bid wall, selling into it
+      const spoofAsk = askStack > bidStack * 3 && delta > 0;   // big ask wall, buying into it
+
+      // DOM pressure: bid vs ask stack balance (>60% bid = buy pressure, >60% ask = sell pressure)
+      const totalDom = bidStack + askStack;
+      const domBidPct = totalDom > 0 ? Math.round(bidStack / totalDom * 100) : 50;
+      const domAskPct = totalDom > 0 ? Math.round(askStack / totalDom * 100) : 50;
+      const domBias   = domBidPct > 60 ? "BUY_PRESSURE"
+                      : domAskPct > 60 ? "SELL_PRESSURE"
+                      : "BALANCED";
+
+      // Cumulative order flow score (0-100)
+      let ofScore = 50; // neutral base
+      if (delta > 0)             ofScore += 10;
+      if (delta < 0)             ofScore -= 10;
+      if (sc.absorptionBull)     ofScore += 15;
+      if (sc.absorptionBear)     ofScore -= 15;
+      if (sc.imbalanceBull)      ofScore += 10;
+      if (sc.imbalanceBear)      ofScore -= 10;
+      if (domBias === "BUY_PRESSURE")  ofScore += 8;
+      if (domBias === "SELL_PRESSURE") ofScore -= 8;
+      if (spoofBid)              ofScore += 5;  // spoof on bid = bullish (wall will pull)
+      if (spoofAsk)              ofScore -= 5;  // spoof on ask = bearish
+      ofScore = Math.max(0, Math.min(100, ofScore));
+
+      const ofBias = ofScore > 60 ? "BULLISH" : ofScore < 40 ? "BEARISH" : "NEUTRAL";
+
+      return res.json({
+        hasData       : true,
+        ageSec,
+        fresh         : ageSec < 300, // 5 min
+        price         : sc.close,
+        delta         : sc.delta,
+        cvd           : sc.cvd,
+        buyVolume     : sc.buyVolume,
+        sellVolume    : sc.sellVolume,
+        bidStackSize  : bidStack,
+        askStackSize  : askStack,
+        stackRatio    : parseFloat(stackImbalanceRatio.toFixed(2)),
+        absorptionBull: !!(sc.absorptionBull),
+        absorptionBear: !!(sc.absorptionBear),
+        imbalanceBull : !!(sc.imbalanceBull),
+        imbalanceBear : !!(sc.imbalanceBear),
+        vapPoc        : sc.vapPoc,
+        domBidPct,
+        domAskPct,
+        domBias,
+        spoofBid,
+        spoofAsk,
+        ofScore,
+        ofBias,
+      });
+    } catch (err) {
+      return res.status(500).json({ error: "SC latest failed" });
     }
   });
 

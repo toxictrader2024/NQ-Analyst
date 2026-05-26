@@ -156,6 +156,7 @@ export interface IStorage {
   saveWebhook(data: InsertWebhookPayload): WebhookPayload;
   getRecentWebhooks(limit?: number): WebhookPayload[];
   getLatestWebhook(): WebhookPayload | undefined;
+  clearSeedData(): { deletedWebhooks: number; deletedCommentary: number };
 
   // Analyses
   saveAnalysis(data: InsertAnalysis): Analysis;
@@ -189,6 +190,13 @@ export const storage: IStorage = {
   },
   getLatestWebhook() {
     return db.select().from(webhookPayloads).orderBy(desc(webhookPayloads.receivedAt)).limit(1).get();
+  },
+  clearSeedData() {
+    // Remove any webhooks where close price is clearly demo/seed data (below 25000)
+    const wResult = sqlite.prepare("DELETE FROM webhook_payloads WHERE close IS NOT NULL AND close < 25000").run();
+    // Remove demo commentary (triggerSource LIKE 'demo_%' or price < 25000)
+    const cResult = sqlite.prepare("DELETE FROM commentary WHERE price IS NOT NULL AND price < 25000").run();
+    return { deletedWebhooks: wResult.changes, deletedCommentary: cResult.changes };
   },
 
   saveAnalysis(data) {
