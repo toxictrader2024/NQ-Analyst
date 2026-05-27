@@ -281,7 +281,7 @@ CURRENT STATE:
 - FVG: ${latest.fvgBull ? "BULL" : latest.fvgBear ? "BEAR" : "None"}
 - Sweep: ${latest.sweepHigh ? "HIGH SWEPT" : latest.sweepLow ? "LOW SWEPT" : "None"}
 - Zone: ${(latest as any).premium ? "PREMIUM" : (latest as any).discount ? "DISCOUNT" : "Mid"}
-- VWAP: ${latest.vwap ?? "N/A"}
+- VWAP: ${(tvHook?.vwap && tvHook.vwap > 25000) ? tvHook.vwap.toLocaleString() : "N/A (SC VWAP excluded)"}
 
 ICT Confluences: ${confluences.join("; ") || "None"}
 Warnings: ${warnings.join("; ") || "None"}
@@ -413,7 +413,10 @@ export function startPulse() {
     // Always anchor to live price — never trust stale webhook close
     const livePrice = await fetchLiveNQPrice();
     const price    = livePrice ?? latest.close ?? 0;
-    const vwap     = latest.vwap  ?? 0;
+    // VWAP: only use TV source — SC VWAP field is stale/historical, always ignore it
+    const tvHook   = webhooks.find(w => w.source === 'tradingview');
+    const rawVwap  = tvHook?.vwap ?? null;
+    const vwap     = (rawVwap && rawVwap > 25000) ? rawVwap : 0;
     const bias     = lastBias;
     const score    = lastScore;
 
@@ -431,7 +434,7 @@ export function startPulse() {
     const kz        = latest.killzone?.replace(/_/g, " ") || "none";
     const ms        = latest.marketStructure || "none";
     const zone      = (latest as any).premium ? "premium" : (latest as any).discount ? "discount" : "equilibrium";
-    const vwapRel   = price > vwap ? "above VWAP" : price < vwap ? "below VWAP" : "at VWAP";
+    const vwapRel   = vwap > 0 ? (price > vwap ? "above VWAP" : price < vwap ? "below VWAP" : "at VWAP") : "(VWAP N/A)";
 
     const confluenceList = [
       hasFvg    ? (latest.fvgBull ? "Bull FVG" : "Bear FVG") : null,

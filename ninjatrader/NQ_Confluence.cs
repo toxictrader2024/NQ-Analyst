@@ -345,7 +345,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 ShowOTE          = true;
                 ShowDelta        = true;
                 DeltaBlockLen    = 3;
-                ZoneExtend       = 50;
+                ZoneExtend       = 20;
                 OBLookback       = 10;
                 LiqLookback      = 30;
                 EqualTolerance   = 3.0;
@@ -819,30 +819,41 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (fvgZones.Count > 80) fvgZones.RemoveRange(0, fvgZones.Count - 80);
         }
 
+        private int lastOBBar = -1;  // one-shot guard — only add OB once per bar
+
         private void ProcessOBs(ref bool atBullOB, ref bool atBearOB)
         {
             if (CurrentBar < OBLookback + 2) return;
 
-            // Detect new OBs — last opposing candle before impulse
-            bool bullImpulse = Close[0] > MAX(High, OBLookback)[1];
-            bool bearImpulse = Close[0] < MIN(Low,  OBLookback)[1];
+            // Detect new OBs — last opposing candle before impulse (one per bar)
+            if (CurrentBar != lastOBBar)
+            {
+                bool bullImpulse = Close[0] > MAX(High, OBLookback)[1];
+                bool bearImpulse = Close[0] < MIN(Low,  OBLookback)[1];
 
-            if (bullImpulse && Close[1] < Open[1])
-                obZones.Add(new ConfluenceZone {
-                    StartBar = CurrentBar - 1,
-                    Top      = Math.Max(Open[1], Close[1]),
-                    Bottom   = Math.Min(Open[1], Close[1]),
-                    IsBull   = true,
-                    Tag      = "OB"
-                });
-            if (bearImpulse && Close[1] > Open[1])
-                obZones.Add(new ConfluenceZone {
-                    StartBar = CurrentBar - 1,
-                    Top      = Math.Max(Open[1], Close[1]),
-                    Bottom   = Math.Min(Open[1], Close[1]),
-                    IsBull   = false,
-                    Tag      = "OB"
-                });
+                if (bullImpulse && Close[1] < Open[1])
+                {
+                    lastOBBar = CurrentBar;
+                    obZones.Add(new ConfluenceZone {
+                        StartBar = CurrentBar - 1,
+                        Top      = Math.Max(Open[1], Close[1]),
+                        Bottom   = Math.Min(Open[1], Close[1]),
+                        IsBull   = true,
+                        Tag      = "OB"
+                    });
+                }
+                else if (bearImpulse && Close[1] > Open[1])
+                {
+                    lastOBBar = CurrentBar;
+                    obZones.Add(new ConfluenceZone {
+                        StartBar = CurrentBar - 1,
+                        Top      = Math.Max(Open[1], Close[1]),
+                        Bottom   = Math.Min(Open[1], Close[1]),
+                        IsBull   = false,
+                        Tag      = "OB"
+                    });
+                }
+            }
 
             // Update existing OBs
             for (int i = obZones.Count - 1; i >= 0; i--)
@@ -879,14 +890,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 }
                 else if (!z.Mitigated)
                 {
-                    double zh  = z.Top - z.Bottom;
-                    int    pct = zh > 0
-                        ? (z.IsBull
-                            ? (int)Math.Round((z.Top - Math.Max(Low[0], z.Bottom)) / zh * 100)
-                            : (int)Math.Round((Math.Min(High[0], z.Top) - z.Bottom) / zh * 100))
-                        : 0;
-
-                    Brush obCol = z.IsBull
+                        Brush obCol = z.IsBull
                         ? new SolidColorBrush(Color.FromArgb(45, 0, 180, 160))
                         : new SolidColorBrush(Color.FromArgb(45, 200, 50, 50));
                     obCol.Freeze();
@@ -896,7 +900,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         obCol, obCol, 1);
                     DrawLabel("ob_l_" + i, -ZoneExtend / 2,
                         (z.Top + z.Bottom) / 2,
-                        "OB " + pct + "%",
+                        z.IsBull ? "Bull OB" : "Bear OB",
                         z.IsBull ? Brushes.Cyan : Brushes.Tomato, 8);
                 }
             }
@@ -907,36 +911,44 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (CurrentBar < LiqLookback + 2) return;
 
+            // Use fixed tag per bar so each bar overwrites its own label (no accumulation)
+            string bslTag  = "bsl_"   + CurrentBar;
+            string bslLbl  = "bsl_l_" + CurrentBar;
+            string sslTag  = "ssl_"   + CurrentBar;
+            string sslLbl  = "ssl_l_" + CurrentBar;
+
+            bool foundBSL = false, foundSSL = false;
             for (int j = 1; j <= Math.Min(LiqLookback, CurrentBar - 1); j++)
             {
-                // Equal highs — Buy Side Liquidity (stop cluster above)
-                if (Math.Abs(High[0] - High[j]) <= EqualTolerance &&
+                // Equal highs — Buy Side Liquidity
+                if (!foundBSL &&
+                    Math.Abs(High[0] - High[j]) <= EqualTolerance &&
                     High[0] >= MAX(High, j)[1])
                 {
-                    string tag = "bsl_" + lblIdx++;
-                    Draw.Line(this, tag, true, j, High[j], 0, High[0],
+                    Draw.Line(this, bslTag, true, j, High[j], 0, High[0],
                         Brushes.Yellow, DashStyleHelper.Dot, 1);
-                    DrawLabelAbove("bsl_l_" + lblIdx++, "BSL", Brushes.Yellow, 8);
-                    liqTags.Add(tag);
-                    break;
+                    DrawLabelAbove(bslLbl, "BSL", Brushes.Yellow, 8);
+                    if (!liqTags.Contains(bslTag)) liqTags.Add(bslTag);
+                    foundBSL = true;
                 }
                 // Equal lows — Sell Side Liquidity
-                if (Math.Abs(Low[0] - Low[j]) <= EqualTolerance &&
+                if (!foundSSL &&
+                    Math.Abs(Low[0] - Low[j]) <= EqualTolerance &&
                     Low[0] <= MIN(Low, j)[1])
                 {
-                    string tag = "ssl_" + lblIdx++;
-                    Draw.Line(this, tag, true, j, Low[j], 0, Low[0],
+                    Draw.Line(this, sslTag, true, j, Low[j], 0, Low[0],
                         Brushes.Orange, DashStyleHelper.Dot, 1);
-                    DrawLabelBelow("ssl_l_" + lblIdx++, "SSL", Brushes.Orange, 8);
-                    liqTags.Add(tag);
-                    break;
+                    DrawLabelBelow(sslLbl, "SSL", Brushes.Orange, 8);
+                    if (!liqTags.Contains(sslTag)) liqTags.Add(sslTag);
+                    foundSSL = true;
                 }
+                if (foundBSL && foundSSL) break;
             }
 
-            // Prune old liquidity draw objects (keep last 50)
-            if (liqTags.Count > 50)
+            // Prune old liquidity draw objects (keep last 40 bars worth)
+            if (liqTags.Count > 80)
             {
-                try { RemoveDrawObject(liqTags[0]); } catch { }
+                try { RemoveDrawObject(liqTags[0]); RemoveDrawObject(liqTags[0] + "_l"); } catch { }
                 liqTags.RemoveAt(0);
             }
         }
@@ -1158,7 +1170,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         (top + bot) / 2, "Δ Bull", Brushes.MediumTurquoise, 8);
                 }
                 catch { }
-                deltaZones.Add(new ConfluenceConfluenceZone { Top = top, Bottom = bot, IsBull = true,
+                deltaZones.Add(new ConfluenceZone { Top = top, Bottom = bot, IsBull = true,
                     Tag = tag, Mitigated = false, StartBar = CurrentBar });
             }
             if (bearStreak)
@@ -1177,7 +1189,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         (top + bot) / 2, "Δ Bear", Brushes.Tomato, 8);
                 }
                 catch { }
-                deltaZones.Add(new ConfluenceConfluenceZone { Top = top, Bottom = bot, IsBull = false,
+                deltaZones.Add(new ConfluenceZone { Top = top, Bottom = bot, IsBull = false,
                     Tag = tag, Mitigated = false, StartBar = CurrentBar });
             }
 

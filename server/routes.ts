@@ -167,10 +167,10 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   if (tvLatest?.discount) { confluences.push("Price in discount zone (below EQ) — long bias"); bullPoints += 12; }
   if (tvLatest?.premium) { confluences.push("Price in premium zone (above EQ) — short bias"); bearPoints += 12; }
 
-  // VWAP relationship (prefer TV for VWAP context, priceSource for close)
-  const vwapSource = tvLatest ?? priceSource;
-  if (vwapSource.vwap && priceSource.close) {
-    if (priceSource.close > vwapSource.vwap) { confluences.push("Price above VWAP — bullish intraday"); bullPoints += 8; }
+  // VWAP relationship — TV only, SC VWAP is stale/historical, ignore it
+  const tvVwap = (tvLatest?.vwap && tvLatest.vwap > 25000) ? tvLatest.vwap : null;
+  if (tvVwap && priceSource.close) {
+    if (priceSource.close > tvVwap) { confluences.push("Price above VWAP — bullish intraday"); bullPoints += 8; }
     else { confluences.push("Price below VWAP — bearish intraday"); bearPoints += 8; }
   }
 
@@ -315,7 +315,10 @@ function buildAnalysisPrompt(
   // Prefer live Yahoo Finance price over stale webhook close
   const effectivePrice = livePrice ?? latest?.close ?? null;
   const priceStr = effectivePrice ? `$${effectivePrice.toLocaleString()}` : "unknown";
-  const vwapStr = latest?.vwap ? `$${latest.vwap.toLocaleString()}` : "N/A";
+  // VWAP: TV source only — SC vwap field is stale, always skip it
+  const tvWh    = webhooks.find((w: any) => w.source === 'tradingview');
+  const tvVwapVal = (tvWh?.vwap && tvWh.vwap > 25000) ? tvWh.vwap : null;
+  const vwapStr = tvVwapVal ? `$${tvVwapVal.toLocaleString()}` : "N/A";
 
   const recentSignals = webhooks.slice(0, 5).map(w =>
     `  [${new Date(w.receivedAt).toLocaleTimeString()}] TF:${w.timeframe} | C:${w.close} | ` +
@@ -338,13 +341,13 @@ ORDER FLOW DATA (Sierra Chart — Live CME Data):
 - Bear Absorption: ${ofLatest.absorptionBear ? "YES ← STRONG SIGNAL: buyers being absorbed, sellers in control" : "No"}
 - DOM Imbalance: ${ofLatest.imbalanceBull ? "STACKED BIDS — 3x+ more bids than asks (bullish pressure)" : ofLatest.imbalanceBear ? "STACKED ASKS — 3x+ more asks than bids (bearish pressure)" : "Balanced DOM"}
 - Volume POC: ${ofLatest.vapPoc ?? "N/A"} (highest volume price level — acts as magnet)
-- VWAP: ${ofLatest.vwap ?? "N/A"}
+- VWAP: N/A (SC VWAP excluded — use TV VWAP)
 
 ORDER FLOW INTERPRETATION:
 ${ofLatest.absorptionBull ? "→ Bullish absorption confirms buyers defending the level — ICT discount zone + absorption = high conviction long" : ""}
 ${ofLatest.absorptionBear ? "→ Bearish absorption confirms sellers capping the move — ICT premium zone + absorption = high conviction short" : ""}
-${ofLatest.delta !== null && ofLatest.delta! > 0 && ofLatest.close !== null && ofLatest.close! < (ofLatest.vwap ?? 999999) ? "→ Positive delta below VWAP = buyers accumulating in discount — potential long setup" : ""}
-${ofLatest.delta !== null && ofLatest.delta! < 0 && ofLatest.close !== null && ofLatest.close! > (ofLatest.vwap ?? 0) ? "→ Negative delta above VWAP = distribution in premium — potential short setup" : ""}
+${ofLatest.delta !== null && ofLatest.delta! > 0 ? "→ Positive delta = net buying pressure this bar" : ""}
+${ofLatest.delta !== null && ofLatest.delta! < 0 ? "→ Negative delta = net selling pressure this bar" : ""}
 ` : "ORDER FLOW: Sierra Chart not yet connected. Install NQ_Analyst_Bridge.cpp study in Sierra Chart to enable live delta, DOM, and absorption data.";
 
   const tvFreshFlag = tvFresh ?? false;
@@ -742,7 +745,9 @@ export function registerRoutes(httpServer: Server, app: Express) {
     const { score, bias, confluences } = scoreSetup(webhooks);
     const latest   = webhooks[0];
     const price    = latest?.close ?? 0;
-    const vwap     = latest?.vwap  ?? 0;
+    // VWAP: TV source only — SC VWAP is stale/historical
+    const tvHookChat = webhooks.find((w: any) => w.source === 'tradingview');
+    const vwap = (tvHookChat?.vwap && tvHookChat.vwap > 25000) ? tvHookChat.vwap : 0;
 
     const personality = getPersonality();
     const recentCalls = storage.getRecentCommentary(5).map((c: any) => `${c.title} @ ${c.price?.toLocaleString() || "?"}`);
