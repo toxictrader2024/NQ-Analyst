@@ -461,14 +461,24 @@ if not na(swing_hi) and not na(swing_lo)
 // Signals fire once-per-bar-close (confirmed candle only)
 // ══════════════════════════════════════════════════════════
 
+// ── OTE pullback check (price inside 62-79% fib zone) ──────────────────────
+in_ote_zone = not na(ote_top) and not na(ote_bot) and close <= ote_top and close >= ote_bot
+
+// ── Zone bias: use 15m HTF discount/premium — not 1m session EQ ─────────────
+// Long allowed when: 15m discount OR OTE pullback during bullish structure
+// Short allowed when: 15m premium OR OTE pullback during bearish structure
+long_zone_ok  = htf_disc == 1 or (in_ote_zone and htf_bias == "bull")
+short_zone_ok = htf_prem == 1 or (in_ote_zone and htf_bias == "bear")
+
 // Count bullish confluences
 long_conf = 0
-long_conf := long_conf + (in_bull_fvg ? 1 : 0)     // Price touching bull FVG
-long_conf := long_conf + (at_bull_ob  ? 1 : 0)     // Price touching bull OB
-long_conf := long_conf + (sweep_lo    ? 1 : 0)     // Sweep of recent low (SFP long)
-long_conf := long_conf + (cisd_bull   ? 1 : 0)     // CISD bullish shift
-long_conf := long_conf + (bos_bull    ? 1 : 0)     // Break of structure bullish
-long_conf := long_conf + (discount    ? 1 : 0)     // Price in discount zone
+long_conf := long_conf + (in_bull_fvg  ? 1 : 0)    // Price touching bull FVG
+long_conf := long_conf + (at_bull_ob   ? 1 : 0)    // Price touching bull OB
+long_conf := long_conf + (sweep_lo     ? 1 : 0)    // Sweep of recent low (SFP long)
+long_conf := long_conf + (cisd_bull    ? 1 : 0)    // CISD bullish shift
+long_conf := long_conf + (bos_bull     ? 1 : 0)    // Break of structure bullish
+long_conf := long_conf + (discount     ? 1 : 0)    // 1m discount zone (bonus confluence)
+long_conf := long_conf + (in_ote_zone  ? 1 : 0)    // OTE pullback (62-79% fib)
 
 // Count bearish confluences
 short_conf = 0
@@ -477,11 +487,12 @@ short_conf := short_conf + (at_bear_ob  ? 1 : 0)   // Price touching bear OB
 short_conf := short_conf + (sweep_hi    ? 1 : 0)   // Sweep of recent high (SFP short)
 short_conf := short_conf + (cisd_bear   ? 1 : 0)   // CISD bearish shift
 short_conf := short_conf + (bos_bear    ? 1 : 0)   // Break of structure bearish
-short_conf := short_conf + (premium     ? 1 : 0)   // Price in premium zone
+short_conf := short_conf + (premium     ? 1 : 0)   // 1m premium zone (bonus confluence)
+short_conf := short_conf + (in_ote_zone ? 1 : 0)   // OTE pullback (62-79% fib)
 
-// Signal conditions
-long_signal  = barstate.isconfirmed and show_signals and in_killzone and discount and long_conf  >= min_conf_long
-short_signal = barstate.isconfirmed and show_signals and in_killzone and premium  and short_conf >= min_conf_short
+// Signal conditions — use 15m HTF zone, not 1m EQ
+long_signal  = barstate.isconfirmed and show_signals and in_killzone and long_zone_ok  and long_conf  >= min_conf_long
+short_signal = barstate.isconfirmed and show_signals and in_killzone and short_zone_ok and short_conf >= min_conf_short
 
 // Prevent simultaneous long and short (long wins if both somehow fire)
 long_signal  := long_signal  and not short_signal
@@ -561,6 +572,9 @@ if barstate.isconfirmed
               '"sweep_low":' + (sweep_lo ? "1" : "0") + ',' +
               '"premium":' + (premium ? "1" : "0") + ',' +
               '"discount":' + (discount ? "1" : "0") + ',' +
+              '"in_ote_zone":' + (in_ote_zone ? "1" : "0") + ',' +
+              '"long_zone_ok":' + (long_zone_ok ? "1" : "0") + ',' +
+              '"short_zone_ok":' + (short_zone_ok ? "1" : "0") + ',' +
               '"long_signal":' + str.tostring(long_sig_int) + ',' +
               '"short_signal":' + str.tostring(short_sig_int) + ',' +
               '"long_conf":' + str.tostring(long_conf) + ',' +
