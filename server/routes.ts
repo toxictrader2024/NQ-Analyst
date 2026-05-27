@@ -892,7 +892,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
             type: "absorption" as const,
             urgency: "high" as const,
             title: "Bullish Absorption Detected",
-            detail: `Large sell volume (${saved.sellVolume} contracts) absorbed at ${saved.close?.toFixed(2)} — sellers couldn't push price down`,
+            reason: `Large sell volume (${saved.sellVolume} contracts) absorbed at ${saved.close?.toFixed(2)} — sellers couldn't push price down`,
+            source: "sierra_chart",
           });
         }
         if (saved.absorptionBear) {
@@ -900,7 +901,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
             type: "absorption" as const,
             urgency: "high" as const,
             title: "Bearish Absorption Detected",
-            detail: `Large buy volume (${saved.buyVolume} contracts) absorbed at ${saved.close?.toFixed(2)} — buyers couldn't push price up`,
+            reason: `Large buy volume (${saved.buyVolume} contracts) absorbed at ${saved.close?.toFixed(2)} — buyers couldn't push price up`,
+            source: "sierra_chart",
           });
         }
         if (saved.imbalanceBull) {
@@ -908,7 +910,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
             type: "general" as const,
             urgency: "medium" as const,
             title: "DOM Bid Imbalance",
-            detail: `Bid stack (${saved.bidStackSize}) is 3x+ the ask — strong buy-side pressure at ${saved.close?.toFixed(2)}`,
+            reason: `Bid stack (${saved.bidStackSize}) is 3x+ the ask — strong buy-side pressure at ${saved.close?.toFixed(2)}`,
+            source: "sierra_chart",
           });
         }
         if (saved.imbalanceBear) {
@@ -916,7 +919,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
             type: "general" as const,
             urgency: "medium" as const,
             title: "DOM Ask Imbalance",
-            detail: `Ask stack (${saved.askStackSize}) is 3x+ the bid — strong sell-side pressure at ${saved.close?.toFixed(2)}`,
+            reason: `Ask stack (${saved.askStackSize}) is 3x+ the bid — strong sell-side pressure at ${saved.close?.toFixed(2)}`,
+            source: "sierra_chart",
           });
         }
 
@@ -1382,4 +1386,37 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
     return res.json({ ok: true });
   });
+
+  // ── 5-min fallback pulse — fires commentary even if no specific trigger hits ──
+  setInterval(async () => {
+    try {
+      const webhooks = storage.getRecentWebhooks(10);
+      if (!webhooks.length) return;
+
+      // Only fire if we have fresh data (< 10 min old)
+      const ageMs = Date.now() - (webhooks[0].receivedAt ?? 0);
+      if (ageMs > 10 * 60 * 1000) return;
+
+      const { score, ictScore, orderFlowScore, bias, confluences, orderFlowConfluences, warnings } = scoreSetup(webhooks);
+      const livePrice = await fetchLiveNQPrice();
+      const price = livePrice ?? webhooks[0]?.close ?? 0;
+      if (!price) return;
+
+      const pulseTrigger = {
+        type: "general" as const,
+        urgency: "medium" as const,
+        title: `Market Pulse — ${bias || "NEUTRAL"} ${score}/100`,
+        reason: `5-min scheduled update. Price at ${price.toLocaleString()}. ${confluences.slice(0,2).join("; ") || "No active confluences"}.`,
+        source: "pulse_timer",
+      };
+
+      await generateCommentary(
+        pulseTrigger, webhooks,
+        bias || "NEUTRAL", score, ictScore,
+        confluences, warnings
+      );
+    } catch (e) {
+      console.error("[Pulse] Error:", e);
+    }
+  }, 5 * 60 * 1000); // every 5 minutes
 }
