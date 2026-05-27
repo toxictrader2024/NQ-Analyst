@@ -77,7 +77,16 @@ export function useTTS() {
       const audio = new Audio(url);
       audioRef.current = audio;
       audio.onended = () => URL.revokeObjectURL(url);
-      audio.play();
+      // Catch browser autoplay block — requires prior user interaction
+      const playPromise = audio.play();
+      if (playPromise !== undefined) {
+        playPromise.catch(err => {
+          console.warn("[TTS] Autoplay blocked by browser — user must interact with page first:", err);
+          // Queue for next user click
+          const unlock = () => { audio.play().catch(() => {}); document.removeEventListener("click", unlock); };
+          document.addEventListener("click", unlock, { once: true });
+        });
+      }
     } catch (err) {
       // Fallback to browser TTS
       console.warn("OpenAI TTS failed, falling back to browser:", err);
