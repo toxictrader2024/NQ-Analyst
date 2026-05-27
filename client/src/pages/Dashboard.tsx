@@ -15,7 +15,7 @@ import SimTradeLog from "@/components/SimTradeLog";
 import {
   RefreshCw, Zap, TrendingUp, TrendingDown, Minus,
   AlertTriangle, CheckCircle2, Clock, Loader2, FlaskConical,
-  Target, BarChart2,
+  Target, BarChart2, BarChart3,
 } from "lucide-react";
 
 interface DashboardData {
