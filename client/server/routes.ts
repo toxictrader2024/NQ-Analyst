@@ -545,21 +545,28 @@ export function registerRoutes(httpServer: Server, app: Express) {
           const freshWebhooks = storage.getRecentWebhooks(10);
           const { score, bias, orderFlowScore, tvLatest, scLatest } = scoreSetup(freshWebhooks);
 
-          // Build merged marketData object — ICT from TV, order flow from SC
+          // Build merged marketData object — ICT from TV/NT8, order flow from SC
+          // BUG FIX: if source is ninjatrader, use body.close directly (NT8 sends actual price)
+          // tvLatest only includes tradingview-sourced webhooks — stale for NT8 signals
+          const ntPrice = body.source === 'ninjatrader' && body.close ? Number(body.close) : null;
           const mergedMarketData = {
-            close: tvLatest?.close ?? scLatest?.close ?? null,
+            close: ntPrice ?? tvLatest?.close ?? scLatest?.close ?? null,
             delta: scLatest?.delta ?? null,
             bias,
             score,
             orderFlowScore,
             absorptionBull: scLatest?.absorptionBull ?? null,
             absorptionBear: scLatest?.absorptionBear ?? null,
-            // Pine Script v3 direct signal fields
+            // Direct signal fields from NT8 or Pine Script v3
             long_signal: body.long_signal ? Number(body.long_signal) : undefined,
             short_signal: body.short_signal ? Number(body.short_signal) : undefined,
             long_conf: body.long_conf ? Number(body.long_conf) : undefined,
             short_conf: body.short_conf ? Number(body.short_conf) : undefined,
             killzone: body.killzone || body.kz || null,
+            // NT8 sends pre-calculated SL/TP — pass through so evaluateSignal can use them
+            nt_sl:  body.source === 'ninjatrader' && body.sl  ? Number(body.sl)  : undefined,
+            nt_tp1: body.source === 'ninjatrader' && body.tp1 ? Number(body.tp1) : undefined,
+            nt_tp2: body.source === 'ninjatrader' && body.tp2 ? Number(body.tp2) : undefined,
           };
 
           const newSignal = evaluateSignal(mergedMarketData, activeSession);

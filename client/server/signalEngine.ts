@@ -75,9 +75,18 @@ function isInKillzone(): { active: boolean; name: string } {
   return { active: false, name: '' };
 }
 
-/** Returns true if any signal is currently active (pending or filled). */
+/** Returns true if any signal is currently active (pending or filled).
+ *  'received' is NOT counted — that just means MuzziBot acknowledged it.
+ *  'filled' only blocks if the fill was recent (< 10 min) to prevent stale fills from blocking forever.
+ */
 function hasActiveSignal(): boolean {
-  return signals.some(s => s.status === 'pending' || s.status === 'filled');
+  const TEN_MIN = 10 * 60 * 1000;
+  const now = Date.now();
+  return signals.some(s => {
+    if (s.status === 'pending') return true;
+    if (s.status === 'filled' && (now - s.createdAt) < TEN_MIN) return true;
+    return false;
+  });
 }
 
 // ── Core evaluation ───────────────────────────────────────────────────────────
@@ -143,9 +152,13 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     const kzLabel   = tvKillzone || session || 'killzone';
 
     const entry = price;
-    const sl    = isLong ? entry - 20 : entry + 20;
-    const tp1   = isLong ? entry + 30 : entry - 30;
-    const tp2   = isLong ? entry + 75 : entry - 75;
+    // Use NT8 pre-calculated levels if present, otherwise default ICT levels
+    const nt_sl  = (marketData as any).nt_sl;
+    const nt_tp1 = (marketData as any).nt_tp1;
+    const nt_tp2 = (marketData as any).nt_tp2;
+    const sl    = nt_sl  ?? (isLong ? entry - 20  : entry + 20);
+    const tp1   = nt_tp1 ?? (isLong ? entry + 30  : entry - 30);
+    const tp2   = nt_tp2 ?? (isLong ? entry + 75  : entry - 75);
 
     const reason = [
       `TV signal (${confCount} conf)`,
