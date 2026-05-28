@@ -420,6 +420,11 @@ function parseTradePlan(narrative: string, latest: ReturnType<typeof storage.get
   };
 }
 
+// ── 5-minute gate for auto-analysis on webhook ─────────────────────────────
+// Prevents AI analysis from firing on every incoming tick — max once per 5 min.
+let lastAutoAnalysisAt = 0;
+const AUTO_ANALYSIS_INTERVAL_MS = 5 * 60 * 1000;
+
 export function registerRoutes(httpServer: Server, app: Express) {
 
   // ── POST /api/webhook — TradingView webhook receiver ──────────────────────
@@ -490,12 +495,14 @@ export function registerRoutes(httpServer: Server, app: Express) {
         console.error("[Commentary] Trigger detection failed:", e);
       }
 
-      // Auto-generate analysis on webhook if AI key is present
-      if (process.env.ANTHROPIC_API_KEY) {
+      // Auto-generate analysis on webhook if AI key is present — max once per 5 min
+      const nowMs = Date.now();
+      if (process.env.ANTHROPIC_API_KEY && (nowMs - lastAutoAnalysisAt) >= AUTO_ANALYSIS_INTERVAL_MS) {
         const webhooks = storage.getRecentWebhooks(10);
         const { score, ictScore, bias, confluences, warnings, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge } = scoreSetup(webhooks);
 
         if (score >= 40) {
+          lastAutoAnalysisAt = nowMs;
           try {
             const livePrice = await fetchLiveNQPrice();
             const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings, undefined, activeSession, livePrice, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge);
@@ -626,7 +633,10 @@ export function registerRoutes(httpServer: Server, app: Express) {
     const webhooks = storage.getRecentWebhooks(20);
     const latestAnalysis = storage.getLatestAnalysis();
     const recentAnalyses = storage.getRecentAnalyses(5);
-    const { score, ictScore, bias, confluences, warnings } = scoreSetup(webhooks);
+    const { score, ictScore, bias, confluences, warnings, tvFresh, scFresh, tvAge, scAge, tvLatest, scLatest } = scoreSetup(webhooks);
+
+    const tvAgeMin = tvAge !== Infinity ? Math.round(tvAge / 60000) : null;
+    const scAgeMin = scAge !== Infinity ? Math.round(scAge / 60000) : null;
 
     return res.json({
       latestWebhook: webhooks.find((w: any) => w.source !== "bookmap_cme") || null,
@@ -638,6 +648,13 @@ export function registerRoutes(httpServer: Server, app: Express) {
       latestAnalysis,
       recentAnalyses,
       totalSignals: webhooks.length,
+      // Feed freshness — consumed by Dashboard.tsx feed status banner
+      tvFresh,
+      scFresh,
+      tvAgeMin,
+      scAgeMin,
+      hasTVData: !!tvLatest,
+      hasSCData: !!scLatest,
     });
   });
 
