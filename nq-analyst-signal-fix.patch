@@ -1,0 +1,97 @@
+From 4f182bebdeac0bd314343d9f8b1b93cf7e162b83 Mon Sep 17 00:00:00 2001
+From: toxictrader2024 <jburgess@loveladydd.com>
+Date: Thu, 28 May 2026 15:47:44 +0000
+Subject: [PATCH] fix(signals): allow NT8 webhooks into auto-signal engine; add
+ htfLong gate + visible POST diagnostics
+
+- server/routes.ts: /api/webhook now passes NinjaTrader (and any source
+  carrying long_signal/short_signal=1) into evaluateSignal(). Previously
+  only source=='tradingview' reached the signal queue, so NT8 LONG arrows
+  never produced trade-signals and MuzziBot never traded them. Sierra
+  still excluded by name.
+- ninjatrader/NQ_ICT_Signals.cs: add missing htfLong gate so LONG branch
+  mirrors SHORT (was unfiltered). Add visible NT Output Window logging
+  on every POST so status code + Railway response (or exact failure
+  detail) is printed per signal.
+---
+ ninjatrader/NQ_ICT_Signals.cs | 17 ++++++++++++++---
+ server/routes.ts              | 17 ++++++++++++-----
+ 2 files changed, 26 insertions(+), 8 deletions(-)
+
+diff --git a/ninjatrader/NQ_ICT_Signals.cs b/ninjatrader/NQ_ICT_Signals.cs
+index d27e257..caa2d27 100644
+--- a/ninjatrader/NQ_ICT_Signals.cs
++++ b/ninjatrader/NQ_ICT_Signals.cs
+@@ -443,7 +443,8 @@ namespace NinjaTrader.NinjaScript.Indicators
+                             + ((sweepHi || recentSweepHi) ? 1 : 0)
+                             + (cisdBear ? 1 : 0);
+ 
+-            if (longZone && longConf >= MinConfLong)
++            bool htfLong = htfBias != "bearish";
++            if (htfLong && longZone && longConf >= MinConfLong)
+             {
+                 double e = Close[0], sl = e - SlPts, tp1 = e + Tp1Pts, tp2 = e + Tp2Pts;
+                 string reason = MakeReason(true, inBullFvg, atBullOb, sweepLo || recentSweepLo, cisdBull, discount);
+@@ -543,9 +544,19 @@ namespace NinjaTrader.NinjaScript.Indicators
+                 req.ContentLength = data.Length;
+                 using (var s = req.GetRequestStream()) s.Write(data, 0, data.Length);
+                 using (var r = (HttpWebResponse)req.GetResponse())
+-                using (var sr = new StreamReader(r.GetResponseStream())) sr.ReadToEnd();
++                using (var sr = new StreamReader(r.GetResponseStream()))
++                {
++                    string resp = sr.ReadToEnd();
++                    Print("[ICT] POST " + dir.ToUpper() + " " + (int)r.StatusCode + " " + resp);
++                }
++            }
++            catch (WebException wex)
++            {
++                string detail = wex.Message;
++                try { if (wex.Response != null) using (var sr = new StreamReader(wex.Response.GetResponseStream())) detail += " | " + sr.ReadToEnd(); } catch {}
++                Print("[ICT] Railway POST FAILED (" + dir + "): " + detail);
+             }
+-            catch (Exception ex) { Print("[ICT] Railway error: " + ex.Message); }
++            catch (Exception ex) { Print("[ICT] Railway error (" + dir + "): " + ex.Message); }
+         }
+         #endregion
+     }
+diff --git a/server/routes.ts b/server/routes.ts
+index 40bccad..12337de 100644
+--- a/server/routes.ts
++++ b/server/routes.ts
+@@ -535,12 +535,17 @@ export function registerRoutes(httpServer: Server, app: Express) {
+       }
+ 
+       // ── Signal Engine — evaluate for auto-trade signal ────────────────────
+-      // Uses TV fast-path (long_signal/short_signal from Pine v3) or server scoring
++      // Uses TV/NT fast-path (long_signal/short_signal) or server scoring.
++      // SC (Sierra Charts) sends too frequently with no ICT data, so it is excluded.
+       try {
+         clearExpiredSignals();
+-        // Only evaluate TV webhooks — SC sends too frequently with no ICT data
+-        const isTVWebhook = !body.source || body.source === 'tradingview';
+-        if (isTVWebhook) {
++        const src = (body.source || 'tradingview').toLowerCase();
++        const isSierra = src === 'sierra' || src === 'sierrachart' || src === 'sc';
++        const carriesDirectSignal = body.long_signal === 1 || body.short_signal === 1 ||
++                                    body.long_signal === '1' || body.short_signal === '1';
++        // Allow TV by default, NT (or any non-SC source) only when it carries a direct signal.
++        const isEligible = !isSierra && (src === 'tradingview' || carriesDirectSignal);
++        if (isEligible) {
+           const freshWebhooks = storage.getRecentWebhooks(10);
+           const { score, bias, orderFlowScore, tvLatest, scLatest } = scoreSetup(freshWebhooks);
+ 
+@@ -563,8 +568,10 @@ export function registerRoutes(httpServer: Server, app: Express) {
+ 
+           const newSignal = evaluateSignal(mergedMarketData, activeSession);
+           if (newSignal) {
+-            console.log(`[Webhook] Auto-signal fired: ${newSignal.direction.toUpperCase()} @ ${newSignal.entry}`);
++            console.log(`[Webhook] Auto-signal fired (source=${src}): ${newSignal.direction.toUpperCase()} @ ${newSignal.entry}`);
+           }
++        } else {
++          console.log(`[Webhook] Skipped signal eval — source=${src} carriesDirectSignal=${carriesDirectSignal}`);
+         }
+       } catch (sigErr) {
+         console.error("[Signal] Evaluation error:", sigErr);
+-- 
+2.47.3
+
