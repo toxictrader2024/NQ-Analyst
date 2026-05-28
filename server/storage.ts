@@ -149,7 +149,65 @@ sqlite.exec(`
     rolling_bias_accuracy REAL,
     rolling_avg_pnl_pts REAL
   );
+
+  CREATE TABLE IF NOT EXISTS trade_signals (
+    id TEXT PRIMARY KEY,
+    direction TEXT NOT NULL,
+    entry REAL NOT NULL,
+    sl REAL NOT NULL,
+    tp1 REAL NOT NULL,
+    tp2 REAL NOT NULL,
+    qty INTEGER DEFAULT 1,
+    session TEXT,
+    confidence INTEGER DEFAULT 0,
+    reason TEXT,
+    source TEXT DEFAULT 'tradingview',
+    created_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    fill_price REAL,
+    fill_time TEXT,
+    exit_price REAL,
+    pnl_points REAL,
+    pnl_dollars REAL,
+    exit_reason TEXT,
+    result TEXT
+  );
 `);
+
+// ── Trade Signal DB helpers (raw sqlite for speed) ─────────────────────────
+export function dbSaveSignal(sig: {
+  id: string; direction: string; entry: number; sl: number; tp1: number; tp2: number;
+  qty: number; session: string; confidence: number; reason: string; source?: string;
+  createdAt: number; status: string;
+}): void {
+  sqlite.prepare(`
+    INSERT OR REPLACE INTO trade_signals
+      (id, direction, entry, sl, tp1, tp2, qty, session, confidence, reason, source, created_at, status)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(sig.id, sig.direction, sig.entry, sig.sl, sig.tp1, sig.tp2,
+         sig.qty, sig.session, sig.confidence, sig.reason, sig.source ?? 'tradingview',
+         sig.createdAt, sig.status);
+}
+
+export function dbGetPendingSignals(): any[] {
+  return sqlite.prepare(`SELECT * FROM trade_signals WHERE status = 'pending' ORDER BY created_at ASC`).all();
+}
+
+export function dbUpdateSignalStatus(id: string, status: string, extra?: Record<string, any>): void {
+  const fields = ['status = ?'];
+  const vals: any[] = [status];
+  if (extra?.fill_price  != null) { fields.push('fill_price = ?');  vals.push(extra.fill_price); }
+  if (extra?.exit_price  != null) { fields.push('exit_price = ?');  vals.push(extra.exit_price); }
+  if (extra?.pnl_points  != null) { fields.push('pnl_points = ?');  vals.push(extra.pnl_points); }
+  if (extra?.result      != null) { fields.push('result = ?');       vals.push(extra.result); }
+  if (extra?.exit_reason != null) { fields.push('exit_reason = ?'); vals.push(extra.exit_reason); }
+  vals.push(id);
+  sqlite.prepare(`UPDATE trade_signals SET ${fields.join(', ')} WHERE id = ?`).run(...vals);
+}
+
+export function dbGetRecentSignals(limit = 50): any[] {
+  return sqlite.prepare(`SELECT * FROM trade_signals ORDER BY created_at DESC LIMIT ?`).all(limit);
+}
 
 export interface IStorage {
   // Webhooks
