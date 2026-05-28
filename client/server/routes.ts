@@ -540,7 +540,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
       try {
         clearExpiredSignals();
         // Only evaluate TV webhooks — SC sends too frequently with no ICT data
-        const isTVWebhook = !body.source || body.source === 'tradingview';
+        const isTVWebhook = !body.source || body.source === 'tradingview' || body.source === 'ninjatrader';
         if (isTVWebhook) {
           const freshWebhooks = storage.getRecentWebhooks(10);
           const { score, bias, orderFlowScore, tvLatest, scLatest } = scoreSetup(freshWebhooks);
