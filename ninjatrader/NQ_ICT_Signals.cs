@@ -163,9 +163,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Tp1Pts         = 20;
                 Tp2Pts         = 40;
 
-                FilterNyAm     = true;
+                FilterNyAm     = false;
                 FilterLondon   = false;
-                BlockLunch     = true;
+                BlockLunch     = false;
                 BlockNews      = false;
 
                 ShowFvg        = true;
@@ -606,19 +606,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         #region Session Filter
         private bool InSession()
         {
-            // NT8 Time[0] is in exchange (CT for CME NQ). Add 1h to get ET.
-            DateTime et  = Time[0].AddHours(1);
-            int etH = et.Hour, etM = et.Minute, etHm = etH * 100 + etM;
-
-            if (BlockLunch && etHm >= 1130 && etHm < 1300) return false;
-            if (BlockNews) { int mod = etM % 30; if (mod <= 5 || mod >= 25) return false; }
-            if (!FilterNyAm && !FilterLondon) return true;
-
-            bool nyAm   = etHm >= 700  && etHm < 1130;
-            bool london = etHm >= 200  && etHm < 500;
-            if (FilterNyAm   && nyAm)   return true;
-            if (FilterLondon && london) return true;
-            return false;
+            // Session filter DISABLED — always allow signals to fire.
+            return true;
         }
         #endregion
 
