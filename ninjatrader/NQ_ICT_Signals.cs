@@ -39,7 +39,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         #region Parameters
 
         [NinjaScriptProperty][Display(Name = "Server URL",      GroupName = "Server",    Order = 1)]  public string ServerUrl      { get; set; }
-        [NinjaScriptProperty][Display(Name = "Post To Railway", GroupName = "Server",    Order = 2)]  public bool   PostToRailway  { get; set; }
+        // PostToRailway hardcoded true — not exposed as user property
+        private bool PostToRailway => true;
 
         [NinjaScriptProperty][Display(Name = "FVG Scan Lookback (1m)",    GroupName = "Detection", Order = 3)]  public int    FvgScanBars   { get; set; }
         [NinjaScriptProperty][Display(Name = "OB Swing Length (15m)",     GroupName = "Detection", Order = 4)]  public int    ObSwingLen    { get; set; }
@@ -146,7 +147,6 @@ namespace NinjaTrader.NinjaScript.Indicators
                 MaximumBarsLookBack = MaximumBarsLookBack.Infinite;
 
                 ServerUrl      = "https://nq-analyst-production.up.railway.app";
-                PostToRailway  = true;
 
                 FvgScanBars    = 5;
                 ObSwingLen     = 3;
