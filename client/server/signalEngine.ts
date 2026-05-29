@@ -143,6 +143,36 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   // ════════════════════════════════════════════════════════════════════════════
   // FAST PATH — Pine Script v3 already validated confluence + killzone on-chart
   // ════════════════════════════════════════════════════════════════════════════
+  // ── NT8 fast path — direction field sent directly from NQ_ICT_Signals.cs ──
+  const nt_direction = (marketData as any).direction as string | undefined;
+  const nt_confidence = (marketData as any).confidence as number | undefined;
+  const nt_reasons = (marketData as any).reasons as string | undefined;
+  if (nt_direction === 'long' || nt_direction === 'short') {
+    const isLong = nt_direction === 'long';
+    const entry  = price;
+    const nt_sl  = (marketData as any).nt_sl;
+    const nt_tp1 = (marketData as any).nt_tp1;
+    const nt_tp2 = (marketData as any).nt_tp2;
+    const sl  = nt_sl  ?? (isLong ? entry - 15 : entry + 15);
+    const tp1 = nt_tp1 ?? (isLong ? entry + 20 : entry - 20);
+    const tp2 = nt_tp2 ?? (isLong ? entry + 40 : entry - 40);
+    const signal: TradeSignal = {
+      id:         generateId(),
+      direction:  nt_direction,
+      entry, sl, tp1, tp2,
+      qty:        1,
+      session:    session || 'NT8',
+      confidence: nt_confidence ?? 70,
+      reason:     nt_reasons ?? `NT8 ${nt_direction.toUpperCase()}`,
+      createdAt:  Date.now(),
+      status:     'pending',
+    };
+    signals.unshift(signal);
+    if (signals.length > MAX_SIGNALS) signals.splice(MAX_SIGNALS);
+    console.log(`[SignalEngine][NT8 FastPath] ${signal.direction.toUpperCase()} @ ${entry} | ${signal.reason}`);
+    return signal;
+  }
+
   const tvLong  = long_signal  === 1;
   const tvShort = short_signal === 1;
 
