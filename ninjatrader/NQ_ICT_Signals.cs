@@ -1,10 +1,14 @@
 // NQ_ICT_Signals.cs — ICT Signal Engine for NinjaTrader 8
-// Detects FVG, OB, Sweeps, CISD, Structure natively.
-// Writes signals to NQ_SignalQueue (static class in NQ_MuzziBot.cs).
-// Also POSTs signals to Railway for dashboard logging.
+// v6 — Fixed all compile/runtime issues:
+//   - enum moved inside class (NT8 requirement)
+//   - Calculate.OnBarClose restored (OnPriceChange caused stutter + fires on 15m ticks)
+//   - ATR stored as Series, initialized in OnStateChange DataLoaded
+//   - Times[1][] replaced with BarsArray[1].GetTime() (indicator-safe)
+//   - OB drawing deferred: 15m RunOB15() queues new OBs, 1m OnBarUpdate draws them
+//   - All Draw calls consolidated in BarsInProgress==0 context only
 //
-// IMPORT ORDER: Import NQ_MuzziBot.cs FIRST, then this file.
-// ADD as INDICATOR on same 1-min chart as NQ_MuzziBot strategy.
+// IMPORT ORDER: NQ_MuzziBot.cs first, then this file.
+// ADD as INDICATOR on the 1-min chart.
 
 #region Using declarations
 using System;
@@ -21,348 +25,542 @@ using NinjaTrader.Gui;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.DrawingTools;
 using NinjaTrader.NinjaScript.Indicators;
-
 #endregion
 
 namespace NinjaTrader.NinjaScript.Indicators
 {
+    // ── Enum must be outside the class for NT8 NinjaScript compiler ──────────
+    public enum ObMitigationMode { Wick, Close, FiftyPercent }
+
     public class NQ_ICT_Signals : Indicator
     {
+
+        // ─────────────────────────────────────────────────────────────────
         #region Parameters
-        [NinjaScriptProperty]
-        [Display(Name = "Server URL", GroupName = "Server", Order = 1)]
-        public string ServerUrl { get; set; }
 
-        [NinjaScriptProperty]
-        [Display(Name = "Post To Railway", GroupName = "Server", Order = 2)]
-        public bool PostToRailway { get; set; }
+        [NinjaScriptProperty][Display(Name = "Server URL",      GroupName = "Server",    Order = 1)]  public string ServerUrl      { get; set; }
+        [NinjaScriptProperty][Display(Name = "Post To Railway", GroupName = "Server",    Order = 2)]  public bool   PostToRailway  { get; set; }
 
-        [NinjaScriptProperty]
-        [Display(Name = "FVG Lookback", GroupName = "Detection", Order = 3)]
-        public int FvgLookback { get; set; }
+        [NinjaScriptProperty][Display(Name = "FVG Scan Lookback (1m)",    GroupName = "Detection", Order = 3)]  public int    FvgScanBars   { get; set; }
+        [NinjaScriptProperty][Display(Name = "OB Swing Length (15m)",     GroupName = "Detection", Order = 4)]  public int    ObSwingLen    { get; set; }
+        [NinjaScriptProperty][Display(Name = "OB Max Search Bars (15m)",  GroupName = "Detection", Order = 5)]  public int    ObMaxBars     { get; set; }
+        [NinjaScriptProperty][Display(Name = "Sweep Lookback (1m)",       GroupName = "Detection", Order = 6)]  public int    SweepLookback { get; set; }
+        [NinjaScriptProperty][Display(Name = "ATR Period",                GroupName = "Detection", Order = 7)]  public int    AtrPeriod     { get; set; }
+        [NinjaScriptProperty][Display(Name = "ATR Expansion Mult",        GroupName = "Detection", Order = 8)]  public double AtrMult       { get; set; }
+        [NinjaScriptProperty][Display(Name = "OB Mitigation Mode",        GroupName = "Detection", Order = 9)]  public ObMitigationMode MitigationMode { get; set; }
 
-        [NinjaScriptProperty]
-        [Display(Name = "OB Lookback", GroupName = "Detection", Order = 4)]
-        public int ObLookback { get; set; }
+        [NinjaScriptProperty][Display(Name = "Min Conf Long",   GroupName = "Signals",   Order = 10)] public int    MinConfLong   { get; set; }
+        [NinjaScriptProperty][Display(Name = "Min Conf Short",  GroupName = "Signals",   Order = 11)] public int    MinConfShort  { get; set; }
+        [NinjaScriptProperty][Display(Name = "Cooldown Bars",   GroupName = "Signals",   Order = 12)] public int    CooldownBars  { get; set; }
+        [NinjaScriptProperty][Display(Name = "SL Points",       GroupName = "Signals",   Order = 13)] public double SlPts         { get; set; }
+        [NinjaScriptProperty][Display(Name = "TP1 Points",      GroupName = "Signals",   Order = 14)] public double Tp1Pts        { get; set; }
+        [NinjaScriptProperty][Display(Name = "TP2 Points",      GroupName = "Signals",   Order = 15)] public double Tp2Pts        { get; set; }
 
-        [NinjaScriptProperty]
-        [Display(Name = "Sweep Lookback", GroupName = "Detection", Order = 5)]
-        public int SweepLookback { get; set; }
+        [NinjaScriptProperty][Display(Name = "Filter: NY AM (7-11am ET)",   GroupName = "Session", Order = 16)] public bool FilterNyAm   { get; set; }
+        [NinjaScriptProperty][Display(Name = "Filter: London (2-5am ET)",   GroupName = "Session", Order = 17)] public bool FilterLondon { get; set; }
+        [NinjaScriptProperty][Display(Name = "Block Lunch (11:30-1pm ET)",  GroupName = "Session", Order = 18)] public bool BlockLunch   { get; set; }
+        [NinjaScriptProperty][Display(Name = "Block News (±5min :00/:30)",  GroupName = "Session", Order = 19)] public bool BlockNews    { get; set; }
 
-        [NinjaScriptProperty]
-        [Display(Name = "Min Conf Long", GroupName = "Signals", Order = 6)]
-        public int MinConfLong { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Min Conf Short", GroupName = "Signals", Order = 7)]
-        public int MinConfShort { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Cooldown Bars", GroupName = "Signals", Order = 8)]
-        public int CooldownBars { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "SL Points", GroupName = "Signals", Order = 9)]
-        public double SlPts { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "TP1 Points", GroupName = "Signals", Order = 10)]
-        public double Tp1Pts { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "TP2 Points", GroupName = "Signals", Order = 11)]
-        public double Tp2Pts { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Show FVG", GroupName = "Display", Order = 12)]
-        public bool ShowFvg { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Show OB", GroupName = "Display", Order = 13)]
-        public bool ShowOb { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Show Structure", GroupName = "Display", Order = 14)]
-        public bool ShowStruct { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Show CISD", GroupName = "Display", Order = 15)]
-        public bool ShowCisd { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Show Sweeps", GroupName = "Display", Order = 16)]
-        public bool ShowSweeps { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Show Signals", GroupName = "Display", Order = 17)]
-        public bool ShowSignals { get; set; }
+        [NinjaScriptProperty][Display(Name = "Show FVG",       GroupName = "Display",   Order = 20)] public bool ShowFvg      { get; set; }
+        [NinjaScriptProperty][Display(Name = "Show OB (15m)",  GroupName = "Display",   Order = 21)] public bool ShowOb       { get; set; }
+        [NinjaScriptProperty][Display(Name = "Show Structure", GroupName = "Display",   Order = 22)] public bool ShowStruct   { get; set; }
+        [NinjaScriptProperty][Display(Name = "Show CISD",      GroupName = "Display",   Order = 23)] public bool ShowCisd     { get; set; }
+        [NinjaScriptProperty][Display(Name = "Show Sweeps",    GroupName = "Display",   Order = 24)] public bool ShowSweeps   { get; set; }
+        [NinjaScriptProperty][Display(Name = "Show Signals",   GroupName = "Display",   Order = 25)] public bool ShowSignals  { get; set; }
         #endregion
 
+        // ─────────────────────────────────────────────────────────────────
+        #region Internal types
+        private class FvgZone
+        {
+            public double   Top, Bot;
+            public bool     IsBull, Filled;
+            public DateTime OpenTime;
+        }
+        private class ObZone15
+        {
+            public double   Top, Bot;
+            public bool     IsBull, Mitigated, Drawn;
+            public int      Bar15;
+            public DateTime ObTime;
+            public bool     HadSweep, HadFvg, HadMss;
+        }
+        private class Swing15
+        {
+            public double Price;
+            public int    Bar;
+            public bool   IsHigh;
+        }
+        #endregion
+
+        // ─────────────────────────────────────────────────────────────────
         #region State fields
-        private class FvgZone { public double Top, Bot; public bool IsBull, Filled; }
-        private class ObZone  { public double Top, Bot; public bool IsBull, Mitigated; public int Bar; }
+        private List<FvgZone>  fvgList     = new List<FvgZone>();
+        private List<ObZone15> obList      = new List<ObZone15>();
+        private List<Swing15>  swingList15 = new List<Swing15>();
 
-        private List<FvgZone> fvgList = new List<FvgZone>();
-        private List<ObZone>  obList  = new List<ObZone>();
+        // 15m HTF bias
+        private bool htfBull15 = false;
+        private bool htfBear15 = false;
 
-        private double lastSwingHigh = double.NaN;
-        private double lastSwingLow  = double.NaN;
-        private bool   structBull    = false;
-        private bool   structBear    = false;
-        private bool   cisdBull      = false;
-        private bool   cisdBear      = false;
-        private bool   sweepHi       = false;
-        private bool   sweepLo       = false;
+        // 1m structure
+        private double lastSwingHigh  = double.NaN;
+        private double lastSwingLow   = double.NaN;
+        private bool   structBull     = false;
+        private bool   structBear     = false;
+        private bool   cisdBull       = false;
+        private bool   cisdBear       = false;
+        private bool   sweepHi        = false;
+        private bool   sweepLo        = false;
         private int    lastSweepHiBar = -999;
         private int    lastSweepLoBar = -999;
         private int    lastSignalBar  = -999;
-        private string htfBias        = "neutral";
-        private int    fvgCount       = 0;
-        private int    obCount        = 0;
-        private int    sigCount       = 0;
-        private int    lastBullObBar  = -999;
-        private int    lastBearObBar  = -999;
 
-        private static readonly Brush BrushBullFvgBorder = Brushes.Lime;
-        private static readonly Brush BrushBearFvgBorder = Brushes.Red;
-        private static readonly Brush BrushBullObBorder  = Brushes.DodgerBlue;
-        private static readonly Brush BrushBearObBorder  = Brushes.OrangeRed;
+        // ATR series — initialized in DataLoaded, safe to call on every bar
+        private ATR atrSeries;
+
+        // Draw tag counters
+        private int fvgCount = 0;
+        private int obCount  = 0;
+        private int sigCount = 0;
+
+        private static readonly Brush BrushBullFvg = Brushes.Lime;
+        private static readonly Brush BrushBearFvg = Brushes.Red;
+        private static readonly Brush BrushBullOb  = Brushes.DodgerBlue;
+        private static readonly Brush BrushBearOb  = Brushes.OrangeRed;
         #endregion
 
+        // ─────────────────────────────────────────────────────────────────
         #region OnStateChange
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
             {
                 Name                = "NQ ICT Signals";
-                Description         = "ICT FVG OB Sweep CISD signal engine";
-                Calculate           = Calculate.OnBarClose;
+                Description         = "ICT v6 — 15m OB, 1m FVG/Sweep/CISD, session filter, ATR gate";
+                Calculate           = Calculate.OnBarClose;   // restored — no stutter
                 IsOverlay           = true;
                 DisplayInDataBox    = false;
                 DrawOnPricePanel    = true;
                 IsAutoScale         = false;
                 MaximumBarsLookBack = MaximumBarsLookBack.Infinite;
 
-                ServerUrl     = "https://nq-analyst-production.up.railway.app";
-                PostToRailway = true;
-                FvgLookback   = 3;
-                ObLookback    = 10;
-                SweepLookback = 40;
-                MinConfLong   = 2;
-                MinConfShort  = 2;
-                CooldownBars  = 15;
-                SlPts         = 15;
-                Tp1Pts        = 20;
-                Tp2Pts        = 40;
-                ShowFvg       = true;
-                ShowOb        = true;
-                ShowStruct    = false;
-                ShowCisd      = false;
-                ShowSweeps    = true;
-                ShowSignals   = true;
+                ServerUrl      = "https://nq-analyst-production.up.railway.app";
+                PostToRailway  = true;
+
+                FvgScanBars    = 5;
+                ObSwingLen     = 3;
+                ObMaxBars      = 20;
+                SweepLookback  = 40;
+                AtrPeriod      = 14;
+                AtrMult        = 1.2;
+                MitigationMode = ObMitigationMode.Close;
+
+                MinConfLong    = 2;
+                MinConfShort   = 2;
+                CooldownBars   = 15;
+                SlPts          = 15;
+                Tp1Pts         = 20;
+                Tp2Pts         = 40;
+
+                FilterNyAm     = true;
+                FilterLondon   = false;
+                BlockLunch     = true;
+                BlockNews      = false;
+
+                ShowFvg        = true;
+                ShowOb         = true;
+                ShowStruct     = false;
+                ShowCisd       = false;
+                ShowSweeps     = true;
+                ShowSignals    = true;
+            }
+            else if (State == State.Configure)
+            {
+                // Index 1 = 15-minute secondary series
+                AddDataSeries(new NinjaTrader.Data.BarsPeriod
+                {
+                    BarsPeriodType = NinjaTrader.Data.BarsPeriodType.Minute,
+                    Value          = 15
+                });
+            }
+            else if (State == State.DataLoaded)
+            {
+                // Initialize ATR on the PRIMARY (1m) series — index 0
+                // Must be done in DataLoaded, not SetDefaults
+                atrSeries = ATR(AtrPeriod);
+                atrSeries.Plots[0].Brush = Brushes.Transparent; // hide from chart
             }
         }
         #endregion
 
+        // ─────────────────────────────────────────────────────────────────
         #region OnBarUpdate
         protected override void OnBarUpdate()
         {
-            if (CurrentBar < SweepLookback + 5) return;
+            // ── 15m series (index 1) ─────────────────────────────────────
+            // Calculate.OnBarClose means this fires once per 15m bar close.
+            if (BarsInProgress == 1)
+            {
+                Track15mSwings();
+                RunOB15();          // queues new OBs into obList, sets Drawn=false
+                UpdateHTFBias15();
+                return;
+            }
+
+            // ── 1m primary series (index 0) ──────────────────────────────
+            if (CurrentBar < Math.Max(SweepLookback, FvgScanBars) + 5) return;
+
+            // Draw any pending 15m OBs that were queued by RunOB15()
+            // (drawing must happen from primary series context)
+            DrawPendingOBs();
+
             RunFVG();
-            RunOB();
             RunSweeps();
             RunStructure();
             RunCISD();
-            RunHTFBias();
+            MitigateOBs();
             RunSignal();
         }
         #endregion
 
-        #region FVG
+        // ─────────────────────────────────────────────────────────────────
+        #region 15m Swing Tracker
+        private void Track15mSwings()
+        {
+            int cb    = CurrentBar;
+            int swLen = ObSwingLen;
+            if (cb < swLen * 2 + 1) return;
+
+            bool isPH = true, isPL = true;
+            for (int i = 0; i < swLen; i++)
+            {
+                if (Highs[1][swLen] <= Highs[1][i] || Highs[1][swLen] <= Highs[1][swLen + i + 1]) isPH = false;
+                if (Lows[1][swLen]  >= Lows[1][i]  || Lows[1][swLen]  >= Lows[1][swLen  + i + 1]) isPL = false;
+            }
+            if (isPH)
+            {
+                int swBar = cb - swLen;
+                bool dup = false;
+                foreach (var s in swingList15) if (s.IsHigh && s.Bar == swBar) { dup = true; break; }
+                if (!dup) swingList15.Add(new Swing15 { Price = Highs[1][swLen], Bar = swBar, IsHigh = true });
+            }
+            if (isPL)
+            {
+                int swBar = cb - swLen;
+                bool dup = false;
+                foreach (var s in swingList15) if (!s.IsHigh && s.Bar == swBar) { dup = true; break; }
+                if (!dup) swingList15.Add(new Swing15 { Price = Lows[1][swLen], Bar = swBar, IsHigh = false });
+            }
+            while (swingList15.Count > 40) swingList15.RemoveAt(0);
+        }
+        #endregion
+
+        // ─────────────────────────────────────────────────────────────────
+        #region HTF Bias from 15m structure
+        private void UpdateHTFBias15()
+        {
+            double sh1 = double.NaN, sh2 = double.NaN;
+            double sl1 = double.NaN, sl2 = double.NaN;
+            for (int i = swingList15.Count - 1; i >= 0 && (double.IsNaN(sh2) || double.IsNaN(sl2)); i--)
+            {
+                var s = swingList15[i];
+                if (s.IsHigh)  { if (double.IsNaN(sh1)) sh1 = s.Price; else if (double.IsNaN(sh2)) sh2 = s.Price; }
+                else           { if (double.IsNaN(sl1)) sl1 = s.Price; else if (double.IsNaN(sl2)) sl2 = s.Price; }
+            }
+            bool hh = !double.IsNaN(sh1) && !double.IsNaN(sh2) && sh1 > sh2;
+            bool hl = !double.IsNaN(sl1) && !double.IsNaN(sl2) && sl1 > sl2;
+            bool lh = !double.IsNaN(sh1) && !double.IsNaN(sh2) && sh1 < sh2;
+            bool ll = !double.IsNaN(sl1) && !double.IsNaN(sl2) && sl1 < sl2;
+            if (hh && hl)      { htfBull15 = true;  htfBear15 = false; }
+            else if (lh && ll) { htfBull15 = false; htfBear15 = true;  }
+        }
+        #endregion
+
+        // ─────────────────────────────────────────────────────────────────
+        #region ICT OB Detection on 15m — queues, does NOT draw
+        private void RunOB15()
+        {
+            int cb = CurrentBar;
+            if (cb < ObSwingLen * 2 + ObMaxBars + 2) return;
+
+            // ─── BULLISH OB ───────────────────────────────────────────────
+            bool sslSwept = false; int sslBar = -1; double sslLvl = double.NaN;
+            for (int i = 1; i <= ObMaxBars; i++)
+            {
+                double swLow = GetLastSwingLow15(cb - i);
+                if (double.IsNaN(swLow)) continue;
+                if (Lows[1][i] < swLow && Closes[1][i] > swLow) { sslSwept = true; sslBar = i; sslLvl = swLow; break; }
+            }
+            if (sslSwept && sslBar >= 2)
+            {
+                double avg = AvgBody15(10);
+                bool dispUp = false; int dispBar = -1;
+                for (int i = sslBar - 1; i >= 1; i--)
+                    if (Closes[1][i] > Opens[1][i] && (Closes[1][i] - Opens[1][i]) > avg * 1.2) { dispUp = true; dispBar = i; break; }
+
+                if (dispUp && dispBar >= 2)
+                {
+                    bool fvg15 = Lows[1][dispBar] > Highs[1][dispBar + 2];
+                    bool mssUp = false;
+                    foreach (var sw in swingList15)
+                        if (sw.IsHigh && sw.Bar < cb - dispBar && sw.Bar > cb - ObMaxBars && Closes[1][0] > sw.Price) { mssUp = true; break; }
+
+                    int conf = (sslSwept?1:0) + (dispUp?1:0) + (fvg15?1:0) + (mssUp?1:0);
+                    if (conf >= 3)
+                    {
+                        int obBarAgo = -1;
+                        for (int i = sslBar; i >= dispBar + 1; i--)
+                            if (Closes[1][i] < Opens[1][i]) { obBarAgo = i; break; }
+
+                        if (obBarAgo > 0)
+                        {
+                            double obTop = Highs[1][obBarAgo], obBot = Lows[1][obBarAgo];
+                            bool dup = false;
+                            foreach (var o in obList)
+                                if (o.IsBull && !o.Mitigated && Math.Abs(o.Bot - obBot) < TickSize * 4) { dup = true; break; }
+                            if (!dup)
+                            {
+                                // Use BarsArray[1] to get the time of the OB candle — indicator-safe API
+                                int absIdx15 = BarsArray[1].Count - 1 - obBarAgo;
+                                DateTime obTime = absIdx15 >= 0 ? BarsArray[1].GetTime(absIdx15) : DateTime.MinValue;
+                                obList.Add(new ObZone15 { Top=obTop, Bot=obBot, IsBull=true,
+                                    Bar15=cb, ObTime=obTime, Drawn=false,
+                                    HadSweep=sslSwept, HadFvg=fvg15, HadMss=mssUp });
+                                Print("[OB15] Bull OB queued @ "+obBot.ToString("F2")+"-"+obTop.ToString("F2")+" Conf:"+conf);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ─── BEARISH OB ───────────────────────────────────────────────
+            bool bslSwept = false; int bslBar = -1; double bslLvl = double.NaN;
+            for (int i = 1; i <= ObMaxBars; i++)
+            {
+                double swHigh = GetLastSwingHigh15(cb - i);
+                if (double.IsNaN(swHigh)) continue;
+                if (Highs[1][i] > swHigh && Closes[1][i] < swHigh) { bslSwept = true; bslBar = i; bslLvl = swHigh; break; }
+            }
+            if (bslSwept && bslBar >= 2)
+            {
+                double avg = AvgBody15(10);
+                bool dispDn = false; int dispBar = -1;
+                for (int i = bslBar - 1; i >= 1; i--)
+                    if (Closes[1][i] < Opens[1][i] && (Opens[1][i] - Closes[1][i]) > avg * 1.2) { dispDn = true; dispBar = i; break; }
+
+                if (dispDn && dispBar >= 2)
+                {
+                    bool fvg15 = Highs[1][dispBar] < Lows[1][dispBar + 2];
+                    bool mssDn = false;
+                    foreach (var sw in swingList15)
+                        if (!sw.IsHigh && sw.Bar < cb - dispBar && sw.Bar > cb - ObMaxBars && Closes[1][0] < sw.Price) { mssDn = true; break; }
+
+                    int conf = (bslSwept?1:0) + (dispDn?1:0) + (fvg15?1:0) + (mssDn?1:0);
+                    if (conf >= 3)
+                    {
+                        int obBarAgo = -1;
+                        for (int i = bslBar; i >= dispBar + 1; i--)
+                            if (Closes[1][i] > Opens[1][i]) { obBarAgo = i; break; }
+
+                        if (obBarAgo > 0)
+                        {
+                            double obTop = Highs[1][obBarAgo], obBot = Lows[1][obBarAgo];
+                            bool dup = false;
+                            foreach (var o in obList)
+                                if (!o.IsBull && !o.Mitigated && Math.Abs(o.Top - obTop) < TickSize * 4) { dup = true; break; }
+                            if (!dup)
+                            {
+                                int absIdx15 = BarsArray[1].Count - 1 - obBarAgo;
+                                DateTime obTime = absIdx15 >= 0 ? BarsArray[1].GetTime(absIdx15) : DateTime.MinValue;
+                                obList.Add(new ObZone15 { Top=obTop, Bot=obBot, IsBull=false,
+                                    Bar15=cb, ObTime=obTime, Drawn=false,
+                                    HadSweep=bslSwept, HadFvg=fvg15, HadMss=mssDn });
+                                Print("[OB15] Bear OB queued @ "+obBot.ToString("F2")+"-"+obTop.ToString("F2")+" Conf:"+conf);
+                            }
+                        }
+                    }
+                }
+            }
+
+            while (obList.Count > 10) obList.RemoveAt(0);
+        }
+
+        // Called from primary series context — safe to Draw
+        private void DrawPendingOBs()
+        {
+            if (!ShowOb) return;
+            foreach (var ob in obList)
+            {
+                if (ob.Drawn || ob.Mitigated) continue;
+                if (ob.ObTime == DateTime.MinValue) { ob.Drawn = true; continue; }
+
+                // Find 1m bar whose time is closest to the 15m OB candle time
+                int startBarsAgo = 0;
+                for (int i = 0; i < Math.Min(CurrentBar, 500); i++)
+                {
+                    if (Time[i] <= ob.ObTime) { startBarsAgo = i; break; }
+                }
+
+                string tag   = ob.IsBull ? "OB15_B_" + obCount++ : "OB15_S_" + obCount++;
+                Brush  brush = ob.IsBull ? BrushBullOb : BrushBearOb;
+                string lbl   = ob.IsBull ? "Bull OB 15m" : "Bear OB 15m";
+
+                int endBarsAgo = Math.Max(0, startBarsAgo - 60);
+                Draw.Rectangle(this, tag, false, startBarsAgo, ob.Bot, endBarsAgo, ob.Top, brush, brush, 25);
+
+                double lblY = ob.IsBull ? ob.Top + TickSize * 10 : ob.Bot - TickSize * 14;
+                Draw.Text(this, tag + "_L", lbl, startBarsAgo, lblY, brush);
+
+                ob.Drawn = true;
+            }
+        }
+
+        private double GetLastSwingLow15(int beforeBar)
+        {
+            double r = double.NaN; int best = -1;
+            foreach (var s in swingList15) if (!s.IsHigh && s.Bar <= beforeBar && s.Bar > best) { best = s.Bar; r = s.Price; }
+            return r;
+        }
+        private double GetLastSwingHigh15(int beforeBar)
+        {
+            double r = double.NaN; int best = -1;
+            foreach (var s in swingList15) if (s.IsHigh && s.Bar <= beforeBar && s.Bar > best) { best = s.Bar; r = s.Price; }
+            return r;
+        }
+        private double AvgBody15(int n)
+        {
+            if (CurrentBar < n) return 10.0;
+            double sum = 0;
+            for (int i = 1; i <= n; i++) sum += Math.Abs(Closes[1][i] - Opens[1][i]);
+            return sum / n;
+        }
+        #endregion
+
+        // ─────────────────────────────────────────────────────────────────
+        #region OB Mitigation — 1m
+        private void MitigateOBs()
+        {
+            for (int i = obList.Count - 1; i >= 0; i--)
+            {
+                var o = obList[i];
+                if (o.Mitigated) continue;
+                double mid = (o.Top + o.Bot) / 2.0;
+                switch (MitigationMode)
+                {
+                    case ObMitigationMode.Wick:
+                        if ( o.IsBull && Low[0]   < o.Bot) o.Mitigated = true;
+                        if (!o.IsBull && High[0]  > o.Top) o.Mitigated = true;
+                        break;
+                    case ObMitigationMode.Close:
+                        if ( o.IsBull && Close[0] < o.Bot) o.Mitigated = true;
+                        if (!o.IsBull && Close[0] > o.Top) o.Mitigated = true;
+                        break;
+                    case ObMitigationMode.FiftyPercent:
+                        if ( o.IsBull && Close[0] < mid) o.Mitigated = true;
+                        if (!o.IsBull && Close[0] > mid) o.Mitigated = true;
+                        break;
+                }
+            }
+        }
+        #endregion
+
+        // ─────────────────────────────────────────────────────────────────
+        #region FVG — 1m
         private void RunFVG()
         {
             if (CurrentBar < 2) return;
-
-            // Bull FVG: gap up — Low[0] > High[2]
-            if (Low[0] > High[2])
+            int scan = Math.Min(FvgScanBars, CurrentBar - 2);
+            for (int k = 0; k <= scan; k++)
             {
-                var z = new FvgZone { Top = Low[0], Bot = High[2], IsBull = true };
-                fvgList.Add(z);
-                if (ShowFvg)
+                if (k + 2 > CurrentBar) break;
+                double lo0 = Low[k], hi0 = High[k];
+                double lo2 = Low[k+2], hi2 = High[k+2];
+
+                if (lo0 > hi2) // Bull FVG
                 {
-                    string t = "FVG_B_" + fvgCount++;
-                    // Draw.Rectangle(owner, tag, isAutoScale, startBarsAgo, startY, endBarsAgo, endY, outlineBrush, areaBrush, areaOpacity)
-                    Draw.Rectangle(this, t, false, 1, z.Bot, -(FvgLookback * 10), z.Top,
-                        BrushBullFvgBorder, BrushBullFvgBorder, 20);
+                    DateTime gt = Time[k + 1];
+                    bool dup = false;
+                    foreach (var z in fvgList) if (z.IsBull && z.OpenTime == gt) { dup = true; break; }
+                    if (!dup)
+                    {
+                        var z = new FvgZone { Top = lo0, Bot = hi2, IsBull = true, OpenTime = gt };
+                        fvgList.Add(z);
+                        if (ShowFvg)
+                        {
+                            int endBarsAgo = Math.Max(0, k - 30);
+                            Draw.Rectangle(this, "FVG_B_" + fvgCount++, false,
+                                k + 2, z.Bot, endBarsAgo, z.Top, BrushBullFvg, BrushBullFvg, 20);
+                        }
+                    }
+                }
+                if (hi0 < lo2) // Bear FVG
+                {
+                    DateTime gt = Time[k + 1];
+                    bool dup = false;
+                    foreach (var z in fvgList) if (!z.IsBull && z.OpenTime == gt) { dup = true; break; }
+                    if (!dup)
+                    {
+                        var z = new FvgZone { Top = lo2, Bot = hi0, IsBull = false, OpenTime = gt };
+                        fvgList.Add(z);
+                        if (ShowFvg)
+                        {
+                            int endBarsAgo = Math.Max(0, k - 30);
+                            Draw.Rectangle(this, "FVG_S_" + fvgCount++, false,
+                                k + 2, z.Bot, endBarsAgo, z.Top, BrushBearFvg, BrushBearFvg, 20);
+                        }
+                    }
                 }
             }
-
-            // Bear FVG: gap down — High[0] < Low[2]
-            if (High[0] < Low[2])
-            {
-                var z = new FvgZone { Top = Low[2], Bot = High[0], IsBull = false };
-                fvgList.Add(z);
-                if (ShowFvg)
-                {
-                    string t = "FVG_S_" + fvgCount++;
-                    Draw.Rectangle(this, t, false, 1, z.Bot, -(FvgLookback * 10), z.Top,
-                        BrushBearFvgBorder, BrushBearFvgBorder, 20);
-                }
-            }
-
             foreach (var z in fvgList)
             {
                 if (z.Filled) continue;
-                if (z.IsBull  && Low[0]  <= z.Bot) z.Filled = true;
+                if ( z.IsBull && Low[0]  <= z.Bot) z.Filled = true;
                 if (!z.IsBull && High[0] >= z.Top) z.Filled = true;
             }
-            while (fvgList.Count > 12) fvgList.RemoveAt(0);
+            while (fvgList.Count > 20) fvgList.RemoveAt(0);
         }
         #endregion
 
-        #region OB
-        private void RunOB()
-        {
-            if (CurrentBar < ObLookback + 1) return;
-
-            // Average range over lookback
-            double avgRange = 0;
-            for (int i = 1; i <= ObLookback; i++) avgRange += (High[i] - Low[i]);
-            avgRange /= ObLookback;
-            if (avgRange <= 0) return;
-
-            // Require 3x avg range impulse AND at least 10 bars since last OB of same type
-            double impulseUp   = Close[0] - Low[ObLookback];
-            double impulseDown = High[ObLookback] - Close[0];
-
-            // Bull OB: strong up close, last candle in the down leg before impulse
-            if (impulseUp > avgRange * 3.0 && Close[0] > Open[0]
-                && (CurrentBar - lastBullObBar) > 10)
-            {
-                // Find the last bearish candle within the lookback (the OB candle)
-                for (int i = 1; i <= ObLookback; i++)
-                {
-                    if (Close[i] < Open[i] && High[i] == High[i]) // bearish candle
-                    {
-                        // Confirm: candle after it (i-1) closed higher (impulse started)
-                        if (i > 1 && Close[i - 1] > High[i])
-                        {
-                            bool dup = false;
-                            foreach (var o in obList)
-                                if (Math.Abs(o.Top - High[i]) < TickSize * 4) { dup = true; break; }
-                            if (!dup)
-                            {
-                                var o = new ObZone { Top = High[i], Bot = Low[i], IsBull = true, Bar = CurrentBar };
-                                obList.Add(o);
-                                lastBullObBar = CurrentBar;
-                                if (ShowOb)
-                                {
-                                    string t = "OB_B_" + obCount++;
-                                    Draw.Rectangle(this, t, false, i, o.Bot, -20, o.Top,
-                                        BrushBullObBorder, BrushBullObBorder, 20);
-                                    Draw.Text(this, t + "_L", "Bull OB", i, o.Top + TickSize * 4, BrushBullObBorder);
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Bear OB: strong down close, last bullish candle before impulse down
-            if (impulseDown > avgRange * 3.0 && Close[0] < Open[0]
-                && (CurrentBar - lastBearObBar) > 10)
-            {
-                for (int i = 1; i <= ObLookback; i++)
-                {
-                    if (Close[i] > Open[i]) // bullish candle
-                    {
-                        // Confirm: candle after it (i-1) closed lower (impulse started)
-                        if (i > 1 && Close[i - 1] < Low[i])
-                        {
-                            bool dup = false;
-                            foreach (var o in obList)
-                                if (Math.Abs(o.Bot - Low[i]) < TickSize * 4) { dup = true; break; }
-                            if (!dup)
-                            {
-                                var o = new ObZone { Top = High[i], Bot = Low[i], IsBull = false, Bar = CurrentBar };
-                                obList.Add(o);
-                                lastBearObBar = CurrentBar;
-                                if (ShowOb)
-                                {
-                                    string t = "OB_S_" + obCount++;
-                                    Draw.Rectangle(this, t, false, i, o.Bot, -20, o.Top,
-                                        BrushBearObBorder, BrushBearObBorder, 20);
-                                    Draw.Text(this, t + "_L", "Bear OB", i, o.Bot - TickSize * 8, BrushBearObBorder);
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Mitigate OBs price has traded into
-            foreach (var o in obList)
-            {
-                if (o.Mitigated) continue;
-                if (o.IsBull  && Low[0]  < o.Bot) o.Mitigated = true;
-                if (!o.IsBull && High[0] > o.Top) o.Mitigated = true;
-            }
-            // Keep only 4 active OBs per side
-            while (obList.Count > 8) obList.RemoveAt(0);
-        }
-        #endregion
-
-        #region Sweeps
+        // ─────────────────────────────────────────────────────────────────
+        #region Sweeps — 1m
         private void RunSweeps()
         {
-            sweepHi = false;
-            sweepLo = false;
+            sweepHi = false; sweepLo = false;
             double hi = double.MinValue, lo = double.MaxValue;
-            for (int i = 1; i <= SweepLookback; i++)
-            {
-                if (High[i] > hi) hi = High[i];
-                if (Low[i]  < lo) lo = Low[i];
-            }
+            for (int i = 1; i <= SweepLookback; i++) { if (High[i] > hi) hi = High[i]; if (Low[i] < lo) lo = Low[i]; }
             if (High[0] > hi && Close[0] < hi)
             {
-                sweepHi = true;
-                lastSweepHiBar = CurrentBar;
-                if (ShowSweeps)
-                    // Draw.Dot(owner, tag, isAutoScale, barsAgo, y, brush)
-                    Draw.Dot(this, "SWP_H_" + CurrentBar, false, 0, High[0] + TickSize * 6, Brushes.Red);
+                sweepHi = true; lastSweepHiBar = CurrentBar;
+                if (ShowSweeps) Draw.Dot(this, "SWP_H_" + CurrentBar, false, 0, High[0] + TickSize * 6, Brushes.Red);
             }
             if (Low[0] < lo && Close[0] > lo)
             {
-                sweepLo = true;
-                lastSweepLoBar = CurrentBar;
-                if (ShowSweeps)
-                    Draw.Dot(this, "SWP_L_" + CurrentBar, false, 0, Low[0] - TickSize * 6, Brushes.Lime);
+                sweepLo = true; lastSweepLoBar = CurrentBar;
+                if (ShowSweeps) Draw.Dot(this, "SWP_L_" + CurrentBar, false, 0, Low[0] - TickSize * 6, Brushes.Lime);
             }
         }
         #endregion
 
-        #region Structure
+        // ─────────────────────────────────────────────────────────────────
+        #region Structure — 1m
         private void RunStructure()
         {
             int swLen = 5;
             if (CurrentBar < swLen * 2 + 1) return;
-
             bool isPH = true, isPL = true;
             for (int i = 0; i < swLen; i++)
             {
                 if (High[swLen] <= High[i] || High[swLen] <= High[swLen + i + 1]) isPH = false;
                 if (Low[swLen]  >= Low[i]  || Low[swLen]  >= Low[swLen  + i + 1]) isPL = false;
             }
-
             if (isPH)
             {
                 double ph = High[swLen];
                 if (!double.IsNaN(lastSwingHigh))
                 {
-                    if (ph > lastSwingHigh) { structBull = true; if (ShowStruct) Draw.Text(this, "HH_" + CurrentBar, "HH", swLen, ph + TickSize * 6, Brushes.Lime); }
-                    else                    {                     if (ShowStruct) Draw.Text(this, "LH_" + CurrentBar, "LH", swLen, ph + TickSize * 6, Brushes.OrangeRed); }
+                    if (ph > lastSwingHigh) { structBull = true;  if (ShowStruct) Draw.Text(this, "HH_"+CurrentBar, "HH", swLen, ph+TickSize*6,  Brushes.Lime); }
+                    else                    {                      if (ShowStruct) Draw.Text(this, "LH_"+CurrentBar, "LH", swLen, ph+TickSize*6,  Brushes.OrangeRed); }
                 }
                 lastSwingHigh = ph;
             }
@@ -371,112 +569,153 @@ namespace NinjaTrader.NinjaScript.Indicators
                 double pl = Low[swLen];
                 if (!double.IsNaN(lastSwingLow))
                 {
-                    if (pl < lastSwingLow) { structBear = true; if (ShowStruct) Draw.Text(this, "LL_" + CurrentBar, "LL", swLen, pl - TickSize * 10, Brushes.OrangeRed); }
-                    else                   {                     if (ShowStruct) Draw.Text(this, "HL_" + CurrentBar, "HL", swLen, pl - TickSize * 10, Brushes.Lime); }
+                    if (pl < lastSwingLow) { structBear = true;  if (ShowStruct) Draw.Text(this, "LL_"+CurrentBar, "LL", swLen, pl-TickSize*10, Brushes.OrangeRed); }
+                    else                   {                      if (ShowStruct) Draw.Text(this, "HL_"+CurrentBar, "HL", swLen, pl-TickSize*10, Brushes.Lime); }
                 }
                 lastSwingLow = pl;
             }
             if (!double.IsNaN(lastSwingHigh) && Close[0] > lastSwingHigh && !structBull)
-            { structBull = true; structBear = false; if (ShowStruct) Draw.Text(this, "MSS_B_" + CurrentBar, "MSS^", 0, Low[0] - TickSize * 10, Brushes.Lime); }
-            if (!double.IsNaN(lastSwingLow) && Close[0] < lastSwingLow && !structBear)
-            { structBear = true; structBull = false; if (ShowStruct) Draw.Text(this, "MSS_S_" + CurrentBar, "MSSv", 0, High[0] + TickSize * 6, Brushes.OrangeRed); }
+            { structBull=true; structBear=false; if (ShowStruct) Draw.Text(this, "MSS_B_"+CurrentBar, "MSS^", 0, Low[0]-TickSize*10,  Brushes.Lime); }
+            if (!double.IsNaN(lastSwingLow)  && Close[0] < lastSwingLow  && !structBear)
+            { structBear=true; structBull=false; if (ShowStruct) Draw.Text(this, "MSS_S_"+CurrentBar, "MSSv", 0, High[0]+TickSize*6,  Brushes.OrangeRed); }
         }
         #endregion
 
-        #region CISD
+        // ─────────────────────────────────────────────────────────────────
+        #region CISD — 1m (close beyond prior body)
         private void RunCISD()
         {
-            cisdBull = false;
-            cisdBear = false;
+            cisdBull = false; cisdBear = false;
             if (CurrentBar < 2) return;
-            if (Close[1] < Open[1] && Close[0] > Open[0] && CheckBullLevel())
+            // Bullish CISD: current closes ABOVE prior bearish candle's OPEN (body top)
+            if (Close[1] < Open[1] && Close[0] > Open[1] && Close[0] > Open[0] && CheckBullLevel())
             {
                 cisdBull = true;
-                if (ShowCisd) Draw.Text(this, "CISD_B_" + CurrentBar, "CISD", 0, Low[0] - TickSize * 10, Brushes.Red);
+                if (ShowCisd) Draw.Text(this, "CISD_B_"+CurrentBar, "CISD", 0, Low[0]-TickSize*10, Brushes.Red);
             }
-            if (Close[1] > Open[1] && Close[0] < Open[0] && CheckBearLevel())
+            // Bearish CISD: current closes BELOW prior bullish candle's OPEN (body bottom)
+            if (Close[1] > Open[1] && Close[0] < Open[1] && Close[0] < Open[0] && CheckBearLevel())
             {
                 cisdBear = true;
-                if (ShowCisd) Draw.Text(this, "CISD_S_" + CurrentBar, "CISD", 0, High[0] + TickSize * 6, Brushes.Lime);
+                if (ShowCisd) Draw.Text(this, "CISD_S_"+CurrentBar, "CISD", 0, High[0]+TickSize*6,  Brushes.Lime);
             }
         }
         #endregion
 
-        #region HTF Bias
-        private void RunHTFBias()
+        // ─────────────────────────────────────────────────────────────────
+        #region Session Filter
+        private bool InSession()
         {
-            double net = Close[0] - Close[Math.Min(15, CurrentBar - 1)];
-            if      (structBull && net > 0) htfBias = "bullish";
-            else if (structBear && net < 0) htfBias = "bearish";
-            else                            htfBias = "neutral";
+            // NT8 Time[0] is in exchange (CT for CME NQ). Add 1h to get ET.
+            DateTime et  = Time[0].AddHours(1);
+            int etH = et.Hour, etM = et.Minute, etHm = etH * 100 + etM;
+
+            if (BlockLunch && etHm >= 1130 && etHm < 1300) return false;
+            if (BlockNews) { int mod = etM % 30; if (mod <= 5 || mod >= 25) return false; }
+            if (!FilterNyAm && !FilterLondon) return true;
+
+            bool nyAm   = etHm >= 700  && etHm < 1130;
+            bool london = etHm >= 200  && etHm < 500;
+            if (FilterNyAm   && nyAm)   return true;
+            if (FilterLondon && london) return true;
+            return false;
         }
         #endregion
 
+        // ─────────────────────────────────────────────────────────────────
         #region Signal Engine
         private void RunSignal()
         {
             if (!ShowSignals) return;
+            if (!InSession())  return;
             if (CurrentBar - lastSignalBar < CooldownBars) return;
-            double eq       = GetEQ(20);
-            bool   discount = Close[0] < eq;
-            bool   premium  = Close[0] > eq;
+            if (atrSeries == null || CurrentBar < AtrPeriod + 2) return;
 
-            bool inBullFvg     = CheckInBullFvg();
-            bool atBullOb      = CheckAtBullOb();
-            bool inBearFvg     = CheckInBearFvg();
-            bool atBearOb      = CheckAtBearOb();
-            bool recentSweepLo = (CurrentBar - lastSweepLoBar) <= 5;
-            bool recentSweepHi = (CurrentBar - lastSweepHiBar) <= 5;
+            // ATR expansion filter — previous bar must show range >= AtrMult * ATR
+            double atrVal   = atrSeries[1];
+            double lastRange = High[1] - Low[1];
+            bool   atrOk    = lastRange >= atrVal * AtrMult;
+
+            double eq      = GetEQ(20);
+            bool discount  = Close[0] < eq;
+            bool premium   = Close[0] > eq;
+
+            bool inBullFvg    = CheckInBullFvg();
+            bool atBullOb     = CheckAtBullOb();
+            bool inBearFvg    = CheckInBearFvg();
+            bool atBearOb     = CheckAtBearOb();
+            bool recentSwpLo  = (CurrentBar - lastSweepLoBar) <= 5;
+            bool recentSwpHi  = (CurrentBar - lastSweepHiBar) <= 5;
 
             // LONG
-            bool htfLong    = htfBias != "bearish";
-            bool longLevel  = inBullFvg || atBullOb || sweepLo || recentSweepLo;
-            bool longZone   = htfLong && longLevel && discount;
-            int  longConf   = (inBullFvg ? 1 : 0) + (atBullOb ? 1 : 0)
-                            + ((sweepLo || recentSweepLo) ? 1 : 0)
-                            + (cisdBull ? 1 : 0) + (discount ? 1 : 0) + (structBull ? 1 : 0);
+            bool htfLong  = !htfBear15;
+            bool longLvl  = inBullFvg || atBullOb || sweepLo || recentSwpLo;
+            int  longConf = 0;
+            if (inBullFvg)              longConf++;
+            if (atBullOb)               longConf++;
+            if (sweepLo || recentSwpLo) longConf++;
+            if (cisdBull)               longConf++;
+            if (discount)               longConf++;
+            if (structBull)             longConf++;
+            if (htfBull15)              longConf++;
 
             // SHORT
-            bool htfShort   = htfBias != "bullish";
-            bool shortLevel = inBearFvg || atBearOb || sweepHi || recentSweepHi;
-            int  shortConf  = (inBearFvg ? 1 : 0) + (atBearOb ? 1 : 0)
-                            + ((sweepHi || recentSweepHi) ? 1 : 0)
-                            + (cisdBear ? 1 : 0);
+            bool htfShort  = !htfBull15;
+            bool shortLvl  = inBearFvg || atBearOb || sweepHi || recentSwpHi;
+            int  shortConf = 0;
+            if (inBearFvg)              shortConf++;
+            if (atBearOb)               shortConf++;
+            if (sweepHi || recentSwpHi) shortConf++;
+            if (cisdBear)               shortConf++;
+            if (premium)                shortConf++;
+            if (structBear)             shortConf++;
+            if (htfBear15)              shortConf++;
 
-            if (longZone && longConf >= MinConfLong)
+            bool longValid  = htfLong  && longLvl  && discount && longConf  >= MinConfLong  && atrOk;
+            bool shortValid = htfShort && shortLvl && premium  && shortConf >= MinConfShort && atrOk;
+
+            if (longValid)
             {
-                double e = Close[0], sl = e - SlPts, tp1 = e + Tp1Pts, tp2 = e + Tp2Pts;
-                string reason = MakeReason(true, inBullFvg, atBullOb, sweepLo || recentSweepLo, cisdBull, discount);
-                if (ShowSignals)
-                {
-                    Draw.TriangleUp(this, "SIG_L_" + sigCount, false, 0, Low[0] - TickSize * 10, Brushes.Lime);
-                    Draw.ArrowUp(this,   "SIG_LA_" + sigCount, false, 0, Low[0] - TickSize * 20, Brushes.Lime);
-                    sigCount++;
-                }
+                double e = Close[0], sl = e-SlPts, tp1 = e+Tp1Pts, tp2 = e+Tp2Pts;
+                string rsn   = MakeReason(true,  inBullFvg, atBullOb, sweepLo||recentSwpLo, cisdBull, discount, htfBull15);
+                string slbl  = "LONG " + longConf + "/7\n" + rsn;
+                Draw.TriangleUp(this,  "SIG_L_"  + sigCount, false, 0, Low[0]-TickSize*10,  Brushes.Lime);
+                Draw.ArrowUp(this,     "SIG_LA_" + sigCount, false, 0, Low[0]-TickSize*22,  Brushes.Lime);
+                Draw.Text(this,        "SIG_LT_" + sigCount, slbl,  0, Low[0]-TickSize*38,  Brushes.Lime);
+                sigCount++;
                 lastSignalBar = CurrentBar;
-                string sigIdL = DateTime.Now.Ticks.ToString();
-                if (PostToRailway) ThreadPool.QueueUserWorkItem(_ => PostRailway("long", e, sl, tp1, tp2, reason, sigIdL));
-                Print("[ICT] LONG @ " + e + " | " + reason);
+                string sigId = DateTime.Now.Ticks.ToString();
+                if (PostToRailway && IsInRealtimeMode()) ThreadPool.QueueUserWorkItem(_ => PostRailway("long",  e, sl, tp1, tp2, rsn, sigId));
+                Print("[ICT] LONG "  + longConf  + "/7 @ " + e.ToString("F2") + " | " + rsn);
             }
-            else if (htfShort && shortLevel && shortConf >= MinConfShort)
+            else if (shortValid)
             {
-                double e = Close[0], sl = e + SlPts, tp1 = e - Tp1Pts, tp2 = e - Tp2Pts;
-                string reason = MakeReason(false, inBearFvg, atBearOb, sweepHi || recentSweepHi, cisdBear, premium);
-                if (ShowSignals)
-                {
-                    Draw.TriangleDown(this, "SIG_S_" + sigCount,  false, 0, High[0] + TickSize * 10, Brushes.Red);
-                    Draw.ArrowDown(this,    "SIG_SA_" + sigCount, false, 0, High[0] + TickSize * 20, Brushes.Red);
-                    sigCount++;
-                }
+                double e = Close[0], sl = e+SlPts, tp1 = e-Tp1Pts, tp2 = e-Tp2Pts;
+                string rsn   = MakeReason(false, inBearFvg, atBearOb, sweepHi||recentSwpHi, cisdBear, premium, htfBear15);
+                string slbl  = "SHORT " + shortConf + "/7\n" + rsn;
+                Draw.TriangleDown(this, "SIG_S_"  + sigCount, false, 0, High[0]+TickSize*10, Brushes.Red);
+                Draw.ArrowDown(this,    "SIG_SA_" + sigCount, false, 0, High[0]+TickSize*22, Brushes.Red);
+                Draw.Text(this,         "SIG_ST_" + sigCount, slbl,  0, High[0]+TickSize*38, Brushes.Red);
+                sigCount++;
                 lastSignalBar = CurrentBar;
-                string sigIdS = DateTime.Now.Ticks.ToString();
-                if (PostToRailway) ThreadPool.QueueUserWorkItem(_ => PostRailway("short", e, sl, tp1, tp2, reason, sigIdS));
-                Print("[ICT] SHORT @ " + e + " | " + reason);
+                string sigId = DateTime.Now.Ticks.ToString();
+                if (PostToRailway && IsInRealtimeMode()) ThreadPool.QueueUserWorkItem(_ => PostRailway("short", e, sl, tp1, tp2, rsn, sigId));
+                Print("[ICT] SHORT " + shortConf + "/7 @ " + e.ToString("F2") + " | " + rsn);
             }
         }
         #endregion
 
+        // ─────────────────────────────────────────────────────────────────
         #region Helpers
+        // NT8 indicators don't transition to State.Realtime the same way strategies do.
+        // Use BarsArray[0].IsTickReplay or check if current bar time is close to now.
+        private bool IsInRealtimeMode()
+        {
+            if (State == State.Realtime) return true;
+            // Fallback: if the bar's timestamp is within 2 minutes of now, we're live
+            return (DateTime.Now - Time[0]).TotalMinutes < 2;
+        }
+
         private bool CheckBullLevel() { return CheckInBullFvg() || CheckAtBullOb(); }
         private bool CheckBearLevel() { return CheckInBearFvg() || CheckAtBearOb(); }
 
@@ -513,14 +752,15 @@ namespace NinjaTrader.NinjaScript.Indicators
             return (hi + lo) / 2.0;
         }
 
-        private string MakeReason(bool isLong, bool fvg, bool ob, bool sweep, bool cisd, bool zone)
+        private string MakeReason(bool isLong, bool fvg, bool ob, bool sweep, bool cisd, bool zone, bool htf)
         {
             var p = new List<string>();
             if (fvg)   p.Add("FVG");
-            if (ob)    p.Add("OB");
+            if (ob)    p.Add("OB15m");
             if (sweep) p.Add("Sweep");
             if (cisd)  p.Add("CISD");
-            if (zone)  p.Add(isLong ? "Discount" : "Premium");
+            if (zone)  p.Add(isLong ? "Disc" : "Prem");
+            if (htf)   p.Add(isLong ? "HTF↑" : "HTF↓");
             return string.Join("+", p);
         }
 
@@ -528,15 +768,14 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             try
             {
-                string body = "{\"long_signal\":" + (dir == "long" ? "1" : "0")
-                    + ",\"short_signal\":" + (dir == "short" ? "1" : "0")
-                    + ",\"close\":" + e.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                    + ",\"sl\":"   + sl.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                    + ",\"tp1\":" + tp1.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                    + ",\"tp2\":" + tp2.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                string body = "{\"long_signal\":"  + (dir=="long" ?"1":"0")
+                    + ",\"short_signal\":" + (dir=="short"?"1":"0")
+                    + ",\"close\":"  + e.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    + ",\"sl\":"     + sl.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    + ",\"tp1\":"    + tp1.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    + ",\"tp2\":"    + tp2.ToString(System.Globalization.CultureInfo.InvariantCulture)
                     + ",\"source\":\"ninjatrader\",\"ticker\":\"NQ1!\""
                     + ",\"signal_id\":\"" + id + "\",\"reason\":\"" + reason + "\"}";
-
                 var req = (HttpWebRequest)WebRequest.Create(ServerUrl + "/api/webhook");
                 req.Method = "POST"; req.ContentType = "application/json"; req.Timeout = 5000;
                 byte[] data = Encoding.UTF8.GetBytes(body);
