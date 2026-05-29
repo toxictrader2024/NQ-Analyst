@@ -156,8 +156,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 AtrMult        = 1.2;
                 MitigationMode = ObMitigationMode.Close;
 
-                MinConfLong    = 2;
-                MinConfShort   = 2;
+                MinConfLong    = 4;
+                MinConfShort   = 4;
                 CooldownBars   = 15;
                 SlPts          = 15;
                 Tp1Pts         = 20;
@@ -636,8 +636,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             bool recentSwpLo  = (CurrentBar - lastSweepLoBar) <= 5;
             bool recentSwpHi  = (CurrentBar - lastSweepHiBar) <= 5;
 
-            // LONG
-            bool htfLong  = !htfBear15;
+            // LONG — HTF bias MUST be confirmed bullish (not just neutral)
             bool longLvl  = inBullFvg || atBullOb || sweepLo || recentSwpLo;
             int  longConf = 0;
             if (inBullFvg)              longConf++;
@@ -648,8 +647,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (structBull)             longConf++;
             if (htfBull15)              longConf++;
 
-            // SHORT
-            bool htfShort  = !htfBull15;
+            // SHORT — HTF bias MUST be confirmed bearish (not just neutral)
             bool shortLvl  = inBearFvg || atBearOb || sweepHi || recentSwpHi;
             int  shortConf = 0;
             if (inBearFvg)              shortConf++;
@@ -660,8 +658,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (structBear)             shortConf++;
             if (htfBear15)              shortConf++;
 
-            bool longValid  = htfLong  && longLvl  && discount && longConf  >= MinConfLong  && atrOk;
-            bool shortValid = htfShort && shortLvl && premium  && shortConf >= MinConfShort && atrOk;
+            bool longValid  = htfBull15 && longLvl  && discount && longConf  >= MinConfLong  && atrOk;
+            bool shortValid = htfBear15 && shortLvl && premium  && shortConf >= MinConfShort && atrOk;
 
             if (longValid)
             {
