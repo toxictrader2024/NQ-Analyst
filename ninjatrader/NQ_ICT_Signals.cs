@@ -198,6 +198,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         #region OnBarUpdate
         protected override void OnBarUpdate()
         {
+            Print("[ICT] OBU BIP=" + BarsInProgress + " Bar=" + CurrentBar + " Close=" + Close[0].ToString("F2"));
+
             // ── 15m series (index 1) ─────────────────────────────────────
             // Calculate.OnBarClose means this fires once per 15m bar close.
             if (BarsInProgress == 1)
