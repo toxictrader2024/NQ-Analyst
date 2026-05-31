@@ -34,9 +34,45 @@ export interface TradeSignal {
   result?: 'TP1' | 'TP2' | 'STOPPED' | 'EXPIRED';
 }
 
-// ── In-memory store (max 200) ─────────────────────────────────────────────────
+// ── SQLite persistence ───────────────────────────────────────────────────────
+import Database from 'better-sqlite3';
+import path from 'path';
+const dbPath = path.resolve(process.cwd(), 'data.db');
+const _db = new Database(dbPath);
+_db.exec(`
+  CREATE TABLE IF NOT EXISTS trade_signals (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+  );
+`);
+
+function dbSave(sig: TradeSignal) {
+  _db.prepare('INSERT OR REPLACE INTO trade_signals (id, data, created_at, status) VALUES (?, ?, ?, ?)'
+  ).run(sig.id, JSON.stringify(sig), sig.createdAt, sig.status);
+}
+function dbUpdateStatus(id: string, status: string) {
+  _db.prepare('UPDATE trade_signals SET status=?, data=(
+    SELECT json_set(data, \"$.status\", ?) FROM trade_signals WHERE id=?
+  ) WHERE id=?').run(status, status, id, id);
+  // Simpler: reload and re-save
+  const row = _db.prepare('SELECT data FROM trade_signals WHERE id=?').get(id) as any;
+  if (row) {
+    const sig = JSON.parse(row.data);
+    sig.status = status;
+    _db.prepare('UPDATE trade_signals SET status=?, data=? WHERE id=?').run(status, JSON.stringify(sig), id);
+  }
+}
+function dbLoadRecent(): TradeSignal[] {
+  const cutoff = Date.now() - 60 * 60 * 1000; // last 60 min
+  const rows = _db.prepare('SELECT data FROM trade_signals WHERE created_at > ? ORDER BY created_at DESC LIMIT 200').all(cutoff) as any[];
+  return rows.map(r => JSON.parse(r.data));
+}
+
+// ── In-memory store (max 200) — seeded from SQLite on startup ─────────────────
 const MAX_SIGNALS = 200;
-const signals: TradeSignal[] = [];
+const signals: TradeSignal[] = dbLoadRecent();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -169,6 +205,7 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     };
     signals.unshift(signal);
     if (signals.length > MAX_SIGNALS) signals.splice(MAX_SIGNALS);
+    dbSave(signal);
     console.log(`[SignalEngine][NT8 FastPath] ${signal.direction.toUpperCase()} @ ${entry} | ${signal.reason}`);
     return signal;
   }
@@ -214,6 +251,7 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
 
     signals.unshift(signal);
     if (signals.length > MAX_SIGNALS) signals.splice(MAX_SIGNALS);
+    dbSave(signal);
     console.log(`[SignalEngine][TV FastPath] ${signal.direction.toUpperCase()} @ ${entry} | ${reason}`);
     return signal;
   }
