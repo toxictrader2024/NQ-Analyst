@@ -126,8 +126,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── Lifecycle ────────────────────────────────────────────────────────
         protected override void OnStateChange()
         {
+            // Route ALL of this strategy's Print() calls to Output Tab 2.
+            // ROOT CAUSE of the "silent OnBarUpdate": PrintTo defaults to
+            // PrintTo.OutputTab1, so every MuzziBot print was landing in
+            // Output 1 (mixed with the ICT indicator) while we were watching
+            // a blank Output 2. OnBarUpdate WAS firing the whole time.
+            // Set this as early as possible so even SetDefaults/Configure
+            // diagnostics land in Output 2.
+            PrintTo = PrintTo.OutputTab2;
+
             if (State == State.SetDefaults)
             {
+                Print("[MuzziBot] OnStateChange → SetDefaults");
                 Name                          = "NQ MuzziBot";
                 Description                   = "Polls NQ Analyst Railway API and executes signals on the NT8 main thread.";
                 Calculate                     = Calculate.OnPriceChange;
@@ -150,10 +160,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxLossPts      = 25;
                 EnableTrading   = true;
             }
+            else if (State == State.Configure)
+            {
+                Print("[MuzziBot] OnStateChange → Configure");
+            }
             else if (State == State.DataLoaded)
             {
+                Print("[MuzziBot] OnStateChange → DataLoaded");
                 DrawStatusLabel("MUZZIBOT ONLINE | WAITING FOR SIGNAL", StatusIdle);
                 Print("[MuzziBot] DataLoaded — server " + ServerUrl + " | poll " + PollIntervalSec + "s | qty " + Qty);
+            }
+            else if (State == State.Historical)
+            {
+                Print("[MuzziBot] OnStateChange → Historical");
+            }
+            else if (State == State.Transition)
+            {
+                Print("[MuzziBot] OnStateChange → Transition");
+            }
+            else if (State == State.Realtime)
+            {
+                Print("[MuzziBot] OnStateChange → Realtime — strategy is now live.");
             }
             else if (State == State.Terminated)
             {
@@ -171,6 +198,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── Main thread — fires on every tick (Calculate.OnPriceChange) ──────
         protected override void OnBarUpdate()
         {
+            // Absolute first line, no conditions — proves OnBarUpdate fires.
+            Print("[MuzziBot] TICK " + CurrentBar);
+
             if (BarsInProgress != 0) return;
             if (CurrentBar < 0)      return;
 
