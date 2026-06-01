@@ -12,8 +12,6 @@
  *  - Killzone now covers: London Open 2-5am ET, NY Open 9:30-11am ET, London Close 1:30-2pm ET
  */
 
-import { dbSaveSignal, dbGetPendingSignals, dbUpdateSignalStatus, dbGetRecentSignals } from './storage';
-
 export interface TradeSignal {
   id: string;
   direction: 'long' | 'short';
@@ -36,34 +34,42 @@ export interface TradeSignal {
   result?: 'TP1' | 'TP2' | 'STOPPED' | 'EXPIRED';
 }
 
-// ── In-memory store (max 200) + SQLite persistence ──────────────────────────
-// In-memory for fast access; SQLite survives Railway restarts.
-const MAX_SIGNALS = 200;
-const signals: TradeSignal[] = [];
+// ── SQLite persistence ───────────────────────────────────────────────────────
+import Database from 'better-sqlite3';
+import path from 'path';
+const dbPath = path.resolve(process.cwd(), 'data.db');
+const _db = new Database(dbPath);
+_db.exec(`
+  CREATE TABLE IF NOT EXISTS trade_signals (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+  );
+`);
 
-// Load any pending signals from DB on startup (survive restart)
-try {
-  const dbPending = dbGetPendingSignals();
-  for (const row of dbPending) {
-    signals.push({
-      id:         row.id,
-      direction:  row.direction as 'long' | 'short',
-      entry:      row.entry,
-      sl:         row.sl,
-      tp1:        row.tp1,
-      tp2:        row.tp2,
-      qty:        row.qty ?? 1,
-      session:    row.session ?? '',
-      confidence: row.confidence ?? 0,
-      reason:     row.reason ?? '',
-      createdAt:  row.created_at,
-      status:     row.status as TradeSignal['status'],
-    });
-  }
-  if (dbPending.length) console.log(`[SignalEngine] Restored ${dbPending.length} pending signal(s) from DB`);
-} catch (e) {
-  console.error('[SignalEngine] DB restore error:', e);
+function dbSave(sig: TradeSignal) {
+  _db.prepare('INSERT OR REPLACE INTO trade_signals (id, data, created_at, status) VALUES (?, ?, ?, ?)'
+  ).run(sig.id, JSON.stringify(sig), sig.createdAt, sig.status);
 }
+function dbUpdateStatus(id: string, status: string) {
+  // Reload signal, update status, and re-save
+  const row = _db.prepare('SELECT data FROM trade_signals WHERE id=?').get(id) as any;
+  if (row) {
+    const sig = JSON.parse(row.data);
+    sig.status = status;
+    _db.prepare('UPDATE trade_signals SET status=?, data=? WHERE id=?').run(status, JSON.stringify(sig), id);
+  }
+}
+function dbLoadRecent(): TradeSignal[] {
+  const cutoff = Date.now() - 60 * 60 * 1000; // last 60 min
+  const rows = _db.prepare('SELECT data FROM trade_signals WHERE created_at > ? ORDER BY created_at DESC LIMIT 200').all(cutoff) as any[];
+  return rows.map(r => JSON.parse(r.data));
+}
+
+// ── In-memory store (max 200) — seeded from SQLite on startup ─────────────────
+const MAX_SIGNALS = 200;
+const signals: TradeSignal[] = dbLoadRecent();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -102,9 +108,18 @@ function isInKillzone(): { active: boolean; name: string } {
   return { active: false, name: '' };
 }
 
-/** Returns true if any signal is currently active (pending or filled). */
+/** Returns true if any signal is currently active (pending or filled).
+ *  'received' is NOT counted — that just means MuzziBot acknowledged it.
+ *  'filled' only blocks if the fill was recent (< 10 min) to prevent stale fills from blocking forever.
+ */
 function hasActiveSignal(): boolean {
-  return signals.some(s => s.status === 'pending' || s.status === 'filled');
+  const TEN_MIN = 10 * 60 * 1000;
+  const now = Date.now();
+  return signals.some(s => {
+    if (s.status === 'pending') return true;
+    if (s.status === 'filled' && (now - s.createdAt) < TEN_MIN) return true;
+    return false;
+  });
 }
 
 // ── Core evaluation ───────────────────────────────────────────────────────────
@@ -161,6 +176,37 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   // ════════════════════════════════════════════════════════════════════════════
   // FAST PATH — Pine Script v3 already validated confluence + killzone on-chart
   // ════════════════════════════════════════════════════════════════════════════
+  // ── NT8 fast path — direction field sent directly from NQ_ICT_Signals.cs ──
+  const nt_direction = (marketData as any).direction as string | undefined;
+  const nt_confidence = (marketData as any).confidence as number | undefined;
+  const nt_reasons = (marketData as any).reasons as string | undefined;
+  if (nt_direction === 'long' || nt_direction === 'short') {
+    const isLong = nt_direction === 'long';
+    const entry  = price;
+    const nt_sl  = (marketData as any).nt_sl;
+    const nt_tp1 = (marketData as any).nt_tp1;
+    const nt_tp2 = (marketData as any).nt_tp2;
+    const sl  = nt_sl  ?? (isLong ? entry - 15 : entry + 15);
+    const tp1 = nt_tp1 ?? (isLong ? entry + 20 : entry - 20);
+    const tp2 = nt_tp2 ?? (isLong ? entry + 40 : entry - 40);
+    const signal: TradeSignal = {
+      id:         generateId(),
+      direction:  nt_direction,
+      entry, sl, tp1, tp2,
+      qty:        1,
+      session:    session || 'NT8',
+      confidence: nt_confidence ?? 70,
+      reason:     nt_reasons ?? `NT8 ${nt_direction.toUpperCase()}`,
+      createdAt:  Date.now(),
+      status:     'pending',
+    };
+    signals.unshift(signal);
+    if (signals.length > MAX_SIGNALS) signals.splice(MAX_SIGNALS);
+    dbSave(signal);
+    console.log(`[SignalEngine][NT8 FastPath] ${signal.direction.toUpperCase()} @ ${entry} | ${signal.reason}`);
+    return signal;
+  }
+
   const tvLong  = long_signal  === 1;
   const tvShort = short_signal === 1;
 
@@ -170,9 +216,13 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     const kzLabel   = tvKillzone || session || 'killzone';
 
     const entry = price;
-    const sl    = isLong ? entry - 20 : entry + 20;
-    const tp1   = isLong ? entry + 30 : entry - 30;
-    const tp2   = isLong ? entry + 75 : entry - 75;
+    // Use NT8 pre-calculated levels if present, otherwise default ICT levels
+    const nt_sl  = (marketData as any).nt_sl;
+    const nt_tp1 = (marketData as any).nt_tp1;
+    const nt_tp2 = (marketData as any).nt_tp2;
+    const sl    = nt_sl  ?? (isLong ? entry - 20  : entry + 20);
+    const tp1   = nt_tp1 ?? (isLong ? entry + 30  : entry - 30);
+    const tp2   = nt_tp2 ?? (isLong ? entry + 75  : entry - 75);
 
     const reason = [
       `TV signal (${confCount} conf)`,
@@ -196,13 +246,10 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
       status:     'pending',
     };
 
-    // Tag the source so we can filter NT8 vs TV signals
-    const src = (marketData.source === 'ninjatrader') ? 'ninjatrader' : 'tradingview';
     signals.unshift(signal);
     if (signals.length > MAX_SIGNALS) signals.splice(MAX_SIGNALS);
-    // Persist to DB so signal survives Railway restart
-    try { dbSaveSignal({ ...signal, source: src, createdAt: signal.createdAt, status: 'pending' }); } catch(e) {}
-    console.log(`[SignalEngine][FastPath:${src}] ${signal.direction.toUpperCase()} @ ${entry} | ${reason}`);
+    dbSave(signal);
+    console.log(`[SignalEngine][TV FastPath] ${signal.direction.toUpperCase()} @ ${entry} | ${reason}`);
     return signal;
   }
 
@@ -268,35 +315,15 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
 
   signals.unshift(signal);
   if (signals.length > MAX_SIGNALS) signals.splice(MAX_SIGNALS);
-  try { dbSaveSignal({ ...signal, source: marketData.source ?? 'tradingview', createdAt: signal.createdAt, status: 'pending' }); } catch(e) {}
   console.log(`[SignalEngine][Standard] ${signal.direction.toUpperCase()} @ ${entry} | ${reason}`);
   return signal;
 }
 
 // ── CRUD helpers ──────────────────────────────────────────────────────────────
 
-/** Returns the oldest 'pending' signal (checks memory first, then DB). */
+/** Returns the oldest 'pending' signal, or null if none exists. */
 export function getPendingSignal(): TradeSignal | null {
-  // Check in-memory first
-  let pending = signals.filter(s => s.status === 'pending');
-  if (!pending.length) {
-    // Fallback: reload from DB (handles case where memory was cleared by restart)
-    try {
-      const rows = dbGetPendingSignals();
-      for (const row of rows) {
-        if (!signals.find(s => s.id === row.id)) {
-          const restored: TradeSignal = {
-            id: row.id, direction: row.direction as 'long'|'short',
-            entry: row.entry, sl: row.sl, tp1: row.tp1, tp2: row.tp2,
-            qty: row.qty ?? 1, session: row.session ?? '', confidence: row.confidence ?? 0,
-            reason: row.reason ?? '', createdAt: row.created_at, status: row.status as any,
-          };
-          signals.unshift(restored);
-        }
-      }
-      pending = signals.filter(s => s.status === 'pending');
-    } catch(e) {}
-  }
+  const pending = signals.filter(s => s.status === 'pending');
   if (!pending.length) return null;
   return pending.reduce((oldest, s) => s.createdAt < oldest.createdAt ? s : oldest);
 }
@@ -306,7 +333,6 @@ export function confirmSignal(id: string): void {
   const sig = signals.find(s => s.id === id);
   if (sig && sig.status === 'pending') {
     sig.status = 'received';
-    try { dbUpdateSignalStatus(id, 'received'); } catch(e) {}
     console.log(`[SignalEngine] Confirmed signal ${id}`);
   }
 }
@@ -314,12 +340,6 @@ export function confirmSignal(id: string): void {
 /** Update fill / close data on an existing signal. */
 export function updateSignalResult(id: string, data: Partial<TradeSignal>): void {
   const sig = signals.find(s => s.id === id);
-  if (sig) {
-    try { dbUpdateSignalStatus(id, data.status ?? sig.status, {
-      fill_price: data.fillPrice, exit_price: data.exitPrice,
-      pnl_points: data.pnlPoints, result: data.result, exit_reason: data.exitReason,
-    }); } catch(e) {}
-  }
   if (!sig) return;
   Object.assign(sig, data);
 

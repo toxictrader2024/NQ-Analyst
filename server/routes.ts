@@ -62,10 +62,8 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   //   15m → session bias (trend direction)
   //   5m  → setup confirmation (structure / FVG / OB)
   //   1m  → trigger execution (MSS, delta flip, 3-bar play)
-  // Filter out seed/demo data with unrealistic NQ prices (below 25000)
-  const validWebhooks = webhooks.filter(w => !w.close || w.close >= 25000);
-  const tvWebhooks = validWebhooks.filter(w => w.source === 'tradingview' || (!w.source && w.killzone !== null));
-  const scWebhooks = validWebhooks.filter(w => w.source === 'sierra_chart' || w.source === 'bookmap_cme');
+  const tvWebhooks = webhooks.filter(w => w.source === 'tradingview' || (!w.source && w.killzone !== null));
+  const scWebhooks = webhooks.filter(w => w.source === 'sierra_chart' || w.source === 'bookmap_cme');
 
   // Timeframe sub-streams from TradingView
   const tv15 = tvWebhooks.filter(w => String(w.timeframe) === "15" || String(w.timeframe) === "15m");
@@ -80,7 +78,7 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   // tvLatest = best available for general ICT scoring (prefer 5m for setup, fall back to 15m)
   const tvLatest = tv5Latest ?? tv15Latest ?? tvWebhooks[0] ?? null;
   const tvAge = tvLatest ? Date.now() - tvLatest.receivedAt : Infinity;
-  const tvFresh = tvAge < 4 * 60 * 60 * 1000; // 4 hours — TV only fires on bar close, may be silent between sessions
+  const tvFresh = tvAge < 30 * 60 * 1000; // 30 min
 
   // Use most recent Sierra Chart webhook for order flow (up to 5 min old)
   const scLatest = scWebhooks[0] ?? null;
@@ -95,11 +93,7 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   // ── ICT Signals (from TradingView) ─────────────────────────────────────────
 
   if (!tvFresh) {
-    const tvAgeHours = tvAge === Infinity ? null : (tvAge / 3600000).toFixed(1);
-    warnings.push(tvAgeHours
-      ? `TradingView ICT signals stale (${tvAgeHours}h) — check TV alert is active on your NQ chart`
-      : "TradingView ICT signals not received — check TV alert is active and pointing to webhook URL"
-    );
+    warnings.push("TradingView ICT signals stale (>30min) — order flow only");
   }
 
   // Killzone check
@@ -426,6 +420,11 @@ function parseTradePlan(narrative: string, latest: ReturnType<typeof storage.get
   };
 }
 
+// ── 5-minute gate for auto-analysis on webhook ─────────────────────────────
+// Prevents AI analysis from firing on every incoming tick — max once per 5 min.
+let lastAutoAnalysisAt = 0;
+const AUTO_ANALYSIS_INTERVAL_MS = 5 * 60 * 1000;
+
 export function registerRoutes(httpServer: Server, app: Express) {
 
   // ── POST /api/webhook — TradingView webhook receiver ──────────────────────
@@ -496,12 +495,14 @@ export function registerRoutes(httpServer: Server, app: Express) {
         console.error("[Commentary] Trigger detection failed:", e);
       }
 
-      // Auto-generate analysis on webhook if AI key is present
-      if (process.env.ANTHROPIC_API_KEY) {
+      // Auto-generate analysis on webhook if AI key is present — max once per 5 min
+      const nowMs = Date.now();
+      if (process.env.ANTHROPIC_API_KEY && (nowMs - lastAutoAnalysisAt) >= AUTO_ANALYSIS_INTERVAL_MS) {
         const webhooks = storage.getRecentWebhooks(10);
         const { score, ictScore, bias, confluences, warnings, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge } = scoreSetup(webhooks);
 
         if (score >= 40) {
+          lastAutoAnalysisAt = nowMs;
           try {
             const livePrice = await fetchLiveNQPrice();
             const prompt = buildAnalysisPrompt(webhooks, score, bias, confluences, warnings, undefined, activeSession, livePrice, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge);
@@ -538,34 +539,34 @@ export function registerRoutes(httpServer: Server, app: Express) {
       // Uses TV fast-path (long_signal/short_signal from Pine v3) or server scoring
       try {
         clearExpiredSignals();
-        // Evaluate TV webhooks AND NinjaTrader webhooks. (SC/Bookmap order-flow
-        // sends too frequently with no ICT data, so those are excluded.)
-        // CRITICAL FIX: the ICT NinjaScript posts source="ninjatrader", which was
-        // previously rejected here — that silently broke the entire pipeline
-        // (signal never queued → MuzziBot /pending always empty → no trades).
-        const isTVWebhook   = !body.source || body.source === 'tradingview';
-        const isNtWebhook   = body.source === 'ninjatrader';
-        if (isTVWebhook || isNtWebhook) {
+        // Only evaluate TV webhooks — SC sends too frequently with no ICT data
+        const isTVWebhook = !body.source || body.source === 'tradingview' || body.source === 'ninjatrader';
+        if (isTVWebhook) {
           const freshWebhooks = storage.getRecentWebhooks(10);
           const { score, bias, orderFlowScore, tvLatest, scLatest } = scoreSetup(freshWebhooks);
 
-          // Build merged marketData object — ICT from TV, order flow from SC
+          // Build merged marketData object — ICT from TV/NT8, order flow from SC
+          // BUG FIX: if source is ninjatrader, use body.close directly (NT8 sends actual price)
+          // tvLatest only includes tradingview-sourced webhooks — stale for NT8 signals
+          const ntPrice = body.source === 'ninjatrader' && body.close ? Number(body.close) : null;
           const mergedMarketData = {
-            close: tvLatest?.close ?? scLatest?.close ?? null,
+            close: ntPrice ?? tvLatest?.close ?? scLatest?.close ?? null,
             delta: scLatest?.delta ?? null,
             bias,
             score,
             orderFlowScore,
             absorptionBull: scLatest?.absorptionBull ?? null,
             absorptionBear: scLatest?.absorptionBear ?? null,
-            // Pine Script v3 direct signal fields
-            // Pass source through so evaluateSignal tags the signal correctly
-            source: body.source || 'tradingview',
+            // Direct signal fields from NT8 or Pine Script v3
             long_signal: body.long_signal ? Number(body.long_signal) : undefined,
             short_signal: body.short_signal ? Number(body.short_signal) : undefined,
             long_conf: body.long_conf ? Number(body.long_conf) : undefined,
             short_conf: body.short_conf ? Number(body.short_conf) : undefined,
             killzone: body.killzone || body.kz || null,
+            // NT8 sends pre-calculated SL/TP — pass through so evaluateSignal can use them
+            nt_sl:  body.source === 'ninjatrader' && body.sl  ? Number(body.sl)  : undefined,
+            nt_tp1: body.source === 'ninjatrader' && body.tp1 ? Number(body.tp1) : undefined,
+            nt_tp2: body.source === 'ninjatrader' && body.tp2 ? Number(body.tp2) : undefined,
           };
 
           const newSignal = evaluateSignal(mergedMarketData, activeSession);
@@ -582,6 +583,49 @@ export function registerRoutes(httpServer: Server, app: Express) {
       console.error("Webhook error:", err);
       return res.status(500).json({ error: "Webhook processing failed" });
     }
+  });
+
+  // ── POST /api/debug-signal — Test evaluateSignal directly with NT8 payload ───
+  app.post("/api/debug-signal", (req, res) => {
+    const body = req.body || {};
+    const freshWebhooks = storage.getRecentWebhooks(10);
+    const { score, bias, orderFlowScore, tvLatest, scLatest } = scoreSetup(freshWebhooks);
+    const ntPrice = body.source === 'ninjatrader' && body.close ? Number(body.close) : null;
+    const mergedMarketData = {
+      close: ntPrice ?? tvLatest?.close ?? scLatest?.close ?? null,
+      delta: scLatest?.delta ?? null,
+      bias,
+      score,
+      orderFlowScore,
+      absorptionBull: scLatest?.absorptionBull ?? null,
+      absorptionBear: scLatest?.absorptionBear ?? null,
+      long_signal: body.long_signal ? Number(body.long_signal) : undefined,
+      short_signal: body.short_signal ? Number(body.short_signal) : undefined,
+      long_conf: body.long_conf ? Number(body.long_conf) : undefined,
+      short_conf: body.short_conf ? Number(body.short_conf) : undefined,
+      killzone: body.killzone || body.kz || null,
+      nt_sl:  body.source === 'ninjatrader' && body.sl  ? Number(body.sl)  : undefined,
+      nt_tp1: body.source === 'ninjatrader' && body.tp1 ? Number(body.tp1) : undefined,
+      nt_tp2: body.source === 'ninjatrader' && body.tp2 ? Number(body.tp2) : undefined,
+    };
+    // Also expose hasActiveSignal state by checking pending signals
+    const { getRecentSignals } = require('./signalEngine');
+    const recent = getRecentSignals(10);
+    const pendingSignals = recent.filter((s: any) => s.status === 'pending');
+    const filledRecent = recent.filter((s: any) => s.status === 'filled' && (Date.now() - s.createdAt) < 10 * 60 * 1000);
+    const isBlocked = pendingSignals.length > 0 || filledRecent.length > 0;
+    const newSignal = evaluateSignal(mergedMarketData, activeSession);
+    return res.json({
+      mergedMarketData,
+      activeSession,
+      pendingSignals,
+      filledRecent,
+      isBlocked,
+      result: newSignal ? 'SIGNAL_CREATED' : 'NULL_NO_SIGNAL',
+      signal: newSignal,
+      score,
+      bias,
+    });
   });
 
   // ── POST /api/simulate — Inject test/demo data ─────────────────────────────
@@ -639,17 +683,13 @@ export function registerRoutes(httpServer: Server, app: Express) {
     const webhooks = storage.getRecentWebhooks(20);
     const latestAnalysis = storage.getLatestAnalysis();
     const recentAnalyses = storage.getRecentAnalyses(5);
-    const { score, ictScore, bias, confluences, warnings, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge } = scoreSetup(webhooks);
-
-    // latestWebhook for MuzziAnalyzer — prefer tvLatest (has ICT fields) over SC (order flow only)
-    // Fall back to any non-bookmap webhook if TV hasn't sent yet
-    const latestWebhook = tvLatest ?? webhooks.find((w: any) => w.source !== "bookmap_cme") ?? null;
+    const { score, ictScore, bias, confluences, warnings, tvFresh, scFresh, tvAge, scAge, tvLatest, scLatest } = scoreSetup(webhooks);
 
     const tvAgeMin = tvAge !== Infinity ? Math.round(tvAge / 60000) : null;
     const scAgeMin = scAge !== Infinity ? Math.round(scAge / 60000) : null;
 
     return res.json({
-      latestWebhook,
+      latestWebhook: webhooks.find((w: any) => w.source !== "bookmap_cme") || null,
       score,
       ictScore,
       bias,
@@ -658,11 +698,11 @@ export function registerRoutes(httpServer: Server, app: Express) {
       latestAnalysis,
       recentAnalyses,
       totalSignals: webhooks.length,
-      // Feed freshness — used by dashboard status banner
+      // Feed freshness — consumed by Dashboard.tsx feed status banner
       tvFresh,
       scFresh,
-      tvAgeMin,   // minutes since last TV webhook (null = never received)
-      scAgeMin,   // minutes since last SC webhook
+      tvAgeMin,
+      scAgeMin,
       hasTVData: !!tvLatest,
       hasSCData: !!scLatest,
     });
@@ -975,17 +1015,6 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // ── GET /api/webhook-url — Return the webhook URL hint ───────────────────
-  // ── POST /api/clear-seed — purge demo/seed data with prices below 25000 ──
-  app.post("/api/clear-seed", (_req, res) => {
-    try {
-      const result = storage.clearSeedData();
-      console.log(`[clear-seed] Deleted ${result.deletedWebhooks} webhooks, ${result.deletedCommentary} commentary entries`);
-      return res.json({ ok: true, ...result });
-    } catch (e: any) {
-      return res.status(500).json({ error: e.message });
-    }
-  });
-
   app.get("/api/webhook-url", (req, res) => {
     const host = req.headers.host || "localhost:5000";
     const proto = req.headers["x-forwarded-proto"] || "http";
@@ -1052,183 +1081,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
   });
 
-    // ══════════════════════════════════════════════════════════════════════════
-  // SIM TRADES — paper-tracking of every Muzzi signal (NQ_Muzzi_Sim.cs posts here)
-  // ══════════════════════════════════════════════════════════════════════════
-
-  const simTrades: any[] = [];   // in-memory, max 500, newest first
-  const MAX_SIM = 500;
-
-  // POST /api/sim-trades — receive a sim trade open or update from NT
-  app.post("/api/sim-trades", (req, res) => {
-    try {
-      const trade = req.body;
-      if (!trade || !trade.id) return res.status(400).json({ error: "Missing trade id" });
-
-      // Upsert: update if id exists, insert if new
-      const idx = simTrades.findIndex(t => t.id === trade.id);
-      if (idx >= 0) {
-        simTrades[idx] = { ...simTrades[idx], ...trade, updatedAt: Date.now() };
-      } else {
-        simTrades.unshift({ ...trade, receivedAt: Date.now() });
-        if (simTrades.length > MAX_SIM) simTrades.splice(MAX_SIM);
-      }
-      return res.json({ ok: true });
-    } catch (err) {
-      return res.status(500).json({ error: "Failed to store sim trade" });
-    }
-  });
-
-  // GET /api/sim-trades — return trades + stats for dashboard
-  app.get("/api/sim-trades", (req, res) => {
-    try {
-      const limit = parseInt(String(req.query.limit ?? "100"));
-      const recent = simTrades.slice(0, limit);
-
-      // Stats — closed trades only
-      const closed = simTrades.filter(t => t.result && t.result !== "OPEN");
-      const wins   = closed.filter(t => t.result === "TP1" || t.result === "TP2");
-      const losses = closed.filter(t => t.result === "STOPPED");
-      const totalPnlPts = closed.reduce((s: number, t: any) => s + (t.pnlPoints ?? 0), 0);
-
-      // Stats by grade
-      const byGrade: Record<string, { wins: number; total: number; pnl: number }> = {};
-      for (const t of closed) {
-        const g = t.grade ?? "?";
-        if (!byGrade[g]) byGrade[g] = { wins: 0, total: 0, pnl: 0 };
-        byGrade[g].total++;
-        byGrade[g].pnl += t.pnlPoints ?? 0;
-        if (t.result === "TP1" || t.result === "TP2") byGrade[g].wins++;
-      }
-
-      // Stats by gravity score
-      const byGravity: Record<number, { wins: number; total: number; pnl: number }> = {};
-      for (const t of closed) {
-        const g = t.gravityScore ?? 0;
-        if (!byGravity[g]) byGravity[g] = { wins: 0, total: 0, pnl: 0 };
-        byGravity[g].total++;
-        byGravity[g].pnl += t.pnlPoints ?? 0;
-        if (t.result === "TP1" || t.result === "TP2") byGravity[g].wins++;
-      }
-
-      // Open trades
-      const open = simTrades.filter(t => t.result === "OPEN");
-
-      return res.json({
-        trades: recent,
-        open,
-        stats: {
-          total     : closed.length,
-          wins      : wins.length,
-          losses    : losses.length,
-          winRate   : closed.length ? Math.round(wins.length / closed.length * 100) : 0,
-          totalPnlPts: parseFloat(totalPnlPts.toFixed(2)),
-          totalPnlDollars: parseFloat((totalPnlPts * 20).toFixed(2)),
-          avgPnlPts : closed.length ? parseFloat((totalPnlPts / closed.length).toFixed(2)) : 0,
-          byGrade   : Object.entries(byGrade).map(([grade, d]) => ({
-            grade,
-            wins    : d.wins,
-            total   : d.total,
-            winRate : d.total ? Math.round(d.wins / d.total * 100) : 0,
-            pnl     : parseFloat(d.pnl.toFixed(2)),
-          })).sort((a, b) => b.winRate - a.winRate),
-          byGravity : Object.entries(byGravity).map(([g, d]) => ({
-            gravity : parseInt(g),
-            wins    : d.wins,
-            total   : d.total,
-            winRate : d.total ? Math.round(d.wins / d.total * 100) : 0,
-            pnl     : parseFloat(d.pnl.toFixed(2)),
-          })).sort((a, b) => a.gravity - b.gravity),
-        },
-      });
-    } catch (err) {
-      return res.status(500).json({ error: "Failed to load sim trades" });
-    }
-  });
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // SC LATEST — serves Sierra Chart order flow to Pine Script via HTTP
-  // Pine Script uses a webhook trigger that includes SC data fields from server
-  // GET /api/sc-latest — latest SC order flow snapshot
-  // ══════════════════════════════════════════════════════════════════════════
-  app.get("/api/sc-latest", (_req, res) => {
-    try {
-      const webhooks = storage.getRecentWebhooks(30);
-      const sc = webhooks.find(w => w.source === "sierra_chart" || w.source === "bookmap_cme");
-      if (!sc) return res.json({ error: "No SC data", hasData: false });
-
-      const ageMs  = Date.now() - (sc.receivedAt ?? 0);
-      const ageSec = Math.round(ageMs / 1000);
-
-      // Compute spoofing score:
-      // Large bid stack that disappears quickly + sell delta = spoof attempt on bid
-      // Large ask stack + buy delta = spoof attempt on ask
-      const bidStack = sc.bidStackSize ?? 0;
-      const askStack = sc.askStackSize ?? 0;
-      const delta    = sc.delta ?? 0;
-      const stackImbalanceRatio = bidStack > 0 && askStack > 0
-        ? Math.max(bidStack / askStack, askStack / bidStack)
-        : 1;
-
-      // Spoof signal: extreme stack imbalance (>3:1) but delta going opposite direction
-      const spoofBid = bidStack > askStack * 3 && delta < 0;   // big bid wall, selling into it
-      const spoofAsk = askStack > bidStack * 3 && delta > 0;   // big ask wall, buying into it
-
-      // DOM pressure: bid vs ask stack balance (>60% bid = buy pressure, >60% ask = sell pressure)
-      const totalDom = bidStack + askStack;
-      const domBidPct = totalDom > 0 ? Math.round(bidStack / totalDom * 100) : 50;
-      const domAskPct = totalDom > 0 ? Math.round(askStack / totalDom * 100) : 50;
-      const domBias   = domBidPct > 60 ? "BUY_PRESSURE"
-                      : domAskPct > 60 ? "SELL_PRESSURE"
-                      : "BALANCED";
-
-      // Cumulative order flow score (0-100)
-      let ofScore = 50; // neutral base
-      if (delta > 0)             ofScore += 10;
-      if (delta < 0)             ofScore -= 10;
-      if (sc.absorptionBull)     ofScore += 15;
-      if (sc.absorptionBear)     ofScore -= 15;
-      if (sc.imbalanceBull)      ofScore += 10;
-      if (sc.imbalanceBear)      ofScore -= 10;
-      if (domBias === "BUY_PRESSURE")  ofScore += 8;
-      if (domBias === "SELL_PRESSURE") ofScore -= 8;
-      if (spoofBid)              ofScore += 5;  // spoof on bid = bullish (wall will pull)
-      if (spoofAsk)              ofScore -= 5;  // spoof on ask = bearish
-      ofScore = Math.max(0, Math.min(100, ofScore));
-
-      const ofBias = ofScore > 60 ? "BULLISH" : ofScore < 40 ? "BEARISH" : "NEUTRAL";
-
-      return res.json({
-        hasData       : true,
-        ageSec,
-        fresh         : ageSec < 300, // 5 min
-        price         : sc.close,
-        delta         : sc.delta,
-        cvd           : sc.cvd,
-        buyVolume     : sc.buyVolume,
-        sellVolume    : sc.sellVolume,
-        bidStackSize  : bidStack,
-        askStackSize  : askStack,
-        stackRatio    : parseFloat(stackImbalanceRatio.toFixed(2)),
-        absorptionBull: !!(sc.absorptionBull),
-        absorptionBear: !!(sc.absorptionBear),
-        imbalanceBull : !!(sc.imbalanceBull),
-        imbalanceBear : !!(sc.imbalanceBear),
-        vapPoc        : sc.vapPoc,
-        domBidPct,
-        domAskPct,
-        domBias,
-        spoofBid,
-        spoofAsk,
-        ofScore,
-        ofBias,
-      });
-    } catch (err) {
-      return res.status(500).json({ error: "SC latest failed" });
-    }
-  });
-
-  // ── GET /api/scorecard — Full scorecard history + stats ───────────────────
+    // ── GET /api/scorecard — Full scorecard history + stats ───────────────────
   app.get("/api/scorecard", (req, res) => {
     const limit = parseInt(String(req.query.limit || "60"));
     const entries = storage.getRecentScorecard(limit);
