@@ -538,9 +538,14 @@ export function registerRoutes(httpServer: Server, app: Express) {
       // Uses TV fast-path (long_signal/short_signal from Pine v3) or server scoring
       try {
         clearExpiredSignals();
-        // Only evaluate TV webhooks — SC sends too frequently with no ICT data
-        const isTVWebhook = !body.source || body.source === 'tradingview';
-        if (isTVWebhook) {
+        // Evaluate TV webhooks AND NinjaTrader webhooks. (SC/Bookmap order-flow
+        // sends too frequently with no ICT data, so those are excluded.)
+        // CRITICAL FIX: the ICT NinjaScript posts source="ninjatrader", which was
+        // previously rejected here — that silently broke the entire pipeline
+        // (signal never queued → MuzziBot /pending always empty → no trades).
+        const isTVWebhook   = !body.source || body.source === 'tradingview';
+        const isNtWebhook   = body.source === 'ninjatrader';
+        if (isTVWebhook || isNtWebhook) {
           const freshWebhooks = storage.getRecentWebhooks(10);
           const { score, bias, orderFlowScore, tvLatest, scLatest } = scoreSetup(freshWebhooks);
 
@@ -554,6 +559,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
             absorptionBull: scLatest?.absorptionBull ?? null,
             absorptionBear: scLatest?.absorptionBear ?? null,
             // Pine Script v3 direct signal fields
+            // Pass source through so evaluateSignal tags the signal correctly
+            source: body.source || 'tradingview',
             long_signal: body.long_signal ? Number(body.long_signal) : undefined,
             short_signal: body.short_signal ? Number(body.short_signal) : undefined,
             long_conf: body.long_conf ? Number(body.long_conf) : undefined,

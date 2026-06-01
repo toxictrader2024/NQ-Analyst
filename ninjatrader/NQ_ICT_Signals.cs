@@ -135,10 +135,20 @@ namespace NinjaTrader.NinjaScript.Indicators
         #region OnStateChange
         protected override void OnStateChange()
         {
+            // Route ALL of this indicator's Print() calls to Output Tab 1.
+            // ROOT CAUSE of the "silent OnBarUpdate": PrintTo was never set.
+            // NT8 indicators nominally default to OutputTab1, but when the
+            // default is left unassigned the prints can be swallowed entirely
+            // (drawings still render because OnBarUpdate keeps running).
+            // Set this as early as possible — before SetDefaults runs its body —
+            // so even Configure/DataLoaded diagnostics land in Output 1.
+            PrintTo = PrintTo.OutputTab1;
+
             if (State == State.SetDefaults)
             {
                 Name                = "NQ ICT Signals";
                 Description         = "ICT v6 — 15m OB, 1m FVG/Sweep/CISD, session filter, ATR gate";
+                PrintTo             = PrintTo.OutputTab1;      // explicit — fixes blank Output
                 Calculate           = Calculate.OnBarClose;   // restored — no stutter
                 IsOverlay           = true;
                 DisplayInDataBox    = false;
@@ -198,7 +208,15 @@ namespace NinjaTrader.NinjaScript.Indicators
         #region OnBarUpdate
         protected override void OnBarUpdate()
         {
-            Print("[ICT] OBU BIP=" + BarsInProgress + " Bar=" + CurrentBar + " Close=" + Close[0].ToString("F2"));
+            // Absolute first line — UNCONDITIONAL, no array access that could throw
+            // before the print fires. Proves OnBarUpdate is running and that
+            // prints reach Output 1.
+            Print("[ICT] BAR " + CurrentBar + " BIP=" + BarsInProgress);
+
+            // Guard the price-bearing diagnostic so a warmup CurrentBar==0 on the
+            // 15m series can never throw and swallow subsequent prints.
+            if (CurrentBars[BarsInProgress] >= 0)
+                Print("[ICT] OBU BIP=" + BarsInProgress + " Bar=" + CurrentBar + " Close=" + Close[0].ToString("F2"));
 
             // ── 15m series (index 1) ─────────────────────────────────────
             // Calculate.OnBarClose means this fires once per 15m bar close.
@@ -698,13 +716,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         // ─────────────────────────────────────────────────────────────────
         #region Helpers
-        // NT8 indicators don't transition to State.Realtime the same way strategies do.
-        // Use BarsArray[0].IsTickReplay or check if current bar time is close to now.
+        // NT8 indicators DO transition to State.Realtime once historical backfill
+        // completes, so the primary signal is State == State.Realtime. We keep a
+        // time-based fallback for safety: with Calculate.OnBarClose on a 1m chart
+        // a just-closed live bar's Time[0] is at most ~1 min old, comfortably
+        // under the 3-minute window. This guarantees IsInRealtimeMode() is true
+        // during live trading and false during historical replay/backfill.
         private bool IsInRealtimeMode()
         {
             if (State == State.Realtime) return true;
-            // Fallback: if the bar's timestamp is within 2 minutes of now, we're live
-            return (DateTime.Now - Time[0]).TotalMinutes < 2;
+            // Fallback: if the bar's timestamp is within 3 minutes of now, we're live
+            return (DateTime.Now - Times[0][0]).TotalMinutes < 3;
         }
 
         private bool CheckBullLevel() { return CheckInBullFvg() || CheckAtBullOb(); }
@@ -759,21 +781,31 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             try
             {
+                var ci = System.Globalization.CultureInfo.InvariantCulture;
                 string body = "{\"long_signal\":"  + (dir=="long" ?"1":"0")
                     + ",\"short_signal\":" + (dir=="short"?"1":"0")
-                    + ",\"close\":"  + e.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                    + ",\"sl\":"     + sl.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                    + ",\"tp1\":"    + tp1.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                    + ",\"tp2\":"    + tp2.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    + ",\"direction\":\"" + dir + "\""
+                    + ",\"close\":"  + e.ToString(ci)
+                    + ",\"entry\":"  + e.ToString(ci)
+                    + ",\"sl\":"     + sl.ToString(ci)
+                    + ",\"tp1\":"    + tp1.ToString(ci)
+                    + ",\"tp2\":"    + tp2.ToString(ci)
                     + ",\"source\":\"ninjatrader\",\"ticker\":\"NQ1!\""
                     + ",\"signal_id\":\"" + id + "\",\"reason\":\"" + reason + "\"}";
+                Print("[ICT] POST -> " + ServerUrl + "/api/webhook  body=" + body);
                 var req = (HttpWebRequest)WebRequest.Create(ServerUrl + "/api/webhook");
                 req.Method = "POST"; req.ContentType = "application/json"; req.Timeout = 5000;
+                // NOTE: deliberately NO User-Agent header — NT8 blocks WebRequest
+                // when a User-Agent is set, which silently kills the POST.
                 byte[] data = Encoding.UTF8.GetBytes(body);
                 req.ContentLength = data.Length;
                 using (var s = req.GetRequestStream()) s.Write(data, 0, data.Length);
                 using (var r = (HttpWebResponse)req.GetResponse())
-                using (var sr = new StreamReader(r.GetResponseStream())) sr.ReadToEnd();
+                using (var sr = new StreamReader(r.GetResponseStream()))
+                {
+                    string resp = sr.ReadToEnd();
+                    Print("[ICT] POST OK " + (int)r.StatusCode + " resp=" + resp);
+                }
             }
             catch (Exception ex) { Print("[ICT] Railway error: " + ex.Message); }
         }
