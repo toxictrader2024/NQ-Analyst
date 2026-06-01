@@ -326,16 +326,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (isLong)
             {
                 Draw.ArrowUp(this, TagEntry, false, 0, Low[0] - 3 * TickSize, BullGreen);
-                if (useAtm) EnterLong(Qty, id, AtmStrategyName);
-                else        EnterLong(Qty, id);
+                EnterLong(Qty, id);
                 Print("[MuzziBot] EnterLong submitted — Qty:" + Qty + " Name:" + id
                       + (useAtm ? " ATM:" + AtmStrategyName : ""));
             }
             else
             {
                 Draw.ArrowDown(this, TagEntry, false, 0, High[0] + 3 * TickSize, BearRed);
-                if (useAtm) EnterShort(Qty, id, AtmStrategyName);
-                else        EnterShort(Qty, id);
+                EnterShort(Qty, id);
                 Print("[MuzziBot] EnterShort submitted — Qty:" + Qty + " Name:" + id
                       + (useAtm ? " ATM:" + AtmStrategyName : ""));
             }
