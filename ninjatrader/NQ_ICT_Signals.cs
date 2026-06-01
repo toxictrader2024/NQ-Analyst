@@ -674,6 +674,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 sigCount++;
                 lastSignalBar = CurrentBar;
                 string sigId = DateTime.Now.Ticks.ToString();
+                Print("[ICT] SIGNAL LONG " + e.ToString("F2") + " InRealtime=" + IsInRealtimeMode() + " PostToRailway=" + PostToRailway);
                 if (PostToRailway && IsInRealtimeMode()) ThreadPool.QueueUserWorkItem(_ => PostRailway("long",  e, sl, tp1, tp2, rsn, sigId));
                 Print("[ICT] LONG "  + longConf  + "/7 @ " + e.ToString("F2") + " | " + rsn);
             }
@@ -688,6 +689,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 sigCount++;
                 lastSignalBar = CurrentBar;
                 string sigId = DateTime.Now.Ticks.ToString();
+                Print("[ICT] SIGNAL SHORT " + e.ToString("F2") + " InRealtime=" + IsInRealtimeMode() + " PostToRailway=" + PostToRailway);
                 if (PostToRailway && IsInRealtimeMode()) ThreadPool.QueueUserWorkItem(_ => PostRailway("short", e, sl, tp1, tp2, rsn, sigId));
                 Print("[ICT] SHORT " + shortConf + "/7 @ " + e.ToString("F2") + " | " + rsn);
             }
