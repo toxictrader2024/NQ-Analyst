@@ -585,6 +585,49 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
   });
 
+  // ── POST /api/debug-signal — Test evaluateSignal directly with NT8 payload ───
+  app.post("/api/debug-signal", (req, res) => {
+    const body = req.body || {};
+    const freshWebhooks = storage.getRecentWebhooks(10);
+    const { score, bias, orderFlowScore, tvLatest, scLatest } = scoreSetup(freshWebhooks);
+    const ntPrice = body.source === 'ninjatrader' && body.close ? Number(body.close) : null;
+    const mergedMarketData = {
+      close: ntPrice ?? tvLatest?.close ?? scLatest?.close ?? null,
+      delta: scLatest?.delta ?? null,
+      bias,
+      score,
+      orderFlowScore,
+      absorptionBull: scLatest?.absorptionBull ?? null,
+      absorptionBear: scLatest?.absorptionBear ?? null,
+      long_signal: body.long_signal ? Number(body.long_signal) : undefined,
+      short_signal: body.short_signal ? Number(body.short_signal) : undefined,
+      long_conf: body.long_conf ? Number(body.long_conf) : undefined,
+      short_conf: body.short_conf ? Number(body.short_conf) : undefined,
+      killzone: body.killzone || body.kz || null,
+      nt_sl:  body.source === 'ninjatrader' && body.sl  ? Number(body.sl)  : undefined,
+      nt_tp1: body.source === 'ninjatrader' && body.tp1 ? Number(body.tp1) : undefined,
+      nt_tp2: body.source === 'ninjatrader' && body.tp2 ? Number(body.tp2) : undefined,
+    };
+    // Also expose hasActiveSignal state by checking pending signals
+    const { getRecentSignals } = require('./signalEngine');
+    const recent = getRecentSignals(10);
+    const pendingSignals = recent.filter((s: any) => s.status === 'pending');
+    const filledRecent = recent.filter((s: any) => s.status === 'filled' && (Date.now() - s.createdAt) < 10 * 60 * 1000);
+    const isBlocked = pendingSignals.length > 0 || filledRecent.length > 0;
+    const newSignal = evaluateSignal(mergedMarketData, activeSession);
+    return res.json({
+      mergedMarketData,
+      activeSession,
+      pendingSignals,
+      filledRecent,
+      isBlocked,
+      result: newSignal ? 'SIGNAL_CREATED' : 'NULL_NO_SIGNAL',
+      signal: newSignal,
+      score,
+      bias,
+    });
+  });
+
   // ── POST /api/simulate — Inject test/demo data ─────────────────────────────
   app.post("/api/simulate", async (req, res) => {
     // Always use live NQ price as the base — never hardcode stale levels
