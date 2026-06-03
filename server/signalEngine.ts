@@ -213,7 +213,10 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   if (tvLong || tvShort) {
     const isLong    = tvLong;
     const confCount = isLong ? (long_conf ?? 2) : (short_conf ?? 2);
-    const kzLabel   = tvKillzone || session || 'killzone';
+    const nt_session = (marketData as any).nt_session as string | null | undefined;
+    // Fix 1: Prefer nt_session (sent by NQ_CK_Signals.cs) so Railway stores the
+    // correct session label (london, ny_open, london_close) instead of activeSession.
+    const kzLabel   = nt_session || tvKillzone || session || 'killzone';
 
     const entry = price;
     // Use NT8 pre-calculated levels if present, otherwise default ICT levels

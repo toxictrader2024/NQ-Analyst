@@ -567,6 +567,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
             nt_sl:  body.source === 'ninjatrader' && body.sl  ? Number(body.sl)  : undefined,
             nt_tp1: body.source === 'ninjatrader' && body.tp1 ? Number(body.tp1) : undefined,
             nt_tp2: body.source === 'ninjatrader' && body.tp2 ? Number(body.tp2) : undefined,
+            // Fix 1: Pass NT8 session tag through so signalEngine stores the correct label
+            nt_session: body.session ? String(body.session) : null,
           };
 
           const newSignal = evaluateSignal(mergedMarketData, activeSession);
@@ -607,6 +609,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
       nt_sl:  body.source === 'ninjatrader' && body.sl  ? Number(body.sl)  : undefined,
       nt_tp1: body.source === 'ninjatrader' && body.tp1 ? Number(body.tp1) : undefined,
       nt_tp2: body.source === 'ninjatrader' && body.tp2 ? Number(body.tp2) : undefined,
+            // Fix 1: Pass NT8 session tag through so signalEngine stores the correct label
+            nt_session: body.session ? String(body.session) : null,
     };
     // Also expose hasActiveSignal state by checking pending signals
     const { getRecentSignals } = require('./signalEngine');
