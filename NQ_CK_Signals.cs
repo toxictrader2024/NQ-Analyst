@@ -1,6 +1,8 @@
 #region Using declarations
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
 using System.IO;
 using System.Net;
 using System.Text;
@@ -13,6 +15,7 @@ using NinjaTrader.Data;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.Core.FloatingPoint;
 using NinjaTrader.NinjaScript.DrawingTools;
+using NinjaTrader.NinjaScript.Indicators;
 #endregion
 
 // ─── ENUM MUST BE OUTSIDE THE CLASS (NT8 compiler requirement) ──────────────
