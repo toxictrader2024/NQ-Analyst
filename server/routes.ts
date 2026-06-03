@@ -551,12 +551,17 @@ export function registerRoutes(httpServer: Server, app: Express) {
           const ntPrice = body.source === 'ninjatrader' && body.close ? Number(body.close) : null;
           const mergedMarketData = {
             close: ntPrice ?? tvLatest?.close ?? scLatest?.close ?? null,
-            delta: scLatest?.delta ?? null,
+            // ── SC Volume fields — all passed through to signalEngine volume gate ──
+            delta:          scLatest?.delta          ?? null,
+            absorptionBull: scLatest?.absorptionBull ?? null,
+            absorptionBear: scLatest?.absorptionBear ?? null,
+            imbalanceBull:  scLatest?.imbalanceBull  ?? null,
+            imbalanceBear:  scLatest?.imbalanceBear  ?? null,
+            bidStackSize:   scLatest?.bidStackSize   ?? null,
+            askStackSize:   scLatest?.askStackSize   ?? null,
             bias,
             score,
             orderFlowScore,
-            absorptionBull: scLatest?.absorptionBull ?? null,
-            absorptionBear: scLatest?.absorptionBear ?? null,
             // Direct signal fields from NT8 or Pine Script v3
             long_signal: body.long_signal ? Number(body.long_signal) : undefined,
             short_signal: body.short_signal ? Number(body.short_signal) : undefined,

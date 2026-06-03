@@ -189,6 +189,60 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     const sl  = nt_sl  ?? (isLong ? entry - 15 : entry + 15);
     const tp1 = nt_tp1 ?? (isLong ? entry + 20 : entry - 20);
     const tp2 = nt_tp2 ?? (isLong ? entry + 40 : entry - 40);
+
+    // ── SC Volume Gate — block signals with hard directional contradiction ──────
+    // SC data is merged into marketData by routes.ts before evaluateSignal is called.
+    // Rules (only block when SC data is fresh — null means SC not connected, pass through):
+    //   LONG:  block if delta < -500 AND absorptionBull = 0 AND imbalanceBull = 0
+    //   SHORT: block if delta > +500 AND absorptionBear = 0 AND imbalanceBear = 0
+    // A single bullish/bearish absorption OR imbalance overrides a bad delta (institutions
+    // defending a level often print negative delta before the reversal).
+    const scDelta         = (marketData as any).delta          as number | null;
+    const scAbsBull       = (marketData as any).absorptionBull as number | boolean | null;
+    const scAbsBear       = (marketData as any).absorptionBear as number | boolean | null;
+    const scImbBull       = (marketData as any).imbalanceBull  as number | boolean | null;
+    const scImbBear       = (marketData as any).imbalanceBear  as number | boolean | null;
+    const scBidStack      = (marketData as any).bidStackSize   as number | null;
+    const scAskStack      = (marketData as any).askStackSize   as number | null;
+    const scHasFreshData  = scDelta !== null && scDelta !== undefined;
+
+    if (scHasFreshData) {
+      const absBull = scAbsBull === 1 || scAbsBull === true;
+      const absBear = scAbsBear === 1 || scAbsBear === true;
+      const imbBull = scImbBull === 1 || scImbBull === true;
+      const imbBear = scImbBear === 1 || scImbBear === true;
+      // DOM imbalance: bid stack 2x+ ask stack = bullish DOM, vice versa = bearish DOM
+      const domBull = scBidStack !== null && scAskStack !== null && scAskStack > 0 && scBidStack > scAskStack * 2;
+      const domBear = scBidStack !== null && scAskStack !== null && scBidStack > 0 && scAskStack > scBidStack * 2;
+
+      if (isLong) {
+        // Block long: strong sell-side delta with NO bullish confirmation from SC
+        if ((scDelta as number) < -500 && !absBull && !imbBull && !domBull) {
+          console.log(`[SignalEngine][SC VolumeGate] BLOCKED LONG @ ${entry} — delta=${scDelta}, no bull absorption/imbalance/DOM`);
+          return null;
+        }
+      } else {
+        // Block short: strong buy-side delta with NO bearish confirmation from SC
+        if ((scDelta as number) > 500 && !absBear && !imbBear && !domBear) {
+          console.log(`[SignalEngine][SC VolumeGate] BLOCKED SHORT @ ${entry} — delta=${scDelta}, no bear absorption/imbalance/DOM`);
+          return null;
+        }
+      }
+    }
+
+    // ── Build volume context string for reason field ──────────────────────────
+    const volParts: string[] = [];
+    if (scHasFreshData) {
+      volParts.push(`SC delta ${(scDelta as number) > 0 ? '+' : ''}${scDelta}`);
+      if (scAbsBull === 1 || scAbsBull === true) volParts.push('bull absorb');
+      if (scAbsBear === 1 || scAbsBear === true) volParts.push('bear absorb');
+      if (scImbBull === 1 || scImbBull === true) volParts.push('bid imbalance');
+      if (scImbBear === 1 || scImbBear === true) volParts.push('ask imbalance');
+    } else {
+      volParts.push('SC offline');
+    }
+    const volContext = volParts.join(' | ');
+
     const signal: TradeSignal = {
       id:         generateId(),
       direction:  nt_direction,
@@ -196,7 +250,7 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
       qty:        1,
       session:    session || 'NT8',
       confidence: nt_confidence ?? 70,
-      reason:     nt_reasons ?? `NT8 ${nt_direction.toUpperCase()}`,
+      reason:     (nt_reasons ?? `NT8 ${nt_direction.toUpperCase()}`) + ` | ${volContext}`,
       createdAt:  Date.now(),
       status:     'pending',
     };
@@ -227,11 +281,52 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     const tp1   = nt_tp1 ?? (isLong ? entry + 30  : entry - 30);
     const tp2   = nt_tp2 ?? (isLong ? entry + 75  : entry - 75);
 
+    // ── SC Volume Gate (same logic as NT8 fast path above) ──────────────────
+    const tvScDelta    = (marketData as any).delta          as number | null;
+    const tvScAbsBull  = (marketData as any).absorptionBull as number | boolean | null;
+    const tvScAbsBear  = (marketData as any).absorptionBear as number | boolean | null;
+    const tvScImbBull  = (marketData as any).imbalanceBull  as number | boolean | null;
+    const tvScImbBear  = (marketData as any).imbalanceBear  as number | boolean | null;
+    const tvScBidStack = (marketData as any).bidStackSize   as number | null;
+    const tvScAskStack = (marketData as any).askStackSize   as number | null;
+    const tvScFresh    = tvScDelta !== null && tvScDelta !== undefined;
+
+    if (tvScFresh) {
+      const absBull = tvScAbsBull === 1 || tvScAbsBull === true;
+      const absBear = tvScAbsBear === 1 || tvScAbsBear === true;
+      const imbBull = tvScImbBull === 1 || tvScImbBull === true;
+      const imbBear = tvScImbBear === 1 || tvScImbBear === true;
+      const domBull = tvScBidStack !== null && tvScAskStack !== null && tvScAskStack > 0 && tvScBidStack > tvScAskStack * 2;
+      const domBear = tvScBidStack !== null && tvScAskStack !== null && tvScBidStack > 0 && tvScAskStack > tvScBidStack * 2;
+
+      if (isLong && (tvScDelta as number) < -500 && !absBull && !imbBull && !domBull) {
+        console.log(`[SignalEngine][SC VolumeGate] BLOCKED LONG (TV) @ ${entry} — delta=${tvScDelta}`);
+        return null;
+      }
+      if (!isLong && (tvScDelta as number) > 500 && !absBear && !imbBear && !domBear) {
+        console.log(`[SignalEngine][SC VolumeGate] BLOCKED SHORT (TV) @ ${entry} — delta=${tvScDelta}`);
+        return null;
+      }
+    }
+
+    // ── Build volume context for reason ──────────────────────────────────
+    const tvVolParts: string[] = [];
+    if (tvScFresh) {
+      tvVolParts.push(`SC delta ${(tvScDelta as number) > 0 ? '+' : ''}${tvScDelta}`);
+      if (tvScAbsBull === 1 || tvScAbsBull === true) tvVolParts.push('bull absorb');
+      if (tvScAbsBear === 1 || tvScAbsBear === true) tvVolParts.push('bear absorb');
+      if (tvScImbBull === 1 || tvScImbBull === true) tvVolParts.push('bid imbalance');
+      if (tvScImbBear === 1 || tvScImbBear === true) tvVolParts.push('ask imbalance');
+    } else {
+      tvVolParts.push('SC offline');
+    }
+
     const reason = [
       `TV signal (${confCount} conf)`,
       `${isLong ? 'LONG' : 'SHORT'}`,
       `KZ: ${kzLabel}`,
       `${isLong ? 'Discount zone' : 'Premium zone'}`,
+      tvVolParts.join(' | '),
     ].join(' | ');
 
     const signal: TradeSignal = {
