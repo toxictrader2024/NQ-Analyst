@@ -1,10 +1,7 @@
 {
   "phases": {
     "install": {
-      "cmds": ["npm install --production=false"]
-    },
-    "build": {
-      "cmds": ["npm run build"]
+      "cmds": ["npm install --production"]
     }
   },
   "start": {
