@@ -268,7 +268,10 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   const tvLong  = long_signal  === 1;
   const tvShort = short_signal === 1;
 
-  if (tvLong || tvShort) {
+  // ── TV fast path DISABLED — NT8 is the sole signal source ──────────────────
+  // TradingView sends ICT data only; NQ_CK_Signals.cs is the execution trigger.
+  // Re-enable by removing the 'false &&' if TV execution is ever needed.
+  if (false && (tvLong || tvShort)) {
     const isLong    = tvLong;
     const confCount = isLong ? (long_conf ?? 2) : (short_conf ?? 2);
     const nt_session = (marketData as any).nt_session as string | null | undefined;
@@ -356,8 +359,9 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // STANDARD PATH — server-side ICT scoring gates
+  // STANDARD PATH — DISABLED: NT8 is sole signal source
   // ════════════════════════════════════════════════════════════════════════════
+  return null; // HARD BLOCK — only NT8 fast path can generate signals
 
   // ── Gate 3: strong ICT score ─────────────────────────────────────────────────
   if (score < 65) return null;
