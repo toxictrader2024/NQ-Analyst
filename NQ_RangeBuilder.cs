@@ -480,12 +480,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                 // Premium zone: EQ → PDH (semi-transparent red)
                 Draw.Rectangle(this, "Premium_" + dayTag, false,
                     barsBack, currentPDH, 0, eq,
-                    Brushes.Red, 20, Brushes.Red);
+                    Brushes.Red, Brushes.Red, 20);
 
                 // Discount zone: PDL → EQ (semi-transparent green)
                 Draw.Rectangle(this, "Discount_" + dayTag, false,
                     barsBack, eq, 0, currentPDL,
-                    Brushes.Lime, 20, Brushes.Lime);
+                    Brushes.Lime, Brushes.Lime, 20);
 
                 // EQ line (bold dashed yellow)
                 Draw.HorizontalLine(this, "EQ_" + dayTag, eq,
@@ -519,7 +519,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                 Draw.Rectangle(this, "AsiaRect_" + dayTag, false,
                     barsBackAsia, lockedAsiaHigh, 0, lockedAsiaLow,
-                    Brushes.Yellow, 10, Brushes.Goldenrod);
+                    Brushes.Yellow, Brushes.Goldenrod, 10);
             }
 
             // London sweep labels
