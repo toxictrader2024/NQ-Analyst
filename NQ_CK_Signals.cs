@@ -978,7 +978,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     Draw.Text(this, aTag + "_T", false, label,
                               0, Low[0] - 10 * TickSize, 0,
                               Brushes.Lime,
-                              new NinjaTrader.Gui.Tools.SimpleFont("Arial Bold", 8),
+                              new NinjaTrader.Gui.Tools.SimpleFont("Arial", 8) { Bold = true },
                               TextAlignment.Center,
                               Brushes.Transparent, Brushes.Transparent, 0);
                 }
@@ -989,7 +989,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     Draw.Text(this, aTag + "_T", false, label,
                               0, High[0] + 10 * TickSize, 0,
                               Brushes.Red,
-                              new NinjaTrader.Gui.Tools.SimpleFont("Arial Bold", 8),
+                              new NinjaTrader.Gui.Tools.SimpleFont("Arial", 8) { Bold = true },
                               TextAlignment.Center,
                               Brushes.Transparent, Brushes.Transparent, 0);
                 }
