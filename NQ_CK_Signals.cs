@@ -356,6 +356,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             Print("[CK_Signals] " + etNow.ToString("HH:mm") + " ET | KZ:" + sessionTag
                 + " | HTFBull:" + htfBull + " HTFBear:" + htfBear
+                + " | AsiaLocked:" + _rb.AsiaRangeLocked
+                + " | AsiaH:" + _rb.LockedAsiaHigh.ToString("F2")
+                + " | AsiaL:" + _rb.LockedAsiaLow.ToString("F2")
                 + " | CISD B/S:" + bullCisd + "/" + bearCisd
                 + " MSS B/S:" + bullMss + "/" + bearMss
                 + " | Price:" + Close[0].ToString("F2"));

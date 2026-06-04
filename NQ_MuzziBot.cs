@@ -248,13 +248,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // ── Main thread — every tick ────────────────────────────────────────────
+        // ── Main thread — every bar close + price change ──────────────────────
         protected override void OnBarUpdate()
         {
-            Print("[MuzziBot] TICK " + CurrentBar);
-
             if (BarsInProgress != 0) return;
             if (CurrentBar < 0)      return;
+
+            // Status heartbeat — only print once per bar close, not every tick
+            if (IsFirstTickOfBar)
+                Print("[MuzziBot] BAR " + Time[0].ToString("HH:mm") + " | Pos:" + Position.MarketPosition + " | Bar#" + CurrentBar);
 
             // ── STEP 1: Execute pending signal ──────────────────────────────────
             if (hasPending && activeSignalId == null)
