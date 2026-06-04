@@ -1045,10 +1045,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             string endpoint = (ServerUrl ?? string.Empty).TrimEnd('/') + "/api/webhook";
 
-            // Build JSON string — source:"tradingview" is critical for Railway routing
+            // Build JSON string — source:"ninjatrader" triggers Railway's NT8 fast path
+            // which uses body.close directly (not tvLatest) and reads body.sl/tp1/tp2
             string json = string.Concat(
                 "{",
-                "\"source\":\"tradingview\",",
+                "\"source\":\"ninjatrader\",",
+                "\"direction\":\"",   direction,                "\",",
                 "\"long_signal\":",   isLong    ? "1" : "0",   ",",
                 "\"short_signal\":",  isLong    ? "0" : "1",   ",",
                 "\"close\":",         entry.ToString("F2"),     ",",
