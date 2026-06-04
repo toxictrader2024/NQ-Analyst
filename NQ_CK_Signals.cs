@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.Windows;
 using System.IO;
 using System.Net;
 using System.Text;
@@ -609,7 +610,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             double atr15 = 0;
             for (int k = 1; k <= atrLookback; k++)
-                atr15 += High[IDX_15M][k] - Low[IDX_15M][k];
+                atr15 += Highs[IDX_15M][k] - Lows[IDX_15M][k];
             atr15 /= atrLookback;
 
             double impulseThresh = atr15 * 0.5;
@@ -620,7 +621,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             for (int i = ObSwingLen + 1; i <= scanLimit; i++)
             {
                 // Candidate OB bar at index i must be bearish
-                if (Close[IDX_15M][i] >= Open[IDX_15M][i]) continue;
+                if (Closes[IDX_15M][i] >= Opens[IDX_15M][i]) continue;
 
                 // ObSwingLen bars NEWER than i (indices i-1 .. i-ObSwingLen) all close up
                 bool impulseOk = true;
@@ -629,13 +630,13 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     int idx = i - j;
                     if (idx < 0) { impulseOk = false; break; }
-                    if (Close[IDX_15M][idx] <= Open[IDX_15M][idx]) { impulseOk = false; break; }
-                    totalUp += Close[IDX_15M][idx] - Open[IDX_15M][idx];
+                    if (Closes[IDX_15M][idx] <= Opens[IDX_15M][idx]) { impulseOk = false; break; }
+                    totalUp += Closes[IDX_15M][idx] - Opens[IDX_15M][idx];
                 }
                 if (!impulseOk || totalUp < impulseThresh) continue;
 
-                double obHigh = Math.Max(Open[IDX_15M][i], Close[IDX_15M][i]);
-                double obLow  = Math.Min(Open[IDX_15M][i], Close[IDX_15M][i]);
+                double obHigh = Math.Max(Opens[IDX_15M][i], Closes[IDX_15M][i]);
+                double obLow  = Math.Min(Opens[IDX_15M][i], Closes[IDX_15M][i]);
                 string tag    = "OB_BULL_" + CurrentBars[IDX_15M] + "_" + i;
 
                 if (!ObExists(tag))
@@ -670,7 +671,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             // ── Bear OB: last bullish candle before ObSwingLen bearish impulse bars ──
             for (int i = ObSwingLen + 1; i <= scanLimit; i++)
             {
-                if (Close[IDX_15M][i] <= Open[IDX_15M][i]) continue;
+                if (Closes[IDX_15M][i] <= Opens[IDX_15M][i]) continue;
 
                 bool impulseOk = true;
                 double totalDn = 0;
@@ -678,13 +679,13 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     int idx = i - j;
                     if (idx < 0) { impulseOk = false; break; }
-                    if (Close[IDX_15M][idx] >= Open[IDX_15M][idx]) { impulseOk = false; break; }
-                    totalDn += Open[IDX_15M][idx] - Close[IDX_15M][idx];
+                    if (Closes[IDX_15M][idx] >= Opens[IDX_15M][idx]) { impulseOk = false; break; }
+                    totalDn += Opens[IDX_15M][idx] - Closes[IDX_15M][idx];
                 }
                 if (!impulseOk || totalDn < impulseThresh) continue;
 
-                double obHigh = Math.Max(Open[IDX_15M][i], Close[IDX_15M][i]);
-                double obLow  = Math.Min(Open[IDX_15M][i], Close[IDX_15M][i]);
+                double obHigh = Math.Max(Opens[IDX_15M][i], Closes[IDX_15M][i]);
+                double obLow  = Math.Min(Opens[IDX_15M][i], Closes[IDX_15M][i]);
                 string tag    = "OB_BEAR_" + CurrentBars[IDX_15M] + "_" + i;
 
                 if (!ObExists(tag))
@@ -977,7 +978,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     Draw.Text(this, aTag + "_T", false, label,
                               0, Low[0] - 10 * TickSize, 0,
                               Brushes.Lime,
-                              new NinjaTrader.Gui.Tools.SimpleFont("Arial", 8, true),
+                              new NinjaTrader.Gui.Tools.SimpleFont("Arial Bold", 8),
                               TextAlignment.Center,
                               Brushes.Transparent, Brushes.Transparent, 0);
                 }
@@ -988,7 +989,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     Draw.Text(this, aTag + "_T", false, label,
                               0, High[0] + 10 * TickSize, 0,
                               Brushes.Red,
-                              new NinjaTrader.Gui.Tools.SimpleFont("Arial", 8, true),
+                              new NinjaTrader.Gui.Tools.SimpleFont("Arial Bold", 8),
                               TextAlignment.Center,
                               Brushes.Transparent, Brushes.Transparent, 0);
                 }
