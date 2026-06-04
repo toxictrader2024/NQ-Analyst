@@ -237,10 +237,24 @@ namespace NinjaTrader.NinjaScript.Indicators
                 // ATR on primary 1m series only — must be assigned in DataLoaded
                 _atr1m = ATR(AtrPeriod);
 
-                // Bind to NQ_RangeBuilder running on the same chart (sub-indicator pattern)
-                _rb = NQ_RangeBuilder(14);
+                // Bind to the NQ_RangeBuilder ALREADY on the chart — do NOT create a new
+                // internal instance (it would have no historical Asia range data).
+                // Walk the chart's indicator collection to find the live instance.
+                foreach (var ind in ChartIndicators)
+                {
+                    if (ind is NQ_RangeBuilder rb)
+                    {
+                        _rb = rb;
+                        break;
+                    }
+                }
 
-                Print("[CK_Signals] Loaded — RangeBuilder: " + (_rb != null ? "OK" : "NULL — ADD NQ_RangeBuilder first!"));
+                // Fallback: if not found in ChartIndicators (e.g. running outside a chart),
+                // create internal instance — will work on next full session with history.
+                if (_rb == null)
+                    _rb = NQ_RangeBuilder(14);
+
+                Print("[CK_Signals] Loaded — RangeBuilder: " + (_rb != null ? "OK (chart instance)" : "NULL — ADD NQ_RangeBuilder first!"));
                 Print("[CK_Signals] MinConf=" + MinConf + " CooldownBars=" + CooldownBars + " SL=" + SlPts + " TP1=" + Tp1Pts + " TP2=" + Tp2Pts);
                 Print("[CK_Signals] ServerUrl=" + ServerUrl);
             }
@@ -1044,6 +1058,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 "{",
                 "\"source\":\"tradingview\",",
                 "\"long_signal\":",   isLong    ? "1" : "0",   ",",
+                "\"short_signal\":",  isLong    ? "0" : "1",   ",",
                 "\"close\":",         entry.ToString("F2"),     ",",
                 "\"sl\":",            sl.ToString("F2"),        ",",
                 "\"tp1\":",           tp1.ToString("F2"),       ",",
@@ -1084,7 +1099,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 catch (Exception ex)
                 {
                     // Log to NT8 Output window without crashing the indicator
-                    Print("[NQ_CK_Signals] POST error: " + ex.Message);
+                    Print("[CK_Signals] POST error to " + capturedEndpoint + " : " + ex.Message);
+                    Print("[CK_Signals] JSON: " + Encoding.UTF8.GetString(capturedBody));
                 }
             });
         }
