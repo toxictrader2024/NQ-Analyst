@@ -47,6 +47,10 @@ _db.exec(`
     status TEXT NOT NULL DEFAULT 'pending'
   );
 `);
+// Migration: add 'data' column if old schema exists without it
+try {
+  _db.exec(`ALTER TABLE trade_signals ADD COLUMN data TEXT NOT NULL DEFAULT '{}'`);
+} catch (_) { /* column already exists — ignore */ }
 
 function dbSave(sig: TradeSignal) {
   _db.prepare('INSERT OR REPLACE INTO trade_signals (id, data, created_at, status) VALUES (?, ?, ?, ?)'
