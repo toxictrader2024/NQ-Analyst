@@ -1067,7 +1067,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 "\"tp1\":",           tp1.ToString("F2"),       ",",
                 "\"tp2\":",           tp2.ToString("F2"),       ",",
                 "\"session\":\"",     session,                  "\",",
-                "\"killzone\":true,",
+                "\"killzone\":\"",   session,                  "\",",
                 "\"discount\":",      inDiscount ? "true" : "false", ",",
                 "\"premium\":",       inPremium  ? "true" : "false", ",",
                 "\"confidence\":",    score.ToString(),
@@ -1085,10 +1085,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 try
                 {
                     HttpWebRequest req = (HttpWebRequest)WebRequest.Create(capturedEndpoint);
-                    req.Method        = "POST";
-                    req.ContentType   = "application/json";
-                    req.Timeout       = 4000;
-                    req.ContentLength = capturedBody.Length;
+                    req.Method             = "POST";
+                    req.ContentType        = "application/json";
+                    req.Timeout            = 4000;
+                    req.ContentLength      = capturedBody.Length;
+                    req.AllowAutoRedirect  = false;  // CRITICAL: prevent POST→GET redirect on 301
                     // NO User-Agent header — NT8 blocks it
 
                     using (Stream stream = req.GetRequestStream())
