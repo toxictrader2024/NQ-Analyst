@@ -208,7 +208,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 IsSuspendedWhileInactive = true;
 
                 // Default parameter values
-                ServerUrl    = "https://your-railway-app.railway.app";
+                ServerUrl    = "https://nq-analyst-production.up.railway.app";
                 FvgScanBars  = 20;
                 FvgMinPts    = 2.0;
                 ObMaxBars    = 30;
@@ -1109,3 +1109,38 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
     }
 }
+
+#region NinjaScript generated code. Neither change nor remove.
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+    {
+        private NQ_RangeBuilder[] cacheNQ_RangeBuilder;
+        public NQ_RangeBuilder NQ_RangeBuilder(int atrPeriod) { return NQ_RangeBuilder(Input, atrPeriod); }
+        public NQ_RangeBuilder NQ_RangeBuilder(ISeries<double> input, int atrPeriod)
+        {
+            if (cacheNQ_RangeBuilder != null)
+                for (int idx = 0; idx < cacheNQ_RangeBuilder.Length; idx++)
+                    if (cacheNQ_RangeBuilder[idx] != null && cacheNQ_RangeBuilder[idx].AtrPeriod == atrPeriod && cacheNQ_RangeBuilder[idx].EqualsInput(input))
+                        return cacheNQ_RangeBuilder[idx];
+            return CacheIndicator<NQ_RangeBuilder>(new NQ_RangeBuilder { AtrPeriod = atrPeriod }, input, ref cacheNQ_RangeBuilder);
+        }
+    }
+}
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+    public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+    {
+        public Indicators.NQ_RangeBuilder NQ_RangeBuilder(int atrPeriod) { return indicator.NQ_RangeBuilder(Input, atrPeriod); }
+        public Indicators.NQ_RangeBuilder NQ_RangeBuilder(ISeries<double> input, int atrPeriod) { return indicator.NQ_RangeBuilder(input, atrPeriod); }
+    }
+}
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+    {
+        public Indicators.NQ_RangeBuilder NQ_RangeBuilder(int atrPeriod) { return indicator.NQ_RangeBuilder(Input, atrPeriod); }
+        public Indicators.NQ_RangeBuilder NQ_RangeBuilder(ISeries<double> input, int atrPeriod) { return indicator.NQ_RangeBuilder(input, atrPeriod); }
+    }
+}
+#endregion
