@@ -91,49 +91,17 @@ namespace NinjaTrader.NinjaScript.Indicators
         // ─────────────────────────────────────────────────────────────
         //  Public properties consumed by Indicator 2
         // ─────────────────────────────────────────────────────────────
-        [Browsable(false)]
-        public bool   AsiaRangeLocked  { get { Update(); return _asiaRangeLocked; } }
-        private bool  _asiaRangeLocked;
-
-        [Browsable(false)]
-        public bool   LondonSweptLow   { get { Update(); return _londonSweptLow; } }
-        private bool  _londonSweptLow;
-
-        [Browsable(false)]
-        public bool   LondonSweptHigh  { get { Update(); return _londonSweptHigh; } }
-        private bool  _londonSweptHigh;
-
-        [Browsable(false)]
-        public double LockedAsiaHigh   { get { Update(); return _lockedAsiaHigh2; } }
-        private double _lockedAsiaHigh2;
-
-        [Browsable(false)]
-        public double LockedAsiaLow    { get { Update(); return _lockedAsiaLow2; } }
-        private double _lockedAsiaLow2;
-
-        [Browsable(false)]
-        public double LockedAsiaMid    { get { Update(); return _lockedAsiaMid2; } }
-        private double _lockedAsiaMid2;
-
-        [Browsable(false)]
-        public double CurrentPDH       { get { Update(); return _currentPDH2; } }
-        private double _currentPDH2;
-
-        [Browsable(false)]
-        public double CurrentPDL       { get { Update(); return _currentPDL2; } }
-        private double _currentPDL2;
-
-        [Browsable(false)]
-        public double DealingRangeEQ   { get { Update(); return _dealingRangeEQ2; } }
-        private double _dealingRangeEQ2;
-
-        [Browsable(false)]
-        public bool   PriceInPremium   { get { Update(); return _priceInPremium; } }
-        private bool  _priceInPremium;
-
-        [Browsable(false)]
-        public bool   PriceInDiscount  { get { Update(); return _priceInDiscount; } }
-        private bool  _priceInDiscount;
+        [Browsable(false)] public bool   AsiaRangeLocked { get; set; }
+        [Browsable(false)] public bool   LondonSweptLow  { get; set; }
+        [Browsable(false)] public bool   LondonSweptHigh { get; set; }
+        [Browsable(false)] public double LockedAsiaHigh  { get; set; }
+        [Browsable(false)] public double LockedAsiaLow   { get; set; }
+        [Browsable(false)] public double LockedAsiaMid   { get; set; }
+        [Browsable(false)] public double CurrentPDH      { get; set; }
+        [Browsable(false)] public double CurrentPDL      { get; set; }
+        [Browsable(false)] public double DealingRangeEQ  { get; set; }
+        [Browsable(false)] public bool   PriceInPremium  { get; set; }
+        [Browsable(false)] public bool   PriceInDiscount { get; set; }
 
         // ─────────────────────────────────────────────────────────────
         //  Plot series indices (consumed by Indicator 2 via Values[n])
@@ -262,9 +230,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     currentPDH = rthSessionHigh;
                     currentPDL = rthSessionLow;
-                    _currentPDH2          = currentPDH;
-                    _currentPDL2          = currentPDL;
-                    _dealingRangeEQ2      = (currentPDH + currentPDL) / 2.0;
+                    CurrentPDH      = currentPDH;
+                    CurrentPDL      = currentPDL;
+                    DealingRangeEQ  = (currentPDH + currentPDL) / 2.0;
                 }
 
                 // Reset for new session
@@ -273,19 +241,19 @@ namespace NinjaTrader.NinjaScript.Indicators
                 asiaLowRunning      = double.MaxValue;
                 inAsiaSession       = false;
                 asiaRangeLocked     = false;
-                _asiaRangeLocked      = false;
+                AsiaRangeLocked = false;
                 lockedAsiaHigh      = 0;
                 lockedAsiaLow       = 0;
                 lockedAsiaMid       = 0;
-                _lockedAsiaHigh2      = 0;
-                _lockedAsiaLow2       = 0;
-                _lockedAsiaMid2       = 0;
+                LockedAsiaHigh  = 0;
+                LockedAsiaLow   = 0;
+                LockedAsiaMid   = 0;
                 compressionBarCount = 0;
 
                 londonSweptLow      = false;
                 londonSweptHigh     = false;
-                _londonSweptLow      = false;
-                _londonSweptHigh     = false;
+                LondonSweptLow      = false;
+                LondonSweptHigh     = false;
                 londonSweepLabelledLow  = false;
                 londonSweepLabelledHigh = false;
 
@@ -415,14 +383,14 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (!londonSweptLow && Low[0] < lockedAsiaLow)
                 {
                     londonSweptLow   = true;
-                    _londonSweptLow  = true;
+                    LondonSweptLow  = true;
                 }
 
                 // Sweep above Asia High
                 if (!londonSweptHigh && High[0] > lockedAsiaHigh)
                 {
                     londonSweptHigh  = true;
-                    _londonSweptHigh = true;
+                    LondonSweptHigh = true;
                 }
             }
 
@@ -451,9 +419,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             // ─────────────────────────────────────────────────────────
             if (currentPDH > 0 && currentPDL > 0)
             {
-                _dealingRangeEQ2      = (currentPDH + currentPDL) / 2.0;
-                _priceInPremium       = Close[0] > DealingRangeEQ;
-                _priceInDiscount      = Close[0] < DealingRangeEQ;
+                DealingRangeEQ  = (currentPDH + currentPDL) / 2.0;
+                PriceInPremium  = Close[0] > DealingRangeEQ;
+                PriceInDiscount = Close[0] < DealingRangeEQ;
             }
 
             // ─────────────────────────────────────────────────────────
@@ -562,15 +530,15 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (asiaHighRunning <= double.MinValue || asiaLowRunning >= double.MaxValue) return;
 
             asiaRangeLocked = true;
-            _asiaRangeLocked      = true;
+            AsiaRangeLocked = true;
 
             lockedAsiaHigh  = asiaHighRunning;
             lockedAsiaLow   = asiaLowRunning;
             lockedAsiaMid   = (lockedAsiaHigh + lockedAsiaLow) / 2.0;
 
-            _lockedAsiaHigh2      = lockedAsiaHigh;
-            _lockedAsiaLow2       = lockedAsiaLow;
-            _lockedAsiaMid2       = lockedAsiaMid;
+            LockedAsiaHigh  = lockedAsiaHigh;
+            LockedAsiaLow   = lockedAsiaLow;
+            LockedAsiaMid   = lockedAsiaMid;
 
             compressionBarCount = 0;
         }

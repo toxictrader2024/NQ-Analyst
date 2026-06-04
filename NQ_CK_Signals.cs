@@ -295,6 +295,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (_rb == null)
                 return;
 
+            // Force RangeBuilder current before reading any properties
+            _rb.Update();
+
             // -- Update OB mitigation status on every 1m bar --
             CheckObMitigation();
 
