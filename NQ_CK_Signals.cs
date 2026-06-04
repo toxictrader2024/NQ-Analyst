@@ -198,6 +198,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Name                     = "NQ_CK_Signals";
                 Calculate                = Calculate.OnBarClose;
                 IsOverlay                = true;
+                PrintTo                  = PrintTo.OutputTab1;
                 DisplayInDataBox         = false;
                 DrawOnPricePanel         = true;
                 DrawHorizontalGridLines  = false;
@@ -238,6 +239,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                 // Bind to NQ_RangeBuilder running on the same chart (sub-indicator pattern)
                 _rb = NQ_RangeBuilder(14);
+
+                Print("[CK_Signals] Loaded — RangeBuilder: " + (_rb != null ? "OK" : "NULL — ADD NQ_RangeBuilder first!"));
+                Print("[CK_Signals] MinConf=" + MinConf + " CooldownBars=" + CooldownBars + " SL=" + SlPts + " TP1=" + Tp1Pts + " TP2=" + Tp2Pts);
+                Print("[CK_Signals] ServerUrl=" + ServerUrl);
+            }
+            else if (State == State.Terminated)
+            {
+                Print("[CK_Signals] Terminated.");
             }
         }
 
@@ -311,7 +320,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             // Block signals outside killzones, during lunch, IB, or hard block
             if (!inAnyKZ || inLunch || inInitialBalance || inHardBlock)
+            {
+                // Print once per minute to show we're alive but gated
+                if (CurrentBar % 5 == 0)
+                    Print("[CK_Signals] " + etNow.ToString("HH:mm") + " ET | GATED — KZ:" + inAnyKZ + " Lunch:" + inLunch + " HardBlk:" + inHardBlock);
                 return;
+            }
 
             // Cooldown
             if (CurrentBar - _lastSignalBar1m < CooldownBars)
@@ -340,6 +354,12 @@ namespace NinjaTrader.NinjaScript.Indicators
             bool htfBull = _rb.LondonSweptLow;
             bool htfBear = _rb.LondonSweptHigh;
 
+            Print("[CK_Signals] " + etNow.ToString("HH:mm") + " ET | KZ:" + sessionTag
+                + " | HTFBull:" + htfBull + " HTFBear:" + htfBear
+                + " | CISD B/S:" + bullCisd + "/" + bearCisd
+                + " MSS B/S:" + bullMss + "/" + bearMss
+                + " | Price:" + Close[0].ToString("F2"));
+
             // ── Fix 4: Bias-lock kill switch ─────────────────────────────────
             // If LondonSweptHigh (bearish bias) but price has already blasted
             // through PDH by 20+ pts, the sweep reversed — kill bear signals.
@@ -353,8 +373,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (htfBull)
             {
                 int score = ScoreLong(bullCisd, bullMss, bullSfp, inAnyKZ);
+                Print("[CK_Signals] LONG score=" + score + "/7 (need " + MinConf + ") — FVG:" + PriceInBullFvg(Close[0]) + " OB:" + PriceInBullOb(Close[0]) + " Disc:" + _rb.PriceInDiscount);
                 if (score >= MinConf)
                 {
+                    Print("[CK_Signals] >>> FIRING LONG @ " + Close[0].ToString("F2") + " score=" + score + "/7");
                     FireSignal(true, score, sessionTag);
                     // Increment per-session counter after firing
                     if (inLondon && !inNyOpen) _londonCount++;
@@ -366,8 +388,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (htfBear)
             {
                 int score = ScoreShort(bearCisd, bearMss, bearSfp, inAnyKZ);
+                Print("[CK_Signals] SHORT score=" + score + "/7 (need " + MinConf + ") — FVG:" + PriceInBearFvg(Close[0]) + " OB:" + PriceInBearOb(Close[0]) + " Prem:" + _rb.PriceInPremium);
                 if (score >= MinConf)
                 {
+                    Print("[CK_Signals] >>> FIRING SHORT @ " + Close[0].ToString("F2") + " score=" + score + "/7");
                     FireSignal(false, score, sessionTag);
                     if (inLondon && !inNyOpen) _londonCount++;
                     if (inNyOpen)              _nyOpenCount++;
