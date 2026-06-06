@@ -4,6 +4,8 @@ import { WebhookPayload } from "@/types/webhook";
 import { callClaude } from "./claudeClient"; // Your existing Claude wrapper
 import { cacheNarrative } from "./cache";   // Optional caching module
 
+const MIN_COMMENTARY_GAP_MS = 15 * 60 * 1000; // 15-minute interval
+
 export async function generateCommentary(
   trigger: Trigger,
   webhooks: WebhookPayload[],
@@ -16,29 +18,25 @@ export async function generateCommentary(
   const latest = webhooks[0];
   if (!latest) return;
 
-  // ── Cost Control: only call Claude for high-value commentary ─────────────
-  const MIN_COMMENTARY_GAP_MS = 15 * 60 * 1000; // 15 minutes
-
+  // ── Claude Cost Control ───────────────────────────────
   const hasStrongSetup = currentScore >= 70;
   const isHighUrgency = trigger.urgency === "high";
   const hasOrderFlow =
-    latest.delta !== null ||
-    latest.absorptionBull === 1 ||
-    latest.absorptionBear === 1 ||
-    latest.imbalanceBull === 1 ||
-    latest.imbalanceBear === 1;
+    (latest as any).delta !== null ||
+    (latest as any).delta !== undefined ||
+    (latest as any).absorptionBull === 1 ||
+    (latest as any).absorptionBear === 1 ||
+    (latest as any).imbalanceBull === 1 ||
+    (latest as any).imbalanceBear === 1;
 
-  // Skip Claude if low-score / low-urgency update
   if (!hasStrongSetup && !isHighUrgency) return;
-
-  // Optional: skip if score < 60 and no order flow
   if (currentScore < 60 && !hasOrderFlow) return;
 
-  // Throttle calls
+  // ── Throttle calls ────────────────────────────────────
   if (Date.now() - (trigger.lastCommentaryTs || 0) < MIN_COMMENTARY_GAP_MS) return;
   trigger.lastCommentaryTs = Date.now();
 
-  // ── Prepare the prompt for Claude ─────────────────────────────────────────
+  // ── Prepare the prompt for Claude ─────────────────────
   const prompt = `
 Market Analysis:
 Bias: ${currentBias}
@@ -56,15 +54,15 @@ Bid Stack: ${latest.bidStackSize ?? "N/A"}
 Ask Stack: ${latest.askStackSize ?? "N/A"}
 `;
 
-  // ── Call Claude (use lighter model to save cost) ─────────────────────────
+  // ── Call Claude ───────────────────────────────────────
   const narrative = await callClaude(prompt, {
     model: "claude-sonnet-4",
     max_tokens: 300,
   });
 
-  // ── Optional: cache narrative to avoid duplicate calls ───────────────────
+  // ── Cache narrative to avoid duplicate calls ──────────
   await cacheNarrative(latest.id, narrative);
 
-  // ── Output / store narrative in your DB or dashboard ─────────────────────
+  // ── Output / store narrative ─────────────────────────
   console.log("Generated Commentary:", narrative);
 }
