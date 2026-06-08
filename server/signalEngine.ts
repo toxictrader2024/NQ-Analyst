@@ -90,7 +90,12 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
 
   if (hasActiveSignal()) return null;
 
-  const ntDirection = marketData.direction as string | undefined;
+  // Support both explicit direction field AND long_signal/short_signal=1 from NT8 indicator
+  let ntDirection = marketData.direction as string | undefined;
+  if (!ntDirection) {
+    if (marketData.long_signal  === 1) ntDirection = 'long';
+    if (marketData.short_signal === 1) ntDirection = 'short';
+  }
   if (ntDirection !== 'long' && ntDirection !== 'short') {
     // HARD BLOCK: NT8 is sole execution trigger.
     return null;
