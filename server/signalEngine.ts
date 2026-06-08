@@ -108,9 +108,9 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
 
   const isLong = ntDirection === 'long';
   const entry = price;
-  const sl = marketData.nt_sl ?? (isLong ? entry - 15 : entry + 15);
-  const tp1 = marketData.nt_tp1 ?? (isLong ? entry + 20 : entry - 20);
-  const tp2 = marketData.nt_tp2 ?? (isLong ? entry + 40 : entry - 40);
+  const sl = marketData.nt_sl ?? (isLong ? entry - 20 : entry + 20);
+  const tp1 = marketData.nt_tp1 ?? (isLong ? entry + 30 : entry - 30);
+  const tp2 = marketData.nt_tp2 ?? (isLong ? entry + 70 : entry - 70);
 
   // Sierra order-flow contradiction gate.
   const scDelta = marketData.delta as number | null;
