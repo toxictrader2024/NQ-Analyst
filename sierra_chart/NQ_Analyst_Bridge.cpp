@@ -150,16 +150,41 @@ SCSFExport scsf_NQAnalystBridge(SCStudyInterfaceRef sc)
   // ── Absorption detection ────────────────────────────────────────────────────
   // Bullish absorption: large sell volume but price didn't drop (close >= open)
   // Bearish absorption: large buy volume but price didn't rise (close <= open)
+  // INSTITUTIONAL ABSORPTION — requires all 3 conditions (not just 20 contracts):
+  //   1. Volume spike >= 3x running avg (genuine anomalous bar)
+  //   2. Price compression <= 50% of avg range (they absorbed but price barely moved)
+  //   3. Delta contradiction >= 30% of bar volume (meaningful directional imbalance)
   int largeThresh = LargeTradeQty.GetInt();
   int absorptionBull = 0;
   int absorptionBear = 0;
   int largeTradeCount = 0;
-  int largeBuyCount = 0;
-  int largeSellCount = 0;
+  int largeBuyCount   = 0;
+  int largeSellCount  = 0;
 
-  // Count large trades this bar
-  if (sellVol >= largeThresh && barClose >= barOpen) { absorptionBull = 1; }
-  if (buyVol  >= largeThresh && barClose <= barOpen) { absorptionBear = 1; }
+  // Running averages — exponential smoothing (~20-bar EMA)
+  static float avgVol   = 0.0f;
+  static float avgRange = 0.0f;
+  const  float alpha    = 0.05f;
+  float barVol   = buyVol + sellVol;
+  float barRange = barHigh - barLow;
+  if (avgVol   == 0.0f) avgVol   = barVol;
+  if (avgRange == 0.0f) avgRange = barRange;
+  avgVol   = alpha * barVol   + (1.0f - alpha) * avgVol;
+  avgRange = alpha * barRange + (1.0f - alpha) * avgRange;
+
+  bool volSpike        = (avgVol   > 0.0f && barVol   >= avgVol   * 3.0f);
+  bool priceCompressed = (avgRange > 0.0f && barRange <= avgRange * 0.5f);
+  float absDelta       = delta < 0.0f ? -delta : delta;
+  bool strongContra    = (barVol > 0.0f && absDelta >= barVol * 0.30f);
+
+  // Bull absorption: large sell volume absorbed, price still closed up
+  if (volSpike && priceCompressed && strongContra && sellVol > buyVol && barClose >= barOpen)
+    absorptionBull = 1;
+  // Bear absorption: large buy volume absorbed, price still closed down
+  if (volSpike && priceCompressed && strongContra && buyVol > sellVol && barClose <= barOpen)
+    absorptionBear = 1;
+
+  // Large trade counts for logging (unchanged)
   if (buyVol  >= largeThresh) largeBuyCount++;
   if (sellVol >= largeThresh) largeSellCount++;
   largeTradeCount = largeBuyCount + largeSellCount;
