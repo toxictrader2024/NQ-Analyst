@@ -130,12 +130,21 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     const domBull = scBidStack !== null && scAskStack !== null && scAskStack > 0 && scBidStack > scAskStack * 2;
     const domBear = scBidStack !== null && scAskStack !== null && scBidStack > 0 && scAskStack > scBidStack * 2;
 
-    if (isLong && scDelta < -500 && !absBull && !imbBull && !domBull) {
+    // BLOCK LONG: delta strongly negative (heavy selling) with no bullish confirmation
+    // Threshold lowered from -500 → -100 so moderate sell pressure blocks longs
+    if (isLong && scDelta < -100 && !absBull && !imbBull && !domBull) {
       console.log(`[SignalEngine][SC VolumeGate] BLOCKED LONG @ ${entry} — delta=${scDelta}`);
       return null;
     }
-    if (!isLong && scDelta > 500 && !absBear && !imbBear && !domBear) {
-      console.log(`[SignalEngine][SC VolumeGate] BLOCKED SHORT @ ${entry} — delta=${scDelta}`);
+
+    // BLOCK SHORT: ANY positive delta blocks a short unless hard bearish confirmation exists.
+    // Previous threshold was +500 — far too loose. A +50 delta on a bull trend day
+    // is enough to invalidate a short. Now: block short if delta > +50 with no bearish
+    // confirmation, OR if delta is positive AND absBull is true (buyers absorbing supply).
+    const positiveDeltaShortBlock = scDelta > 50 && !absBear && !imbBear && !domBear;
+    const bullAbsorptionShortBlock = absBull && scDelta > 0 && !absBear;
+    if (!isLong && (positiveDeltaShortBlock || bullAbsorptionShortBlock)) {
+      console.log(`[SignalEngine][SC VolumeGate] BLOCKED SHORT @ ${entry} — delta=${scDelta} absBull=${absBull}`);
       return null;
     }
   }
