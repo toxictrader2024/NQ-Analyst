@@ -423,7 +423,20 @@ function parseTradePlan(narrative: string, latest: ReturnType<typeof storage.get
 // ── 5-minute gate for auto-analysis on webhook ─────────────────────────────
 // Prevents AI analysis from firing on every incoming tick — max once per 5 min.
 let lastAutoAnalysisAt = 0;
-const AUTO_ANALYSIS_INTERVAL_MS = 5 * 60 * 1000;
+const AUTO_ANALYSIS_INTERVAL_MS = 15 * 60 * 1000; // 15 min — was 5 min, burning $40-50/day
+
+// ── GLOBAL Claude API gate — ALL callers must check this ─────────────────────
+// Sierra posts every 15s. Without this gate every absorption flag = Claude call.
+let lastAnyClaudeCallAt = 0;
+const GLOBAL_CLAUDE_GATE_MS = 15 * 60 * 1000; // hard 15-minute minimum between ANY Claude call
+function claudeGateOpen(): boolean {
+  const now = Date.now();
+  if (now - lastAnyClaudeCallAt < GLOBAL_CLAUDE_GATE_MS) return false;
+  lastAnyClaudeCallAt = now;
+  return true;
+}
+let lastSierraCommentaryAt = 0;
+const SIERRA_COMMENTARY_GATE_MS = 15 * 60 * 1000;
 
 export function registerRoutes(httpServer: Server, app: Express) {
 
@@ -497,7 +510,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
       // Auto-generate analysis on webhook if AI key is present — max once per 5 min
       const nowMs = Date.now();
-      if (process.env.ANTHROPIC_API_KEY && (nowMs - lastAutoAnalysisAt) >= AUTO_ANALYSIS_INTERVAL_MS) {
+      if (process.env.ANTHROPIC_API_KEY && (nowMs - lastAutoAnalysisAt) >= AUTO_ANALYSIS_INTERVAL_MS && claudeGateOpen()) {
         const webhooks = storage.getRecentWebhooks(10);
         const { score, ictScore, bias, confluences, warnings, tvLatest, scLatest, tvFresh, scFresh, tvAge, scAge } = scoreSetup(webhooks);
 
@@ -977,7 +990,12 @@ export function registerRoutes(httpServer: Server, app: Express) {
           });
         }
 
-        if (triggers.length > 0 && process.env.ANTHROPIC_API_KEY) {
+        // GATE: only fire Claude commentary once per 15 min from Sierra data
+        const nowSierra = Date.now();
+        if (triggers.length > 0 && process.env.ANTHROPIC_API_KEY &&
+            (nowSierra - lastSierraCommentaryAt) >= SIERRA_COMMENTARY_GATE_MS &&
+            claudeGateOpen()) {
+          lastSierraCommentaryAt = nowSierra;
           const { score, ictScore, bias, confluences, warnings } = scoreSetup(recentWebhooks);
           const top = triggers[0];
           generateCommentary(top, recentWebhooks, bias, score, ictScore, confluences, warnings)
