@@ -68,10 +68,15 @@ function generateId(): string {
 }
 
 function hasActiveSignal(): boolean {
-  const TEN_MIN = 10 * 60 * 1000;
+  const TEN_MIN  = 10 * 60 * 1000;
+  const TWO_MIN  =  2 * 60 * 1000;
   const now = Date.now();
   return signals.some(s => {
+    // Stale pending (>2min unconfirmed) = treat as expired, don't block new signal
+    if (s.status === 'pending' && (now - s.createdAt) > TWO_MIN) return false;
     if (s.status === 'pending') return true;
+    // received but not filled for >2min = stale, don't block
+    if (s.status === 'received' && (now - s.createdAt) > TWO_MIN) return false;
     if (s.status === 'received') return true;
     if (s.status === 'filled' && (now - s.createdAt) < TEN_MIN) return true;
     return false;
@@ -220,10 +225,12 @@ export function getRecentSignals(limit = 50): TradeSignal[] {
 }
 
 export function clearExpiredSignals(): void {
-  const FIVE_MIN_MS = 5 * 60 * 1000;
+  // Raised from 5min to 2min — MuzziBot polls every 5s so 2min is plenty
+  // Old 5min was too short when NT8/Railway had any latency
+  const TWO_MIN_MS = 2 * 60 * 1000;
   const now = Date.now();
   signals.forEach(s => {
-    if (s.status === 'pending' && now - s.createdAt > FIVE_MIN_MS) {
+    if (s.status === 'pending' && now - s.createdAt > TWO_MIN_MS) {
       s.status = 'expired';
       s.result = 'EXPIRED';
       dbSave(s);

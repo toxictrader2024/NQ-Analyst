@@ -4,6 +4,7 @@ import type { Request } from 'express';
 import { registerRoutes } from "./routes";
 import { startPulse } from "./commentaryEngine";
 import { serveStatic } from "./static";
+import { clearExpiredSignals } from "./signalEngine";
 import { createServer } from "node:http";
 
 const app = express();
@@ -102,6 +103,11 @@ app.use((req, res, next) => {
     () => {
       log(`serving on port ${port}`);
       startPulse(); // start 5-minute AI market pulse
+
+      // Sweep expired pending signals every 30 seconds
+      // Without this, clearExpiredSignals only runs on webhook receipt
+      // If NT8 goes quiet, stale signals block new ones indefinitely
+      setInterval(() => clearExpiredSignals(), 30 * 1000);
     },
   );
 
