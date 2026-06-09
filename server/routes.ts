@@ -423,12 +423,12 @@ function parseTradePlan(narrative: string, latest: ReturnType<typeof storage.get
 // ── 5-minute gate for auto-analysis on webhook ─────────────────────────────
 // Prevents AI analysis from firing on every incoming tick — max once per 5 min.
 let lastAutoAnalysisAt = 0;
-const AUTO_ANALYSIS_INTERVAL_MS = 15 * 60 * 1000; // 15 min — was 5 min, burning $40-50/day
+const AUTO_ANALYSIS_INTERVAL_MS = 5 * 60 * 1000;  // 5 min per user instruction
 
 // ── GLOBAL Claude API gate — ALL callers must check this ─────────────────────
 // Sierra posts every 15s. Without this gate every absorption flag = Claude call.
 let lastAnyClaudeCallAt = 0;
-const GLOBAL_CLAUDE_GATE_MS = 15 * 60 * 1000; // hard 15-minute minimum between ANY Claude call
+const GLOBAL_CLAUDE_GATE_MS = 5 * 60 * 1000;  // 5 min global gate per user instruction
 function claudeGateOpen(): boolean {
   const now = Date.now();
   if (now - lastAnyClaudeCallAt < GLOBAL_CLAUDE_GATE_MS) return false;
@@ -436,7 +436,7 @@ function claudeGateOpen(): boolean {
   return true;
 }
 let lastSierraCommentaryAt = 0;
-const SIERRA_COMMENTARY_GATE_MS = 15 * 60 * 1000;
+const SIERRA_COMMENTARY_GATE_MS = 5 * 60 * 1000;  // 5 min per user instruction
 
 export function registerRoutes(httpServer: Server, app: Express) {
 

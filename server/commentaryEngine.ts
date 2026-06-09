@@ -368,7 +368,8 @@ Use exact NQ price numbers. Be a prop desk analyst, not a textbook.`;
     console.error("[Commentary] AI generation failed:", err);
 
     // Save a demo commentary without AI
-    const demoMessage = `[Demo Mode — Add ANTHROPIC_API_KEY for live AI commentary]\n\n${trigger.title}\n\n${trigger.reason}\n\nAt current price ${price.toLocaleString()}, bias is ${currentBias} with a setup score of ${currentScore}/100.\n\nSuggested levels based on current structure:\n• Stop Loss: ${currentBias === "BULLISH" ? (price - 25).toFixed(2) : (price + 25).toFixed(2)}\n• TP1: ${currentBias === "BULLISH" ? (price + 30).toFixed(2) : (price - 30).toFixed(2)}\n• TP2: ${currentBias === "BULLISH" ? (price + 60).toFixed(2) : (price - 60).toFixed(2)}`;
+    const biasDir = currentBias === "BULLISH" ? "BULL" : currentBias === "BEARISH" ? "BEAR" : "NEUTRAL";
+    const demoMessage = `${trigger.title}\n\n${trigger.reason}\n\nPrice: ${price.toLocaleString()} | Bias: ${biasDir} ${currentScore}/100\n\nLevels:\n• SL:  ${currentBias === "BULLISH" ? (price - 20).toFixed(2) : (price + 20).toFixed(2)}\n• TP1: ${currentBias === "BULLISH" ? (price + 30).toFixed(2) : (price - 30).toFixed(2)}\n• TP2: ${currentBias === "BULLISH" ? (price + 70).toFixed(2) : (price - 70).toFixed(2)}`;
 
     storage.saveCommentary({
       createdAt: Date.now(),
