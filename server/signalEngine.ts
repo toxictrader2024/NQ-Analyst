@@ -68,6 +68,8 @@ const signals: TradeSignal[] = (() => {
   const TWO_MIN_MS = 2 * 60 * 1000;
   const now = Date.now();
   loaded.forEach(s => {
+    // Only expire real trade signals (must have direction) — skip SC/TV data rows
+    if (!s.direction) return;
     if ((s.status === 'pending' || s.status === 'received') && (now - s.createdAt) > TWO_MIN_MS) {
       s.status = 'expired';
       s.result = 'EXPIRED';
