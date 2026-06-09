@@ -61,7 +61,22 @@ function dbLoadRecent(): TradeSignal[] {
 }
 
 const MAX_SIGNALS = 200;
-const signals: TradeSignal[] = dbLoadRecent();
+// On startup: load recent signals but immediately expire any pending signals
+// older than 2 minutes — prevents stale pending signals surviving a redeploy
+const signals: TradeSignal[] = (() => {
+  const loaded = dbLoadRecent();
+  const TWO_MIN_MS = 2 * 60 * 1000;
+  const now = Date.now();
+  loaded.forEach(s => {
+    if ((s.status === 'pending' || s.status === 'received') && (now - s.createdAt) > TWO_MIN_MS) {
+      s.status = 'expired';
+      s.result = 'EXPIRED';
+      dbSave(s);
+      console.log(`[SignalEngine] Startup: expired stale signal ${s.id} (age ${Math.round((now - s.createdAt)/60000)}min)`);
+    }
+  });
+  return loaded;
+})();
 
 function generateId(): string {
   return `sig_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
