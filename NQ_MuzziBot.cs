@@ -218,24 +218,41 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TrailPts        = 8.5;   // trailing distance
 
                 // Default / Asia
-                DefaultSlPts  = 15;
-                DefaultTp1Pts = 20;
-                DefaultTp2Pts = 40;
+                DefaultSlPts  = 20;
+                DefaultTp1Pts = 30;
+                DefaultTp2Pts = 70;
 
                 // London KZ
-                LondonSlPts  = 12;
-                LondonTp1Pts = 18;
-                LondonTp2Pts = 35;
+                LondonSlPts  = 20;
+                LondonTp1Pts = 30;
+                LondonTp2Pts = 70;
 
                 // NY Open / London Close
-                NySlPts  = 15;
-                NyTp1Pts = 20;
-                NyTp2Pts = 40;
+                NySlPts  = 20;
+                NyTp1Pts = 30;
+                NyTp2Pts = 70;
             }
             else if (State == State.DataLoaded)
             {
+                // Always clear stale in-memory signal on start/restart.
+                // Without this, MuzziBot re-executes the last cached signal
+                // immediately on every strategy enable — even if it was from
+                // hours ago and Railway has already marked it received/closed.
+                hasPending  = false;
+                pendingExec = default(PendingSignal);
+                activeSignalId  = null;
+                activeDirection = null;
+                activeEntry     = 0;
+                activeSL        = 0;
+                activeTp1       = 0;
+                activeTp2       = 0;
+                _halfExited     = false;
+                _slLockedToTp1  = false;
+                _trailActive    = false;
+
                 DrawStatusLabel("MUZZIBOT v4 ONLINE | " + (HalfQty*2) + " MNQ | WAITING", StatusIdle);
                 Print("[MuzziBot v4] DataLoaded | " + (HalfQty*2) + " MNQ | server " + ServerUrl);
+                Print("[MuzziBot v4] Signal state cleared — polling Railway fresh.");
             }
             else if (State == State.Terminated)
             {
@@ -507,14 +524,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                 + " | trail >" + TrailTriggerPts + "pts past TP1 @ " + TrailPts + "pt trail"
                 + " | " + sl);
 
-            // ── SetStopLoss for BOTH halves (same initial stop price) ─────────
-            SetStopLoss(SigHalf, CalculationMode.Ticks, ToTicks(slPts), false);
-            SetStopLoss(SigRun,  CalculationMode.Ticks, ToTicks(slPts), false);
+            // ── SetStopLoss / SetProfitTarget — use absolute PRICE levels ────
+            // CRITICAL: DO NOT use CalculationMode.Ticks here.
+            // Ticks-mode calculates the stop offset from the market price at the
+            // moment SetStopLoss is called — NOT from the actual fill price.
+            // On fast-moving markets the fill can be 10-20pts from Close[0],
+            // so a 20pt tick-offset stop can end up only 1-2pts from actual fill
+            // and trigger instantly ("millisecond stop").
+            // Price-mode anchors the stop to the exact absolute level we computed
+            // from activeEntry, so it is always exactly slPts/tp1Pts/tp2Pts away
+            // from the intended entry price.
+            SetStopLoss(SigHalf, CalculationMode.Price, activeSL,  false);
+            SetStopLoss(SigRun,  CalculationMode.Price, activeSL,  false);
 
             // ── TP targets ────────────────────────────────────────────────────
             // SigHalf exits at TP1, SigRun exits at TP2 (or trail stop, whichever first)
-            SetProfitTarget(SigHalf, CalculationMode.Ticks, ToTicks(tp1Pts));
-            SetProfitTarget(SigRun,  CalculationMode.Ticks, ToTicks(tp2Pts));
+            SetProfitTarget(SigHalf, CalculationMode.Price, activeTp1);
+            SetProfitTarget(SigRun,  CalculationMode.Price, activeTp2);
 
             // ── Draw levels ───────────────────────────────────────────────────
             DrawHLine(TagSL,  activeSL,  SlColor,  "SL");

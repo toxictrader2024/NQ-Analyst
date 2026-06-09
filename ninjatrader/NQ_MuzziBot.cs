@@ -1,18 +1,27 @@
-// NQ_MuzziBot.cs — Execution strategy for NQ Analyst
-// Clean rewrite from scratch — guaranteed compile, no accumulated bugs.
-// ─────────────────────────────────────────────────────────────────────
-// ARCHITECTURE (NT8 thread-safety rules strictly followed):
-//   • Calculate.OnPriceChange  → OnBarUpdate fires on every tick.
-//   • A single background ThreadPool worker polls the Railway API every
-//     PollIntervalSec seconds and parks the result in a VOLATILE slot
-//     (pendingExec). It NEVER calls EnterLong / EnterShort.
-//   • OnBarUpdate (main thread, BarsInProgress == 0) consumes pendingExec
-//     and is the ONLY place orders are submitted.
-//   • OnExecutionUpdate detects fills and posts results back to Railway
-//     on a background thread.
-//   • SL / TP1 / TP2 are placed with managed SetStopLoss / SetProfitTarget.
-//   • No User-Agent header (NT8 blocks WebRequest with a User-Agent).
-// ─────────────────────────────────────────────────────────────────────
+// NQ_MuzziBot.cs — Execution strategy for NQ Analyst (CK Build v4 — MNQ Split Exit)
+// ─────────────────────────────────────────────────────────────────────────────────
+// EXIT LOGIC (v4):
+//   Entry:     4 contracts, two named signals — E_HALF (2 contracts) + E_RUN (2 contracts)
+//   TP1 hit:   E_HALF profit target fires → 2 contracts exit at TP1 automatically
+//              via SetProfitTarget(E_HALF, tp1Ticks)
+//   TP1 + 8:   OnBarUpdate detects price >= activeTp1 + 8 (long) / <= activeTp1 - 8 (short)
+//              → SetStopLoss(E_RUN, CalculationMode.Price, activeTp1) — locks runners at TP1
+//              → _trailActive = true, _trailHigh/_trailLow initialized to current price
+//   Trail:     Once _trailActive, OnBarUpdate updates trail every tick:
+//              long:  if High[0] > _trailHigh → _trailHigh = High[0]
+//                     SetStopLoss(E_RUN, Price, _trailHigh - TrailPts)
+//              short: if Low[0]  < _trailLow  → _trailLow  = Low[0]
+//                     SetStopLoss(E_RUN, Price, _trailLow  + TrailPts)
+//   TP2 hit:   E_RUN profit target fires → 2 runners exit, _lastTp2Time set → cooldown starts
+//   Cooldown:  PostTp2CooldownMin (default 20) — PollForSignal() skips if in cooldown
+//
+// THREAD SAFETY:
+//   • Background ThreadPool polls Railway, parks result in pendingExec + hasPending flag
+//   • OnBarUpdate (main thread) is ONLY place EnterLong/EnterShort/SetStopLoss are called
+//   • OnExecutionUpdate fires on NT8 internal thread — only sets volatile flags, never orders
+//
+// SOURCE: "tradingview" in all POST payloads (Railway fast-path filter — DO NOT CHANGE)
+// ─────────────────────────────────────────────────────────────────────────────────
 
 #region Using declarations
 using System;
@@ -34,20 +43,20 @@ using System.Windows.Media;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    // ── Pending execution slot (handed from background thread → main thread) ──
     public struct PendingSignal
     {
         public string Id;
-        public string Direction;   // "long" | "short"
+        public string Direction;
         public double Entry;
         public double SL;
         public double TP1;
         public double TP2;
+        public string Session;
     }
 
     public class NQ_MuzziBot : Strategy
     {
-        // ── Parameters ─────────────────────────────────────────────────────
+        // ── Server ─────────────────────────────────────────────────────────────
         [NinjaScriptProperty]
         [Display(Name = "Server URL", GroupName = "Server", Order = 1)]
         public string ServerUrl { get; set; }
@@ -58,62 +67,116 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int PollIntervalSec { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "ATM Strategy Name", GroupName = "Execution", Order = 3)]
+        [Range(0, 120)]
+        [Display(Name = "Post-TP2 Cooldown Min", GroupName = "Server", Order = 3,
+                 Description = "Minutes to block new entries after TP2 closes all contracts.")]
+        public int PostTp2CooldownMin { get; set; }
+
+        // ── Execution ──────────────────────────────────────────────────────────
+        [NinjaScriptProperty]
+        [Display(Name = "ATM Strategy Name", GroupName = "Execution", Order = 1)]
         public string AtmStrategyName { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
-        [Display(Name = "Contracts", GroupName = "Execution", Order = 4)]
-        public int Qty { get; set; }
+        [Display(Name = "Contracts Per Half (2 halves)", GroupName = "Execution", Order = 2,
+                 Description = "Contracts per split. Total position = this x2. Default 2 = 4 MNQ total.")]
+        public int HalfQty { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "SL Pts", GroupName = "Execution", Order = 5)]
-        public double SlPts { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "TP1 Pts", GroupName = "Execution", Order = 6)]
-        public double Tp1Pts { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "TP2 Pts", GroupName = "Execution", Order = 7)]
-        public double Tp2Pts { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Max Loss Pts", GroupName = "Execution", Order = 8)]
-        public double MaxLossPts { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Enable Trading", GroupName = "Execution", Order = 9)]
+        [Display(Name = "Enable Trading", GroupName = "Execution", Order = 3)]
         public bool EnableTrading { get; set; }
 
-        // ── Threading state ────────────────────────────────────────────────
-        private volatile bool   polling     = false;
-        private volatile bool   hasPending  = false;   // true when pendingExec holds a fresh signal
-        private PendingSignal    pendingExec;           // guarded by pendingLock + hasPending flag
+        // ── Trail ──────────────────────────────────────────────────────────────
+        [NinjaScriptProperty]
+        [Display(Name = "Trail Trigger Pts past TP1", GroupName = "Trail", Order = 1,
+                 Description = "How many pts past TP1 before SL locks to TP1 and trail starts. Default 8.")]
+        public double TrailTriggerPts { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trail Distance Pts", GroupName = "Trail", Order = 2,
+                 Description = "Trailing stop distance once trail is active. Default 8.5.")]
+        public double TrailPts { get; set; }
+
+        // ── Default / Asia Risk ────────────────────────────────────────────────
+        [NinjaScriptProperty]
+        [Display(Name = "Default SL Pts",  GroupName = "Default / Asia Risk", Order = 1)]
+        public double DefaultSlPts  { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Default TP1 Pts", GroupName = "Default / Asia Risk", Order = 2)]
+        public double DefaultTp1Pts { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Default TP2 Pts", GroupName = "Default / Asia Risk", Order = 3)]
+        public double DefaultTp2Pts { get; set; }
+
+        // ── London KZ Risk ─────────────────────────────────────────────────────
+        [NinjaScriptProperty]
+        [Display(Name = "London SL Pts",  GroupName = "London KZ Risk", Order = 1)]
+        public double LondonSlPts  { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "London TP1 Pts", GroupName = "London KZ Risk", Order = 2)]
+        public double LondonTp1Pts { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "London TP2 Pts", GroupName = "London KZ Risk", Order = 3)]
+        public double LondonTp2Pts { get; set; }
+
+        // ── NY Open / London Close Risk ────────────────────────────────────────
+        [NinjaScriptProperty]
+        [Display(Name = "NY Open SL Pts",  GroupName = "NY Open / London Close Risk", Order = 1)]
+        public double NySlPts  { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "NY Open TP1 Pts", GroupName = "NY Open / London Close Risk", Order = 2)]
+        public double NyTp1Pts { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "NY Open TP2 Pts", GroupName = "NY Open / London Close Risk", Order = 3)]
+        public double NyTp2Pts { get; set; }
+
+        // ── Threading ──────────────────────────────────────────────────────────
+        private volatile bool    polling     = false;
+        private volatile bool    hasPending  = false;
+        private PendingSignal    pendingExec;
         private readonly object  pendingLock = new object();
         private DateTime         lastPoll    = DateTime.MinValue;
 
-        // ── Active trade state (main-thread only) ──────────────────────────
-        private string activeSignalId  = null;
-        private string activeDirection = null;   // "long" | "short"
-        private double activeEntry     = 0;
-        private double activeSL        = 0;
-        private double activeTp1       = 0;
-        private double activeTp2       = 0;
-        private int    entryBar        = -1;
-        private int    tradeCount      = 0;
+        // ── Trade state (main thread only) ─────────────────────────────────────
+        private string   activeSignalId  = null;
+        private string   activeDirection = null;
+        private string   activeSession   = "";
+        private double   activeEntry     = 0;
+        private double   activeSL        = 0;
+        private double   activeTp1       = 0;
+        private double   activeTp2       = 0;
+        private int      entryBar        = -1;
+        private int      tradeCount      = 0;
 
-        // ── Order names ─────────────────────────────────────────────────────
-        private const string SL_NAME  = "MuzziSL";
-        private const string TP1_NAME = "MuzziTP1";
-        private const string TP2_NAME = "MuzziTP2";
+        // ── Split-exit state ───────────────────────────────────────────────────
+        private bool   _halfExited    = false;   // true once 2 contracts exited at TP1
+        private bool   _slLockedToTp1 = false;  // true once SL moved to TP1 price
+        private bool   _trailActive   = false;   // true once 8.5pt trail is running
+        private double _trailHigh     = 0;       // highest price seen since trail started (long)
+        private double _trailLow      = double.MaxValue; // lowest price (short)
+        private double _currentTrailSL = 0;      // last SL price set by trail
 
-        // ── Drawing tags / colors ───────────────────────────────────────────
-        private string TagEntry  => "MZ_Entry_"  + tradeCount;
-        private string TagSL     => "MZ_SL_"     + tradeCount;
-        private string TagTP1    => "MZ_TP1_"    + tradeCount;
-        private string TagTP2    => "MZ_TP2_"    + tradeCount;
-        private string TagOut    => "MZ_Out_"    + tradeCount;
+        // ── TP2 cooldown ───────────────────────────────────────────────────────
+        private DateTime _lastTp2Time = DateTime.MinValue;
+
+        // ── Entry signal name constants ────────────────────────────────────────
+        // Two named entries per trade so SetProfitTarget applies to each independently.
+        private string SigHalf => activeSignalId + "_h";   // 2 contracts → exits at TP1
+        private string SigRun  => activeSignalId + "_r";   // 2 contracts → rides to TP2
+
+        // ── Draw tags ──────────────────────────────────────────────────────────
+        private string TagEntry => "MZ_E_"  + tradeCount;
+        private string TagSL    => "MZ_SL_" + tradeCount;
+        private string TagTP1   => "MZ_T1_" + tradeCount;
+        private string TagTP2   => "MZ_T2_" + tradeCount;
+        private string TagOut   => "MZ_O_"  + tradeCount;
         private const string TagStatus = "MZ_Status";
 
         private static readonly Brush BullGreen  = Brushes.Lime;
@@ -121,124 +184,220 @@ namespace NinjaTrader.NinjaScript.Strategies
         private static readonly Brush SlColor    = Brushes.OrangeRed;
         private static readonly Brush Tp1Color   = Brushes.Yellow;
         private static readonly Brush Tp2Color   = Brushes.Cyan;
+        private static readonly Brush TrailColor = Brushes.DodgerBlue;
         private static readonly Brush StatusIdle = Brushes.Gray;
 
-        // ── Lifecycle ────────────────────────────────────────────────────────
+        // ── Lifecycle ──────────────────────────────────────────────────────────
         protected override void OnStateChange()
         {
-            // Route ALL of this strategy's Print() calls to Output Tab 2.
-            // ROOT CAUSE of the "silent OnBarUpdate": PrintTo defaults to
-            // PrintTo.OutputTab1, so every MuzziBot print was landing in
-            // Output 1 (mixed with the ICT indicator) while we were watching
-            // a blank Output 2. OnBarUpdate WAS firing the whole time.
-            // Set this as early as possible so even SetDefaults/Configure
-            // diagnostics land in Output 2.
             PrintTo = PrintTo.OutputTab2;
 
             if (State == State.SetDefaults)
             {
-                Print("[MuzziBot] OnStateChange → SetDefaults");
-                Name                          = "NQ MuzziBot";
-                Description                   = "Polls NQ Analyst Railway API and executes signals on the NT8 main thread.";
-                Calculate                     = Calculate.OnPriceChange;
-                EntriesPerDirection           = 1;
-                EntryHandling                 = EntryHandling.AllEntries;
-                IsExitOnSessionCloseStrategy  = true;
-                ExitOnSessionCloseSeconds     = 30;
-                IsFillLimitOnTouch            = false;
+                Name                         = "NQ MuzziBot";
+                Description                  = "CK Build v4 — MNQ 4-contract split exit with 8.5pt trail.";
+                Calculate                    = Calculate.OnPriceChange;
+                EntriesPerDirection          = 2;   // TWO named entries per direction
+                EntryHandling                = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy = true;
+                ExitOnSessionCloseSeconds    = 30;
+                IsFillLimitOnTouch           = false;
                 IsInstantiatedOnEachOptimizationIteration = false;
-                StartBehavior                 = StartBehavior.ImmediatelySubmit;
-                BarsRequiredToTrade           = 0;
+                StartBehavior                = StartBehavior.ImmediatelySubmit;
+                BarsRequiredToTrade          = 0;
 
-                ServerUrl       = "https://nq-analyst-production.up.railway.app";
-                PollIntervalSec = 5;
+                ServerUrl          = "https://nq-analyst-production.up.railway.app";
+                PollIntervalSec    = 5;
+                PostTp2CooldownMin = 20;
+
                 AtmStrategyName = "";
-                Qty             = 1;
-                SlPts           = 15;
-                Tp1Pts          = 20;
-                Tp2Pts          = 40;
-                MaxLossPts      = 25;
+                HalfQty         = 2;     // 2+2 = 4 MNQ total
                 EnableTrading   = true;
-            }
-            else if (State == State.Configure)
-            {
-                Print("[MuzziBot] OnStateChange → Configure");
+
+                TrailTriggerPts = 8.0;   // pts past TP1 → lock SL + start trail
+                TrailPts        = 8.5;   // trailing distance
+
+                // Default / Asia
+                DefaultSlPts  = 20;
+                DefaultTp1Pts = 30;
+                DefaultTp2Pts = 70;
+
+                // London KZ
+                LondonSlPts  = 20;
+                LondonTp1Pts = 30;
+                LondonTp2Pts = 70;
+
+                // NY Open / London Close
+                NySlPts  = 20;
+                NyTp1Pts = 30;
+                NyTp2Pts = 70;
             }
             else if (State == State.DataLoaded)
             {
-                Print("[MuzziBot] OnStateChange → DataLoaded");
-                DrawStatusLabel("MUZZIBOT ONLINE | WAITING FOR SIGNAL", StatusIdle);
-                Print("[MuzziBot] DataLoaded — server " + ServerUrl + " | poll " + PollIntervalSec + "s | qty " + Qty);
-            }
-            else if (State == State.Historical)
-            {
-                Print("[MuzziBot] OnStateChange → Historical");
-            }
-            else if (State == State.Transition)
-            {
-                Print("[MuzziBot] OnStateChange → Transition");
-            }
-            else if (State == State.Realtime)
-            {
-                Print("[MuzziBot] OnStateChange → Realtime — strategy is now live.");
+                // Always clear stale in-memory signal on start/restart.
+                // Without this, MuzziBot re-executes the last cached signal
+                // immediately on every strategy enable — even if it was from
+                // hours ago and Railway has already marked it received/closed.
+                hasPending  = false;
+                pendingExec = default(PendingSignal);
+                activeSignalId  = null;
+                activeDirection = null;
+                activeEntry     = 0;
+                activeSL        = 0;
+                activeTp1       = 0;
+                activeTp2       = 0;
+                _halfExited     = false;
+                _slLockedToTp1  = false;
+                _trailActive    = false;
+
+                DrawStatusLabel("MUZZIBOT v4 ONLINE | " + (HalfQty*2) + " MNQ | WAITING", StatusIdle);
+                Print("[MuzziBot v4] DataLoaded | " + (HalfQty*2) + " MNQ | server " + ServerUrl);
+                Print("[MuzziBot v4] Signal state cleared — polling Railway fresh.");
             }
             else if (State == State.Terminated)
             {
                 string sid = activeSignalId;
                 if (!string.IsNullOrEmpty(sid))
-                {
-                    string url = ServerUrl + "/api/trade-signal/result";
-                    string body = "{\"id\":\"" + sid + "\",\"status\":\"cancelled\",\"reason\":\"strategy terminated\"}";
-                    ThreadPool.QueueUserWorkItem(delegate { HttpPost(url, body); });
-                }
-                Print("[MuzziBot] Terminated.");
+                    ThreadPool.QueueUserWorkItem(delegate {
+                        HttpPost(ServerUrl + "/api/trade-signal/result",
+                            "{\"id\":\"" + sid + "\",\"status\":\"cancelled\",\"source\":\"tradingview\"}");
+                    });
             }
         }
 
-        // ── Main thread — fires on every tick (Calculate.OnPriceChange) ──────
+        // ── Main thread — every bar close + price change ──────────────────────
         protected override void OnBarUpdate()
         {
-            // Absolute first line, no conditions — proves OnBarUpdate fires.
-            Print("[MuzziBot] TICK " + CurrentBar);
-
             if (BarsInProgress != 0) return;
             if (CurrentBar < 0)      return;
 
-            // STEP 1 — execute a pending signal (ONLY place orders are entered)
+            // Status heartbeat — only print once per bar close, not every tick
+            if (IsFirstTickOfBar)
+                Print("[MuzziBot] BAR " + Time[0].ToString("HH:mm") + " | Pos:" + Position.MarketPosition + " | Bar#" + CurrentBar);
+
+            // ── STEP 1: Execute pending signal ──────────────────────────────────
             if (hasPending && activeSignalId == null)
             {
                 PendingSignal ps;
-                lock (pendingLock)
-                {
-                    ps = pendingExec;
-                    hasPending = false;
-                }
+                lock (pendingLock) { ps = pendingExec; hasPending = false; }
                 ExecuteSignalOnMainThread(ps);
                 return;
             }
 
-            // STEP 2 — kick off a background poll if idle
+            // ── STEP 2: Split-exit management (only while in trade) ─────────────
+            if (activeSignalId != null && Position.MarketPosition != MarketPosition.Flat)
+            {
+                bool isLong = activeDirection == "long";
+
+                // Phase A — TP1 partial exit (managed by SetProfitTarget on SigHalf)
+                // NT8 handles this automatically — we just track the flag via OnExecutionUpdate
+
+                // Phase B — Trail trigger: price moved TrailTriggerPts past TP1
+                if (_halfExited && !_slLockedToTp1)
+                {
+                    bool triggerHit = isLong
+                        ? High[0] >= activeTp1 + TrailTriggerPts
+                        : Low[0]  <= activeTp1 - TrailTriggerPts;
+
+                    if (triggerHit)
+                    {
+                        _slLockedToTp1 = true;
+
+                        // Lock SL to TP1 price on runners — guaranteed winner
+                        SetStopLoss(SigRun, CalculationMode.Price, activeTp1, false);
+
+                        // Initialize trail from current price
+                        _trailActive = true;
+                        _trailHigh   = High[0];
+                        _trailLow    = Low[0];
+                        _currentTrailSL = isLong
+                            ? activeTp1  // starts at TP1, trail will move it up
+                            : activeTp1;
+
+                        // Redraw SL line at TP1
+                        RemoveDrawObject(TagSL);
+                        RemoveDrawObject(TagSL + "_lbl");
+                        DrawHLine(TagSL, activeTp1, TrailColor, "SL → TP1 LOCKED");
+
+                        string sl = activeSession == "" ? "DEFAULT"
+                            : activeSession.ToUpperInvariant().Replace("_", " ");
+                        DrawStatusLabel("TRAIL ACTIVE — SL LOCKED @ TP1 " + activeTp1.ToString("F2")
+                            + " [" + sl + "]", TrailColor);
+                        Print("[MuzziBot] Trail trigger hit — SL locked to TP1 " + activeTp1.ToString("F2")
+                            + " | trail distance " + TrailPts + " pts");
+
+                        PostStatus("trail_started", "sl_at_tp1:" + activeTp1.ToString("F2"));
+                    }
+                }
+
+                // Phase C — Active 8.5pt trailing stop on runners
+                if (_trailActive)
+                {
+                    bool moved = false;
+                    double newSL;
+
+                    if (isLong)
+                    {
+                        if (High[0] > _trailHigh)
+                        {
+                            _trailHigh = High[0];
+                            newSL = _trailHigh - TrailPts;
+                            // Only ratchet UP — never lower the stop
+                            if (newSL > _currentTrailSL)
+                            {
+                                _currentTrailSL = newSL;
+                                SetStopLoss(SigRun, CalculationMode.Price, newSL, false);
+                                moved = true;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (Low[0] < _trailLow)
+                        {
+                            _trailLow = Low[0];
+                            newSL = _trailLow + TrailPts;
+                            // Only ratchet DOWN — never raise the stop
+                            if (newSL < _currentTrailSL)
+                            {
+                                _currentTrailSL = newSL;
+                                SetStopLoss(SigRun, CalculationMode.Price, newSL, false);
+                                moved = true;
+                            }
+                        }
+                    }
+
+                    if (moved)
+                    {
+                        RemoveDrawObject(TagSL);
+                        RemoveDrawObject(TagSL + "_lbl");
+                        DrawHLine(TagSL, _currentTrailSL, TrailColor,
+                            "TRAIL " + _currentTrailSL.ToString("F2"));
+                    }
+                }
+            }
+
+            // ── STEP 3: Safety reset — stuck signal with flat position ───────────
+            if (activeSignalId != null && Position.MarketPosition == MarketPosition.Flat)
+            {
+                if (entryBar >= 0 && (CurrentBar - entryBar) >= 60)
+                {
+                    Print("[MuzziBot] Safety reset — flat 60+ bars, clearing.");
+                    DrawStatusLabel("RESET — WAITING FOR SIGNAL", StatusIdle);
+                    ResetSignal();
+                }
+            }
+
+            // ── STEP 4: Poll Railway for new signal ─────────────────────────────
             if (activeSignalId == null && !hasPending && !polling
                 && (DateTime.Now - lastPoll).TotalSeconds >= PollIntervalSec)
             {
                 lastPoll = DateTime.Now;
                 ThreadPool.QueueUserWorkItem(delegate { PollForSignal(); });
             }
-
-            // STEP 3 — detect a position that closed (exit orders filled etc.)
-            if (activeSignalId != null && Position.MarketPosition == MarketPosition.Flat)
-            {
-                // STEP 4 — safety reset: signal set but flat for 60+ bars
-                if (entryBar >= 0 && (CurrentBar - entryBar) >= 60)
-                {
-                    Print("[MuzziBot] Safety reset — activeSignalId stuck flat 60+ bars, clearing.");
-                    DrawStatusLabel("RESET — WAITING FOR SIGNAL", StatusIdle);
-                    ResetSignal();
-                }
-            }
         }
 
-        // ── Background thread — polls Railway, parks result. No order calls. ─
+        // ── Background poll ─────────────────────────────────────────────────────
         private void PollForSignal()
         {
             if (polling) return;
@@ -247,8 +406,20 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (!EnableTrading)
                 {
-                    DrawStatusLabel("MUZZIBOT PAUSED | ENABLE TRADING OFF", SlColor);
+                    DrawStatusLabel("MUZZIBOT PAUSED | TRADING OFF", SlColor);
                     return;
+                }
+
+                // Post-TP2 cooldown check
+                if (_lastTp2Time != DateTime.MinValue && PostTp2CooldownMin > 0)
+                {
+                    double mins = (DateTime.Now - _lastTp2Time).TotalMinutes;
+                    if (mins < PostTp2CooldownMin)
+                    {
+                        int left = (int)Math.Ceiling(PostTp2CooldownMin - mins);
+                        DrawStatusLabel("TP2 COOLDOWN — " + left + " MIN REMAINING", Tp2Color);
+                        return;
+                    }
                 }
 
                 DrawStatusLabel("POLLING... " + DateTime.Now.ToString("HH:mm:ss"), StatusIdle);
@@ -256,120 +427,160 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string json = HttpGet(ServerUrl + "/api/trade-signal/pending", 5000);
                 if (string.IsNullOrEmpty(json) || json == "{}" || json.Contains("\"id\":null"))
                 {
-                    DrawStatusLabel("MUZZIBOT ONLINE | NO SIGNAL", StatusIdle);
+                    DrawStatusLabel("ONLINE | NO SIGNAL " + DateTime.Now.ToString("HH:mm:ss"), StatusIdle);
                     return;
                 }
 
-                string rid    = GetString(json, "id");
-                string rdir   = GetString(json, "direction");
-                double rentry = GetDouble(json, "entry");
-                double rsl    = GetDouble(json, "sl");
-                double rtp1   = GetDouble(json, "tp1");
-                double rtp2   = GetDouble(json, "tp2");
+                string rid   = GetString(json, "id");
+                string rdir  = GetString(json, "direction");
+                double rentry= GetDouble(json, "entry");
+                double rsl   = GetDouble(json, "sl");
+                double rtp1  = GetDouble(json, "tp1");
+                double rtp2  = GetDouble(json, "tp2");
+                string rsess = (GetString(json, "session") ?? "").ToLowerInvariant();
+                rdir         = (rdir ?? "").ToLowerInvariant();
 
-                if (string.IsNullOrEmpty(rid) || string.IsNullOrEmpty(rdir)) return;
+                if (string.IsNullOrEmpty(rid) || (rdir != "long" && rdir != "short")) return;
 
-                rdir = rdir.ToLowerInvariant();
-                if (rdir != "long" && rdir != "short")
-                {
-                    Print("[MuzziBot] Ignoring signal with unknown direction: " + rdir);
-                    return;
-                }
+                HttpPost(ServerUrl + "/api/trade-signal/confirm",
+                    "{\"id\":\"" + rid + "\"}");
 
-                Print("[MuzziBot] Signal received: " + rdir.ToUpperInvariant() + " @ " + rentry.ToString("F2") + " | ID " + rid);
-
-                // Confirm receipt so Railway doesn't re-queue it
-                HttpPost(ServerUrl + "/api/trade-signal/confirm", "{\"id\":\"" + rid + "\"}");
-
-                // Hand off to the main thread
                 PendingSignal sig = new PendingSignal
                 {
                     Id = rid, Direction = rdir, Entry = rentry,
-                    SL = rsl, TP1 = rtp1, TP2 = rtp2
+                    SL = rsl, TP1 = rtp1, TP2 = rtp2, Session = rsess
                 };
-                lock (pendingLock)
-                {
-                    pendingExec = sig;
-                    hasPending  = true;
-                }
+                lock (pendingLock) { pendingExec = sig; hasPending = true; }
 
-                DrawStatusLabel("SIGNAL QUEUED: " + rdir.ToUpperInvariant() + " @ " + rentry.ToString("F2"), StatusIdle);
+                string sl = rsess == "" ? "DEFAULT" : rsess.ToUpperInvariant().Replace("_"," ");
+                DrawStatusLabel("SIGNAL QUEUED: " + rdir.ToUpperInvariant()
+                    + " @ " + rentry.ToString("F2") + " [" + sl + "]", StatusIdle);
+
+                Print("[MuzziBot] Signal queued: " + rdir.ToUpperInvariant()
+                    + " @ " + rentry.ToString("F2") + " sess=" + rsess + " id=" + rid);
             }
-            catch (Exception ex)
+            catch (Exception ex) { Print("[MuzziBot] Poll error: " + ex.Message); }
+            finally { polling = false; }
+        }
+
+        // ── Session risk selector ───────────────────────────────────────────────
+        private void GetSessionRisk(string session,
+            out double slPts, out double tp1Pts, out double tp2Pts)
+        {
+            switch (session)
             {
-                Print("[MuzziBot] PollForSignal error: " + ex.Message);
-            }
-            finally
-            {
-                polling = false;
+                case "london":
+                    slPts = LondonSlPts; tp1Pts = LondonTp1Pts; tp2Pts = LondonTp2Pts; break;
+                case "ny_open":
+                case "london_close":
+                    slPts = NySlPts; tp1Pts = NyTp1Pts; tp2Pts = NyTp2Pts; break;
+                default:
+                    slPts = DefaultSlPts; tp1Pts = DefaultTp1Pts; tp2Pts = DefaultTp2Pts; break;
             }
         }
 
-        // ── Main thread only — safe to submit entry orders here ──────────────
+        // ── Entry — main thread only ────────────────────────────────────────────
         private void ExecuteSignalOnMainThread(PendingSignal ps)
         {
-            string id        = ps.Id;
-            string direction = ps.Direction;
-            bool   isLong    = direction == "long";
-
-            // Don't stack onto an existing position.
             if (Position.MarketPosition != MarketPosition.Flat)
             {
-                Print("[MuzziBot] Skipping signal " + id + " — already in position " + Position.MarketPosition);
+                Print("[MuzziBot] Skipping — already in position " + Position.MarketPosition);
                 return;
             }
 
+            string id      = ps.Id;
+            string dir     = ps.Direction;
+            string sess    = ps.Session ?? "";
+            bool   isLong  = dir == "long";
+
+            double slPts, tp1Pts, tp2Pts;
+            GetSessionRisk(sess, out slPts, out tp1Pts, out tp2Pts);
+
             tradeCount++;
             activeSignalId  = id;
-            activeDirection = direction;
+            activeDirection = dir;
+            activeSession   = sess;
             activeEntry     = Close[0];
 
-            // Derive SL / TP levels from configured point distances.
-            double slDist = SlPts;
-            if (MaxLossPts > 0 && slDist > MaxLossPts) slDist = MaxLossPts;
+            activeSL  = isLong ? activeEntry - slPts  : activeEntry + slPts;
+            activeTp1 = isLong ? activeEntry + tp1Pts : activeEntry - tp1Pts;
+            activeTp2 = isLong ? activeEntry + tp2Pts : activeEntry - tp2Pts;
+            entryBar  = CurrentBar;
 
-            if (isLong)
-            {
-                activeSL  = activeEntry - slDist;
-                activeTp1 = activeEntry + Tp1Pts;
-                activeTp2 = activeEntry + Tp2Pts;
-            }
-            else
-            {
-                activeSL  = activeEntry + slDist;
-                activeTp1 = activeEntry - Tp1Pts;
-                activeTp2 = activeEntry - Tp2Pts;
-            }
-            entryBar = CurrentBar;
+            // Reset split state
+            _halfExited     = false;
+            _slLockedToTp1  = false;
+            _trailActive    = false;
+            _trailHigh      = 0;
+            _trailLow       = double.MaxValue;
+            _currentTrailSL = 0;
 
-            // Managed bracket — set BEFORE the entry submits.
-            SetStopLoss(id, CalculationMode.Ticks, ToTicks(slDist), false);
-            SetProfitTarget(id, CalculationMode.Ticks, ToTicks(Tp2Pts));
+            string sl = sess == "" ? "DEFAULT" : sess.ToUpperInvariant().Replace("_"," ");
+            Print("[MuzziBot] EXECUTING " + dir.ToUpperInvariant()
+                + " x" + (HalfQty*2) + " MNQ @ " + activeEntry.ToString("F2")
+                + " | SL " + activeSL.ToString("F2")
+                + " | TP1 " + activeTp1.ToString("F2")
+                + " | TP2 " + activeTp2.ToString("F2")
+                + " | trail >" + TrailTriggerPts + "pts past TP1 @ " + TrailPts + "pt trail"
+                + " | " + sl);
 
-            Print("[MuzziBot] EXECUTING " + direction.ToUpperInvariant() + " @ " + activeEntry.ToString("F2")
-                  + " | SL " + activeSL.ToString("F2") + " | TP1 " + activeTp1.ToString("F2")
-                  + " | TP2 " + activeTp2.ToString("F2") + " | Bar " + CurrentBar);
-            DrawStatusLabel("ENTERING: " + direction.ToUpperInvariant() + " @ " + activeEntry.ToString("F2"),
+            // ── SetStopLoss / SetProfitTarget — use absolute PRICE levels ────
+            // CRITICAL: DO NOT use CalculationMode.Ticks here.
+            // Ticks-mode calculates the stop offset from the market price at the
+            // moment SetStopLoss is called — NOT from the actual fill price.
+            // On fast-moving markets the fill can be 10-20pts from Close[0],
+            // so a 20pt tick-offset stop can end up only 1-2pts from actual fill
+            // and trigger instantly ("millisecond stop").
+            // Price-mode anchors the stop to the exact absolute level we computed
+            // from activeEntry, so it is always exactly slPts/tp1Pts/tp2Pts away
+            // from the intended entry price.
+            SetStopLoss(SigHalf, CalculationMode.Price, activeSL,  false);
+            SetStopLoss(SigRun,  CalculationMode.Price, activeSL,  false);
+
+            // ── TP targets ────────────────────────────────────────────────────
+            // SigHalf exits at TP1, SigRun exits at TP2 (or trail stop, whichever first)
+            SetProfitTarget(SigHalf, CalculationMode.Price, activeTp1);
+            SetProfitTarget(SigRun,  CalculationMode.Price, activeTp2);
+
+            // ── Draw levels ───────────────────────────────────────────────────
+            DrawHLine(TagSL,  activeSL,  SlColor,  "SL");
+            DrawHLine(TagTP1, activeTp1, Tp1Color, "TP1 (½ exit)");
+            DrawHLine(TagTP2, activeTp2, Tp2Color, "TP2 (runner)");
+
+            DrawStatusLabel("ENTERING " + dir.ToUpperInvariant()
+                + " x" + (HalfQty*2) + " @ " + activeEntry.ToString("F2")
+                + " [" + sl + "]",
                 isLong ? BullGreen : BearRed);
 
-            bool useAtm = !string.IsNullOrEmpty(AtmStrategyName);
+            // ── Submit BOTH entries ───────────────────────────────────────────
             if (isLong)
             {
-                Draw.ArrowUp(this, TagEntry, false, 0, Low[0] - 3 * TickSize, BullGreen);
-                EnterLong(Qty, id);
-                Print("[MuzziBot] EnterLong submitted — Qty:" + Qty + " Name:" + id
-                      + (useAtm ? " ATM:" + AtmStrategyName : ""));
+                Draw.ArrowUp(this, TagEntry, false, 0, Low[0] - 3*TickSize, BullGreen);
+                EnterLong(HalfQty, SigHalf);
+                EnterLong(HalfQty, SigRun);
             }
             else
             {
-                Draw.ArrowDown(this, TagEntry, false, 0, High[0] + 3 * TickSize, BearRed);
-                EnterShort(Qty, id);
-                Print("[MuzziBot] EnterShort submitted — Qty:" + Qty + " Name:" + id
-                      + (useAtm ? " ATM:" + AtmStrategyName : ""));
+                Draw.ArrowDown(this, TagEntry, false, 0, High[0] + 3*TickSize, BearRed);
+                EnterShort(HalfQty, SigHalf);
+                EnterShort(HalfQty, SigRun);
             }
+
+            Print("[MuzziBot] Both entries submitted — " + SigHalf + " + " + SigRun);
+
+            // Notify Railway — entry submitted
+            string url  = ServerUrl + "/api/trade-signal/result";
+            string body = "{\"id\":\"" + id + "\",\"status\":\"entered\""
+                + ",\"entry\":"   + activeEntry.ToString("F2", CultureInfo.InvariantCulture)
+                + ",\"halfQty\":" + HalfQty
+                + ",\"tp1\":"     + activeTp1.ToString("F2", CultureInfo.InvariantCulture)
+                + ",\"tp2\":"     + activeTp2.ToString("F2", CultureInfo.InvariantCulture)
+                + ",\"session\":\"" + sess + "\""
+                + ",\"source\":\"tradingview\"}";
+            ThreadPool.QueueUserWorkItem(delegate { HttpPost(url, body); });
         }
 
-        // ── Fills & exits — detect, draw, report to Railway ──────────────────
+        // ── Fills ───────────────────────────────────────────────────────────────
         protected override void OnExecutionUpdate(Execution execution, string executionId,
             double price, int quantity, MarketPosition marketPosition,
             string orderId, DateTime time)
@@ -377,63 +588,146 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (execution == null || execution.Order == null) return;
             if (string.IsNullOrEmpty(activeSignalId))         return;
 
-            string name = execution.Order.Name;
+            string name = execution.Order.Name ?? "";
             double fill = execution.Price;
 
-            // Entry fill — order name == signal id (set in ExecuteSignalOnMainThread)
-            if (name == activeSignalId)
+            // ── Entry fills ───────────────────────────────────────────────────
+            if (name == SigHalf || name == SigRun)
             {
-                Print("[MuzziBot] Entry filled @ " + fill.ToString("F2"));
+                Print("[MuzziBot] Entry fill: " + name + " @ " + fill.ToString("F2")
+                    + " qty=" + quantity);
                 entryBar = CurrentBar;
 
-                DrawHLine(TagSL,  activeSL,  SlColor,  "SL");
-                DrawHLine(TagTP1, activeTp1, Tp1Color, "TP1");
-                DrawHLine(TagTP2, activeTp2, Tp2Color, "TP2");
-
-                DrawStatusLabel("IN TRADE: " + activeDirection.ToUpperInvariant()
-                    + " | ENTRY " + fill.ToString("F2") + " | SL " + activeSL.ToString("F2")
-                    + " | TP2 " + activeTp2.ToString("F2"),
+                string sl = activeSession == "" ? "DEFAULT"
+                    : activeSession.ToUpperInvariant().Replace("_"," ");
+                DrawStatusLabel("IN TRADE x" + (HalfQty*2) + " | "
+                    + activeDirection.ToUpperInvariant()
+                    + " @ " + fill.ToString("F2")
+                    + " TP1=" + activeTp1.ToString("F2")
+                    + " TP2=" + activeTp2.ToString("F2")
+                    + " [" + sl + "]",
                     activeDirection == "long" ? BullGreen : BearRed);
-
-                string sid = activeSignalId;
-                string url = ServerUrl + "/api/trade-signal/result";
-                string body = "{\"id\":\"" + sid + "\",\"status\":\"filled\",\"fillPrice\":"
-                              + fill.ToString("F2", CultureInfo.InvariantCulture) + "}";
-                ThreadPool.QueueUserWorkItem(delegate { HttpPost(url, body); });
                 return;
             }
 
-            // Exit fill — stop or target. Detect via order name.
-            bool isStop   = name == SL_NAME  || name.IndexOf("Stop",   StringComparison.OrdinalIgnoreCase) >= 0;
-            bool isTarget = name == TP2_NAME || name == TP1_NAME
-                            || name.IndexOf("Profit", StringComparison.OrdinalIgnoreCase) >= 0
-                            || name.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0;
+            // ── TP1 partial exit (SigHalf target fills) ───────────────────────
+            bool isHalfTarget = name.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0
+                             || name.IndexOf("Profit", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool isHalfFill   = isHalfTarget && !_halfExited
+                             && Math.Abs(fill - activeTp1) < 5.0;   // within 5pts of TP1
 
-            // Only treat as a close if the position is now flat.
-            if (Position.MarketPosition == MarketPosition.Flat && (isStop || isTarget))
+            if (isHalfFill)
             {
-                double pnl = activeDirection == "long" ? fill - activeEntry : activeEntry - fill;
-                string outcome = isTarget ? "TP2" : "STOPPED";
-                Brush col      = isTarget ? Tp2Color : SlColor;
+                _halfExited = true;
+                double halfPnl = activeDirection == "long"
+                    ? (fill - activeEntry) * HalfQty
+                    : (activeEntry - fill) * HalfQty;
 
-                Print("[MuzziBot] " + outcome + " hit @ " + fill.ToString("F2") + " | PnL " + pnl.ToString("F2") + " pts");
-                Draw.Text(this, TagOut, outcome + " " + pnl.ToString("F1"), 0,
-                    fill + (isTarget ? 4 : -4) * TickSize, col);
-                DrawStatusLabel("CLOSED " + outcome + " " + pnl.ToString("F1") + " pts | WAITING FOR SIGNAL", col);
+                Print("[MuzziBot] TP1 PARTIAL EXIT — " + HalfQty + " contracts @ "
+                    + fill.ToString("F2") + " | half PnL=" + halfPnl.ToString("F2") + " pts"
+                    + " | Runners still open, waiting for TP1+" + TrailTriggerPts + " trigger");
+
+                DrawStatusLabel("TP1 HIT — " + HalfQty + " OUT | RUNNERS OPEN | waiting trail trigger",
+                    Tp1Color);
+
+                // Redraw TP1 line as filled
+                RemoveDrawObject(TagTP1);
+                RemoveDrawObject(TagTP1 + "_lbl");
+                DrawHLine(TagTP1, activeTp1, BullGreen, "TP1 HIT ✓ (" + HalfQty + " out)");
+
+                PostStatus("tp1_partial", "fill:" + fill.ToString("F2")
+                    + ",halfPnlPts:" + halfPnl.ToString("F2"));
+                return;
+            }
+
+            // ── Full close — runners stopped or hit TP2 ───────────────────────
+            bool isFinalClose = Position.MarketPosition == MarketPosition.Flat
+                || (quantity >= HalfQty
+                    && (name.IndexOf("Stop", StringComparison.OrdinalIgnoreCase) >= 0
+                     || name.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0
+                     || name.IndexOf("Profit", StringComparison.OrdinalIgnoreCase) >= 0));
+
+            if (isFinalClose && _halfExited && Position.MarketPosition == MarketPosition.Flat)
+            {
+                // Total PnL = TP1 half + runner half
+                double tp1Pnl    = activeDirection == "long"
+                    ? (activeTp1 - activeEntry) * HalfQty
+                    : (activeEntry - activeTp1) * HalfQty;
+                double runnerPnl = activeDirection == "long"
+                    ? (fill - activeEntry) * HalfQty
+                    : (activeEntry - fill) * HalfQty;
+                double totalPnl  = tp1Pnl + runnerPnl;
+
+                bool   hitTp2  = Math.Abs(fill - activeTp2) < 5.0;
+                string outcome = hitTp2 ? "TP2" : (_trailActive ? "TRAIL_STOP" : "STOPPED");
+                Brush  col     = hitTp2 ? Tp2Color : (_trailActive ? TrailColor : SlColor);
+
+                Print("[MuzziBot] TRADE CLOSED — " + outcome
+                    + " @ " + fill.ToString("F2")
+                    + " | TP1 half=" + tp1Pnl.ToString("F2")
+                    + " runner=" + runnerPnl.ToString("F2")
+                    + " TOTAL=" + totalPnl.ToString("F2") + " pts");
+
+                Draw.Text(this, TagOut, outcome + " " + totalPnl.ToString("F1") + "pts",
+                    0, fill + (hitTp2 ? 4 : -4) * TickSize, col);
+                DrawStatusLabel("CLOSED " + outcome + " | TOTAL "
+                    + totalPnl.ToString("F1") + " pts | WAITING", col);
+
+                // Start cooldown only on TP2
+                if (hitTp2)
+                {
+                    _lastTp2Time = DateTime.Now;
+                    Print("[MuzziBot] TP2 full close — cooldown started " + PostTp2CooldownMin + " min");
+                }
 
                 string sid = activeSignalId;
-                string url = ServerUrl + "/api/trade-signal/result";
-                string body = "{\"id\":\"" + sid + "\",\"status\":\"closed\",\"outcome\":\"" + outcome
-                              + "\",\"exitPrice\":" + fill.ToString("F2", CultureInfo.InvariantCulture)
-                              + ",\"pnlPts\":" + pnl.ToString("F2", CultureInfo.InvariantCulture) + "}";
-                ThreadPool.QueueUserWorkItem(delegate { HttpPost(url, body); });
+                PostStatus("closed", "outcome:" + outcome
+                    + ",exitPrice:" + fill.ToString("F2", CultureInfo.InvariantCulture)
+                    + ",totalPnlPts:" + totalPnl.ToString("F2", CultureInfo.InvariantCulture)
+                    + ",tp1PnlPts:" + tp1Pnl.ToString("F2", CultureInfo.InvariantCulture)
+                    + ",runnerPnlPts:" + runnerPnl.ToString("F2", CultureInfo.InvariantCulture)
+                    + ",trailActive:" + _trailActive.ToString().ToLower());
+
+                RemoveTradeLines();
+                ResetSignal();
+                return;
+            }
+
+            // ── Stop out before TP1 (full loss — both halves stopped) ──────────
+            if (!_halfExited && Position.MarketPosition == MarketPosition.Flat)
+            {
+                double pnl = activeDirection == "long"
+                    ? (fill - activeEntry) * HalfQty * 2
+                    : (activeEntry - fill) * HalfQty * 2;
+
+                Print("[MuzziBot] FULL STOP — both halves stopped @ "
+                    + fill.ToString("F2") + " | PnL=" + pnl.ToString("F2"));
+
+                DrawStatusLabel("STOPPED " + pnl.ToString("F1") + " pts | WAITING", SlColor);
+                Draw.Text(this, TagOut, "STOP " + pnl.ToString("F1"), 0,
+                    fill - 4*TickSize, SlColor);
+
+                PostStatus("closed", "outcome:STOPPED"
+                    + ",exitPrice:" + fill.ToString("F2", CultureInfo.InvariantCulture)
+                    + ",totalPnlPts:" + pnl.ToString("F2", CultureInfo.InvariantCulture));
 
                 RemoveTradeLines();
                 ResetSignal();
             }
         }
 
-        // ── Draw helpers ──────────────────────────────────────────────────────
+        // ── Helpers ─────────────────────────────────────────────────────────────
+        private void PostStatus(string status, string extra)
+        {
+            string sid = activeSignalId ?? "?";
+            string url = ServerUrl + "/api/trade-signal/result";
+            string body = "{\"id\":\"" + sid + "\",\"status\":\"" + status + "\""
+                + ",\"detail\":\"" + extra + "\""
+                + ",\"session\":\"" + activeSession + "\""
+                + ",\"source\":\"tradingview\"}";
+            ThreadPool.QueueUserWorkItem(delegate { HttpPost(url, body); });
+        }
+
         private void DrawHLine(string tag, double price, Brush color, string label)
         {
             int barsAgo = Math.Max(0, CurrentBar - entryBar);
@@ -448,48 +742,51 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Draw.TextFixed(this, TagStatus, text, TextPosition.TopRight,
                     color, new SimpleFont("Arial", 11), Brushes.Transparent, Brushes.Transparent, 0);
             }
-            catch { /* drawing not available outside chart context */ }
+            catch { }
         }
 
         private void RemoveTradeLines()
         {
-            RemoveDrawObject(TagSL);   RemoveDrawObject(TagSL  + "_lbl");
-            RemoveDrawObject(TagTP1);  RemoveDrawObject(TagTP1 + "_lbl");
-            RemoveDrawObject(TagTP2);  RemoveDrawObject(TagTP2 + "_lbl");
+            foreach (string t in new[]{ TagSL, TagTP1, TagTP2 })
+            {
+                RemoveDrawObject(t);
+                RemoveDrawObject(t + "_lbl");
+            }
         }
 
         private void ResetSignal()
         {
             activeSignalId  = null;
             activeDirection = null;
+            activeSession   = "";
             activeEntry     = 0;
             activeSL        = 0;
             activeTp1       = 0;
             activeTp2       = 0;
             entryBar        = -1;
+            _halfExited     = false;
+            _slLockedToTp1  = false;
+            _trailActive    = false;
+            _trailHigh      = 0;
+            _trailLow       = double.MaxValue;
+            _currentTrailSL = 0;
         }
 
         private int ToTicks(double pts)
         {
-            if (TickSize <= 0) return (int)Math.Round(pts * 4); // NQ fallback
+            if (TickSize <= 0) return (int)Math.Round(pts * 4);
             return (int)Math.Round(pts / TickSize);
         }
 
-        // ── HTTP helpers (WebClient — NO User-Agent header) ──────────────────
+        // ── HTTP helpers ─────────────────────────────────────────────────────────
         private string HttpGet(string url, int timeoutMs)
         {
             try
             {
                 using (var wc = new TimedWebClient(timeoutMs))
-                {
                     return wc.DownloadString(url);
-                }
             }
-            catch (Exception ex)
-            {
-                Print("[MuzziBot] GET error: " + ex.Message);
-                return null;
-            }
+            catch (Exception ex) { Print("[MuzziBot] GET error: " + ex.Message); return null; }
         }
 
         private void HttpPost(string url, string json)
@@ -502,26 +799,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                     wc.UploadString(url, "POST", json);
                 }
             }
-            catch (Exception ex)
-            {
-                Print("[MuzziBot] POST error: " + ex.Message);
-            }
+            catch (Exception ex) { Print("[MuzziBot] POST error: " + ex.Message); }
         }
 
-        // WebClient with a configurable timeout. No User-Agent set anywhere.
         private class TimedWebClient : WebClient
         {
-            private readonly int timeoutMs;
-            public TimedWebClient(int timeoutMs) { this.timeoutMs = timeoutMs; }
+            private readonly int _ms;
+            public TimedWebClient(int ms) { _ms = ms; }
             protected override WebRequest GetWebRequest(Uri address)
             {
-                WebRequest req = base.GetWebRequest(address);
-                if (req != null) req.Timeout = timeoutMs;
-                return req;
+                var r = base.GetWebRequest(address);
+                if (r != null) r.Timeout = _ms;
+                return r;
             }
         }
 
-        // ── Minimal JSON parsers ─────────────────────────────────────────────
+        // ── Minimal JSON parsers ────────────────────────────────────────────────
         private double GetDouble(string json, string key)
         {
             int i = json.IndexOf("\"" + key + "\":", StringComparison.Ordinal);
