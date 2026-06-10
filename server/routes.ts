@@ -1242,6 +1242,67 @@ export function registerRoutes(httpServer: Server, app: Express) {
     return res.json(getSignalStats());
   });
 
+  // ── GET /api/trades/today — Full MuzziBot trade log for today ──────────────
+  // Used by post-session cron to grade real trades against morning brief levels.
+  // Returns every signal created today (ET) with all fill/exit/PnL data.
+  app.get("/api/trades/today", (_req, res) => {
+    const todayET = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const all = getRecentSignals(200);
+    const todayTrades = all.filter(s => {
+      const d = new Date(s.createdAt).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+      return d === todayET && s.direction; // only real trades, not SC data rows
+    });
+    const closed  = todayTrades.filter(s => s.status === 'closed' || s.status === 'cancelled');
+    const wins    = closed.filter(s => s.result === 'TP1' || s.result === 'TP2');
+    const tp2s    = closed.filter(s => s.result === 'TP2');
+    const stopped = closed.filter(s => s.result === 'STOPPED');
+    const longs   = closed.filter(s => s.direction === 'long');
+    const shorts  = closed.filter(s => s.direction === 'short');
+    const totalPnlPts = closed.reduce((sum, s) => sum + (s.pnlPoints ?? 0), 0);
+    const totalPnlUsd = closed.reduce((sum, s) => sum + (s.pnlDollars ?? 0), 0);
+    const bySession: Record<string, { trades: number; wins: number; pnl: number }> = {};
+    closed.forEach(s => {
+      const sess = s.session || 'unknown';
+      if (!bySession[sess]) bySession[sess] = { trades: 0, wins: 0, pnl: 0 };
+      bySession[sess].trades++;
+      if (s.result === 'TP1' || s.result === 'TP2') bySession[sess].wins++;
+      bySession[sess].pnl += (s.pnlPoints ?? 0);
+    });
+    return res.json({
+      date: todayET,
+      summary: {
+        total_trades:   closed.length,
+        wins:           wins.length,
+        tp2_count:      tp2s.length,
+        stopped_count:  stopped.length,
+        longs:          longs.length,
+        shorts:         shorts.length,
+        win_rate_pct:   closed.length ? Math.round((wins.length / closed.length) * 100) : 0,
+        total_pnl_pts:  parseFloat(totalPnlPts.toFixed(2)),
+        total_pnl_usd:  parseFloat(totalPnlUsd.toFixed(2)),
+      },
+      by_session: bySession,
+      trades: todayTrades.map(s => ({
+        id:          s.id,
+        direction:   s.direction,
+        session:     s.session,
+        entry:       s.entry,
+        fill_price:  s.fillPrice,
+        exit_price:  s.exitPrice,
+        sl:          s.sl,
+        tp1:         s.tp1,
+        tp2:         s.tp2,
+        status:      s.status,
+        result:      s.result,
+        pnl_pts:     s.pnlPoints,
+        pnl_usd:     s.pnlDollars,
+        reason:      s.reason,
+        score:       s.score,
+        created_at:  new Date(s.createdAt).toISOString(),
+      })),
+    });
+  });
+
   // ── GET /api/commentary — Live commentary feed ─────────────────────────────
   app.get("/api/commentary", (req, res) => {
     const limit = parseInt(String(req.query.limit || "30"));
