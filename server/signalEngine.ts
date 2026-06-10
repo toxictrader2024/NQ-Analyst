@@ -172,15 +172,36 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
 
   const sessionLabel = getSessionLabel(marketData, session);
 
-  // ── Hard session block: only trade London, NY Open, London Close ──────────
-  // ny_close (after 11am ET / 10am CT) is NOT a valid killzone.
-  // Any signal arriving with session='ny_close' or outside allowed windows
-  // is rejected here before it ever becomes a pending order.
-  const ALLOWED_SESSIONS = ['london', 'ny_open', 'london_close', 'ny_open_london_close'];
+  // ── Hard session block: only trade defined killzones ────────────────────
+  // Allowed: London (2-5am ET), NY Open (7-11am ET), London Close (10-11am ET),
+  //          NY Afternoon (1:30-3pm ET) — trend continuation only, score > 65 required
+  // ny_close and any unknown session are hard-blocked.
+  const ALLOWED_SESSIONS = ['london', 'ny_open', 'london_close', 'ny_open_london_close', 'ny_afternoon'];
   const normalizedSession = sessionLabel.toLowerCase().replace(/[\s-]/g, '_');
   if (!ALLOWED_SESSIONS.some(s => normalizedSession.includes(s))) {
-    console.log(`[SignalEngine][SessionBlock] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — session='${sessionLabel}' not in allowed killzones (london/ny_open/london_close)`);
+    console.log(`[SignalEngine][SessionBlock] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — session='${sessionLabel}' not in allowed killzones`);
     return null;
+  }
+
+  // ── NY Afternoon extra rules ─────────────────────────────────────────────────────
+  // Trend-continuation only: direction must match intraday bias
+  // Confidence (score) must be > 65 — no low-conviction afternoon trades
+  if (normalizedSession.includes('ny_afternoon')) {
+    const confidence = (marketData.confidence as number) ?? 0;
+    const intradayBias = (marketData.htfBias ?? marketData.bias ?? '') as string;
+    const biasDirection = intradayBias.toLowerCase().includes('bull') ? 'long'
+                        : intradayBias.toLowerCase().includes('bear') ? 'short'
+                        : null;
+    // Block if score too low
+    if (confidence < 65) {
+      console.log(`[SignalEngine][AfternoonBlock] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — score=${confidence} < 65 required for ny_afternoon`);
+      return null;
+    }
+    // Block counter-trend trades — if bias is clear, only trade with it
+    if (biasDirection && biasDirection !== ntDirection) {
+      console.log(`[SignalEngine][AfternoonBlock] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — counter-trend in ny_afternoon (bias=${intradayBias})`);
+      return null;
+    }
   }
 
   const risk = evaluateRiskGate({ direction: ntDirection, session: sessionLabel, confidence: marketData.confidence });

@@ -159,7 +159,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 ServerUrl      = "https://nq-analyst-production.up.railway.app";
 
                 FvgScanBars    = 5;
-                ObSwingLen     = 3;
+                ObSwingLen     = 2;
                 ObMaxBars      = 20;
                 SweepLookback  = 40;
                 AtrPeriod      = 14;
@@ -292,8 +292,29 @@ namespace NinjaTrader.NinjaScript.Indicators
             bool hl = !double.IsNaN(sl1) && !double.IsNaN(sl2) && sl1 > sl2;
             bool lh = !double.IsNaN(sh1) && !double.IsNaN(sh2) && sh1 < sh2;
             bool ll = !double.IsNaN(sl1) && !double.IsNaN(sl2) && sl1 < sl2;
+
             if (hh && hl)      { htfBull15 = true;  htfBear15 = false; }
             else if (lh && ll) { htfBull15 = false; htfBear15 = true;  }
+            else
+            {
+                // Fallback: not enough swing data yet (e.g. after indicator reload).
+                // Use price vs 20-bar EMA on the 15m series as bias proxy.
+                // This keeps signals flowing during the first ~60 min after restart.
+                if (Closes[1].Count >= 20)
+                {
+                    double ema20 = EMA(Closes[1], 20)[0];
+                    if (Closes[1][0] > ema20)  { htfBull15 = true;  htfBear15 = false; }
+                    else                        { htfBull15 = false; htfBear15 = true;  }
+                    Print("[ICT] HTF fallback bias (EMA20 15m): " + (htfBull15 ? "BULL" : "BEAR") + " close=" + Closes[1][0].ToString("F2") + " ema=" + ema20.ToString("F2"));
+                }
+                // If fewer than 20 bars loaded, allow both directions (no bias gate)
+                else
+                {
+                    htfBull15 = true;
+                    htfBear15 = true;
+                    Print("[ICT] HTF bias: insufficient bars (" + Closes[1].Count + "), both directions open");
+                }
+            }
         }
         #endregion
 
@@ -626,8 +647,33 @@ namespace NinjaTrader.NinjaScript.Indicators
         #region Session Filter
         private bool InSession()
         {
-            // Session filter DISABLED — always allow signals to fire.
-            return true;
+            // Convert bar time to ET
+            DateTime et;
+            try {
+                et = TimeZoneInfo.ConvertTimeFromUtc(
+                    Times[0][0].ToUniversalTime(),
+                    TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"));
+            } catch { return true; }
+
+            int h = et.Hour, m = et.Minute;
+            int hm = h * 100 + m;
+
+            // London Kill Zone: 2:00am - 5:00am ET
+            bool london   = FilterLondon && (hm >= 200  && hm < 500);
+            // NY AM Kill Zone: 7:00am - 11:00am ET
+            bool nyAm     = FilterNyAm   && (hm >= 700  && hm < 1100);
+            // Hard block: first 5 bars of open
+            bool openChop = (hm >= 930 && hm < 935);
+            // Lunch block
+            bool lunch    = BlockLunch   && (hm >= 1130 && hm < 1300);
+            // News block: ±5 min of :00 and :30
+            bool news     = BlockNews    && (m <= 5 || (m >= 25 && m <= 35) || m >= 55);
+
+            // All filters OFF = trade any time (except hard blocks)
+            if (!FilterLondon && !FilterNyAm)
+                return !openChop && !lunch && !(BlockNews && news);
+
+            return (london || nyAm) && !openChop && !lunch && !(BlockNews && news);
         }
         #endregion
 
@@ -777,11 +823,29 @@ namespace NinjaTrader.NinjaScript.Indicators
             return string.Join("+", p);
         }
 
+        // Returns the ICT killzone label for a given ET DateTime
+        private string GetKillzoneLabel(DateTime et)
+        {
+            int hm = et.Hour * 100 + et.Minute;
+            if (hm >= 200  && hm < 500)  return "london";
+            if (hm >= 700  && hm < 930)  return "ny_open";       // pre-open
+            if (hm >= 930  && hm < 1100) return "ny_open";       // NY AM killzone
+            if (hm >= 1000 && hm < 1100) return "london_close";  // London close overlap
+            if (hm >= 1330 && hm < 1500) return "ny_afternoon";  // NY PM killzone
+            return "ny_open"; // fallback
+        }
+
         private void PostRailway(string dir, double e, double sl, double tp1, double tp2, string reason, string id)
         {
             try
             {
                 var ci = System.Globalization.CultureInfo.InvariantCulture;
+                // Get current ET time for killzone label
+                DateTime et;
+                try {
+                    et = TimeZoneInfo.ConvertTime(DateTime.UtcNow,
+                        TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"));
+                } catch { et = DateTime.UtcNow.AddHours(-5); }
                 string body = "{\"long_signal\":"  + (dir=="long" ?"1":"0")
                     + ",\"short_signal\":" + (dir=="short"?"1":"0")
                     + ",\"direction\":\"" + dir + "\""
@@ -791,6 +855,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     + ",\"tp1\":"    + tp1.ToString(ci)
                     + ",\"tp2\":"    + tp2.ToString(ci)
                     + ",\"source\":\"ninjatrader\",\"ticker\":\"NQ1!\""
+                    + ",\"killzone\":\"" + GetKillzoneLabel(et) + "\",\"discount\":" + (dir=="long"?"1":"0") + ",\"premium\":" + (dir=="short"?"1":"0")
                     + ",\"signal_id\":\"" + id + "\",\"reason\":\"" + reason + "\"}";
                 Print("[ICT] POST -> " + ServerUrl + "/api/webhook  body=" + body);
                 var req = (HttpWebRequest)WebRequest.Create(ServerUrl + "/api/webhook");

@@ -447,6 +447,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // ny_close and any unknown session are rejected — no trade after 11am ET
                 bool allowedSession = rsess == "london" || rsess == "ny_open"
                                    || rsess == "london_close" || rsess == "ny_open_london_close"
+                                   || rsess == "ny_afternoon"  // 1:30-3pm ET trend continuation
                                    || rsess == ""  // allow blank (Railway sets it correctly)
                                    || rsess == "default";
                 if (!allowedSession)
@@ -486,6 +487,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     slPts = LondonSlPts; tp1Pts = LondonTp1Pts; tp2Pts = LondonTp2Pts; break;
                 case "ny_open":
                 case "london_close":
+                case "ny_afternoon":   // 1:30-3pm ET — same risk as NY open
                     slPts = NySlPts; tp1Pts = NyTp1Pts; tp2Pts = NyTp2Pts; break;
                 default:
                     slPts = DefaultSlPts; tp1Pts = DefaultTp1Pts; tp2Pts = DefaultTp2Pts; break;
