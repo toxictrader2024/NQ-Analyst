@@ -442,6 +442,19 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (string.IsNullOrEmpty(rid) || (rdir != "long" && rdir != "short")) return;
 
+                // ── Hard session block (second line of defense after Railway) ───────
+                // Only allowed killzones: london, ny_open, london_close
+                // ny_close and any unknown session are rejected — no trade after 11am ET
+                bool allowedSession = rsess == "london" || rsess == "ny_open"
+                                   || rsess == "london_close" || rsess == "ny_open_london_close"
+                                   || rsess == ""  // allow blank (Railway sets it correctly)
+                                   || rsess == "default";
+                if (!allowedSession)
+                {
+                    Print("[MuzziBot] BLOCKED signal id=" + rid + " — session '" + rsess + "' is not a valid killzone (london/ny_open/london_close only)");
+                    return;
+                }
+
                 HttpPost(ServerUrl + "/api/trade-signal/confirm",
                     "{\"id\":\"" + rid + "\"}");
 

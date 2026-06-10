@@ -171,6 +171,18 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   }
 
   const sessionLabel = getSessionLabel(marketData, session);
+
+  // ── Hard session block: only trade London, NY Open, London Close ──────────
+  // ny_close (after 11am ET / 10am CT) is NOT a valid killzone.
+  // Any signal arriving with session='ny_close' or outside allowed windows
+  // is rejected here before it ever becomes a pending order.
+  const ALLOWED_SESSIONS = ['london', 'ny_open', 'london_close', 'ny_open_london_close'];
+  const normalizedSession = sessionLabel.toLowerCase().replace(/[\s-]/g, '_');
+  if (!ALLOWED_SESSIONS.some(s => normalizedSession.includes(s))) {
+    console.log(`[SignalEngine][SessionBlock] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — session='${sessionLabel}' not in allowed killzones (london/ny_open/london_close)`);
+    return null;
+  }
+
   const risk = evaluateRiskGate({ direction: ntDirection, session: sessionLabel, confidence: marketData.confidence });
   if (!risk.allowed) {
     console.log(`[SignalEngine][RiskGate] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — ${risk.reason}`);
