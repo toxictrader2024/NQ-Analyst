@@ -37,6 +37,10 @@ import { evaluateRiskGate } from './RiskEngine';
 
 const dbPath = path.resolve(process.cwd(), 'data.db');
 const _db = new Database(dbPath);
+// WAL mode prevents reader/writer lock contention when MuzziBot fires
+// multiple concurrent POSTs (TP1 hit + trail + close all at once)
+_db.pragma('journal_mode = WAL');
+_db.pragma('busy_timeout = 3000'); // wait up to 3s instead of throwing SQLITE_BUSY
 _db.exec(`
   CREATE TABLE IF NOT EXISTS trade_signals (
     id TEXT PRIMARY KEY,

@@ -1205,22 +1205,31 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
   // ── POST /api/trade-signal/confirm — Confirm receipt of a signal ───────────
   app.post("/api/trade-signal/confirm", (req, res) => {
-    const { id, status } = req.body as { id: string; status?: string };
-    if (!id) return res.status(400).json({ error: "id required" });
-    confirmSignal(id);
-    // Allow caller to also pass an updated status (e.g. 'filled')
-    if (status && status !== 'pending') {
-      updateSignalResult(id, { status: status as any });
+    try {
+      const { id, status } = req.body as { id: string; status?: string };
+      if (!id) return res.status(400).json({ error: "id required" });
+      confirmSignal(id);
+      if (status && status !== 'pending') {
+        updateSignalResult(id, { status: status as any });
+      }
+      return res.json({ ok: true, id });
+    } catch (err: any) {
+      console.error('[confirm] error:', err?.message);
+      return res.json({ ok: true, warn: err?.message }); // always 200 — MuzziBot retries on 500
     }
-    return res.json({ ok: true, id });
   });
 
   // ── POST /api/trade-signal/result — Update fill/close data ────────────────
   app.post("/api/trade-signal/result", (req, res) => {
-    const { id, ...rest } = req.body as { id: string; [key: string]: any };
-    if (!id) return res.status(400).json({ error: "id required" });
-    updateSignalResult(id, rest);
-    return res.json({ ok: true, id });
+    try {
+      const { id, source: _src, ...rest } = req.body as { id: string; source?: string; [key: string]: any };
+      if (!id) return res.status(400).json({ error: "id required" });
+      updateSignalResult(id, rest);
+      return res.json({ ok: true, id });
+    } catch (err: any) {
+      console.error('[result] error:', err?.message);
+      return res.json({ ok: true, warn: err?.message }); // always 200 — prevent MuzziBot retry flood
+    }
   });
 
   // ── GET /api/trade-signal/history — Last 50 signals with outcomes ──────────

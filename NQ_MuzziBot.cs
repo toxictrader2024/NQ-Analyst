@@ -260,7 +260,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!string.IsNullOrEmpty(sid))
                     ThreadPool.QueueUserWorkItem(delegate {
                         HttpPost(ServerUrl + "/api/trade-signal/result",
-                            "{\"id\":\"" + sid + "\",\"status\":\"cancelled\",\"source\":\"tradingview\"}");
+                            "{\"id\":\"" + sid + "\",\"status\":\"cancelled\",\"source\":\"ninjatrader\"}");
                     });
             }
         }
@@ -576,7 +576,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 + ",\"tp1\":"     + activeTp1.ToString("F2", CultureInfo.InvariantCulture)
                 + ",\"tp2\":"     + activeTp2.ToString("F2", CultureInfo.InvariantCulture)
                 + ",\"session\":\"" + sess + "\""
-                + ",\"source\":\"tradingview\"}";
+                + ",\"source\":\"ninjatrader\"}";
             ThreadPool.QueueUserWorkItem(delegate { HttpPost(url, body); });
         }
 
@@ -724,7 +724,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             string body = "{\"id\":\"" + sid + "\",\"status\":\"" + status + "\""
                 + ",\"detail\":\"" + extra + "\""
                 + ",\"session\":\"" + activeSession + "\""
-                + ",\"source\":\"tradingview\"}";
+                + ",\"source\":\"ninjatrader\"}";
             ThreadPool.QueueUserWorkItem(delegate { HttpPost(url, body); });
         }
 
