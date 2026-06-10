@@ -1,11 +1,12 @@
 /**
- * Signal Engine — patched v3
+ * Signal Engine — v4
  *
- * Changes:
- *  - NT8 remains the sole execution signal source.
- *  - Adds server-side RiskEngine gate before creating pending signals.
- *  - Persists signal updates back to SQLite JSON rows.
- *  - Keeps Sierra order-flow contradiction gate.
+ * Fixes applied:
+ *  #1  — Uses shared getDb() from db.ts (Railway persistent volume)
+ *  #2  — Hard 15:00 ET clock block in evaluateSignal()
+ *  #5  — 'entered' status treated as active in hasActiveSignal()
+ *  #7  — PnL uses $2/pt MNQ (not $20/pt NQ); prefers MuzziBot totalPnlPts
+ *  #10 — Session trade cap counts both directions combined (3 total per killzone)
  */
 
 export interface TradeSignal {
@@ -20,7 +21,7 @@ export interface TradeSignal {
   confidence: number;
   reason: string;
   createdAt: number;
-  status: 'pending' | 'received' | 'filled' | 'closed' | 'expired' | 'cancelled';
+  status: 'pending' | 'received' | 'entered' | 'filled' | 'closed' | 'expired' | 'cancelled';
   fillPrice?: number;
   fillTime?: string;
   exitPrice?: number;
@@ -31,16 +32,13 @@ export interface TradeSignal {
   closedAt?: number;
 }
 
-import Database from 'better-sqlite3';
 import path from 'path';
+import { getDb } from './db';
 import { evaluateRiskGate } from './RiskEngine';
 
-const dbPath = path.resolve(process.cwd(), 'data.db');
-const _db = new Database(dbPath);
-// WAL mode prevents reader/writer lock contention when MuzziBot fires
-// multiple concurrent POSTs (TP1 hit + trail + close all at once)
-_db.pragma('journal_mode = WAL');
-_db.pragma('busy_timeout = 3000'); // wait up to 3s instead of throwing SQLITE_BUSY
+// Single shared DB — all modules use getDb()
+const _db = getDb();
+
 _db.exec(`
   CREATE TABLE IF NOT EXISTS trade_signals (
     id TEXT PRIMARY KEY,
@@ -65,14 +63,13 @@ function dbLoadRecent(): TradeSignal[] {
 }
 
 const MAX_SIGNALS = 200;
-// On startup: load recent signals but immediately expire any pending signals
-// older than 2 minutes — prevents stale pending signals surviving a redeploy
+
+// On startup: load recent signals, expire stale pending (>2min) to prevent carry-over blocks
 const signals: TradeSignal[] = (() => {
   const loaded = dbLoadRecent();
   const TWO_MIN_MS = 2 * 60 * 1000;
   const now = Date.now();
   loaded.forEach(s => {
-    // Only expire real trade signals (must have direction) — skip SC/TV data rows
     if (!s.direction) return;
     if ((s.status === 'pending' || s.status === 'received') && (now - s.createdAt) > TWO_MIN_MS) {
       s.status = 'expired';
@@ -88,20 +85,61 @@ function generateId(): string {
   return `sig_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
+// ── Fix #5: treat 'entered' as active ───────────────────────────────────────
 function hasActiveSignal(): boolean {
   const TEN_MIN  = 10 * 60 * 1000;
   const TWO_MIN  =  2 * 60 * 1000;
   const now = Date.now();
   return signals.some(s => {
-    // Stale pending (>2min unconfirmed) = treat as expired, don't block new signal
+    // Stale pending (>2min unconfirmed) → expired, don't block
     if (s.status === 'pending' && (now - s.createdAt) > TWO_MIN) return false;
     if (s.status === 'pending') return true;
-    // received but not filled for >2min = stale, don't block
+    // received but not filled for >2min → stale
     if (s.status === 'received' && (now - s.createdAt) > TWO_MIN) return false;
     if (s.status === 'received') return true;
+    // FIX #5: 'entered' = MuzziBot received, submitted order — definitely active
+    if (s.status === 'entered') return true;
     if (s.status === 'filled' && (now - s.createdAt) < TEN_MIN) return true;
     return false;
   });
+}
+
+// ── Fix #2: 15:00 ET hard clock block ───────────────────────────────────────
+function isAfter15etHardBlock(): boolean {
+  try {
+    const etStr = new Date().toLocaleString('en-US', {
+      timeZone: 'America/New_York',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
+    const [h, m] = etStr.split(':').map(Number);
+    const etMin = h * 60 + m;
+    return etMin >= (15 * 60); // >= 15:00 ET
+  } catch {
+    return false;
+  }
+}
+
+// ── Fix #10: session trade cap — 3 TOTAL per killzone (not per direction) ───
+function countSessionTotal(sessionLabel: string): number {
+  const todayEt = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  return signals.filter(s => {
+    if (!s.session) return false;
+    const sameSession = normalizeKillzone(s.session) === normalizeKillzone(sessionLabel);
+    const isToday = new Date(s.createdAt).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) === todayEt;
+    return sameSession && isToday && ['pending', 'received', 'entered', 'filled', 'closed'].includes(s.status);
+  }).length;
+}
+
+function normalizeKillzone(session: string): string {
+  const s = session.toLowerCase().replace(/[\s-]/g, '_');
+  if (s.includes('london_close') || (s.includes('london') && s.includes('close'))) return 'london_close';
+  if (s.includes('ny_afternoon') || s.includes('afternoon')) return 'ny_afternoon';
+  if (s.includes('london')) return 'london';
+  if (s.includes('ny') || s.includes('new_york')) return 'ny_open';
+  if (s.includes('asia')) return 'asia';
+  return s;
 }
 
 function getSessionLabel(marketData: any, fallback: string): string {
@@ -114,16 +152,21 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   const price = marketData.close as number | null;
   if (!price) return null;
 
+  // ── Fix #2: Hard 15:00 ET block — no new signals at or after 3pm ET ────────
+  if (isAfter15etHardBlock()) {
+    console.log(`[SignalEngine][HardBlock] BLOCKED — past 15:00 ET hard cutoff`);
+    return null;
+  }
+
   if (hasActiveSignal()) return null;
 
-  // Support both explicit direction field AND long_signal/short_signal=1 from NT8 indicator
+  // NT8 is sole execution trigger
   let ntDirection = marketData.direction as string | undefined;
   if (!ntDirection) {
     if (marketData.long_signal  === 1) ntDirection = 'long';
     if (marketData.short_signal === 1) ntDirection = 'short';
   }
   if (ntDirection !== 'long' && ntDirection !== 'short') {
-    // HARD BLOCK: NT8 is sole execution trigger.
     return null;
   }
 
@@ -133,7 +176,7 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   const tp1 = marketData.nt_tp1 ?? (isLong ? entry + 30 : entry - 30);
   const tp2 = marketData.nt_tp2 ?? (isLong ? entry + 70 : entry - 70);
 
-  // Sierra order-flow contradiction gate.
+  // ── Fix #3 is in routes.ts — SC delta only present if fresh ─────────────────
   const scDelta = marketData.delta as number | null;
   const scAbsBull = marketData.absorptionBull as number | boolean | null;
   const scAbsBear = marketData.absorptionBear as number | boolean | null;
@@ -151,17 +194,11 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     const domBull = scBidStack !== null && scAskStack !== null && scAskStack > 0 && scBidStack > scAskStack * 2;
     const domBear = scBidStack !== null && scAskStack !== null && scBidStack > 0 && scAskStack > scBidStack * 2;
 
-    // BLOCK LONG: delta strongly negative (heavy selling) with no bullish confirmation
-    // Threshold lowered from -500 → -100 so moderate sell pressure blocks longs
     if (isLong && scDelta < -100 && !absBull && !imbBull && !domBull) {
       console.log(`[SignalEngine][SC VolumeGate] BLOCKED LONG @ ${entry} — delta=${scDelta}`);
       return null;
     }
 
-    // BLOCK SHORT: ANY positive delta blocks a short unless hard bearish confirmation exists.
-    // Previous threshold was +500 — far too loose. A +50 delta on a bull trend day
-    // is enough to invalidate a short. Now: block short if delta > +50 with no bearish
-    // confirmation, OR if delta is positive AND absBull is true (buyers absorbing supply).
     const positiveDeltaShortBlock = scDelta > 50 && !absBear && !imbBear && !domBear;
     const bullAbsorptionShortBlock = absBull && scDelta > 0 && !absBear;
     if (!isLong && (positiveDeltaShortBlock || bullAbsorptionShortBlock)) {
@@ -172,10 +209,7 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
 
   const sessionLabel = getSessionLabel(marketData, session);
 
-  // ── Hard session block: only trade defined killzones ────────────────────
-  // Allowed: London (2-5am ET), NY Open (7-11am ET), London Close (10-11am ET),
-  //          NY Afternoon (1:30-3pm ET) — trend continuation only, score > 65 required
-  // ny_close and any unknown session are hard-blocked.
+  // ── Session allowlist ────────────────────────────────────────────────────────
   const ALLOWED_SESSIONS = ['london', 'ny_open', 'london_close', 'ny_open_london_close', 'ny_afternoon'];
   const normalizedSession = sessionLabel.toLowerCase().replace(/[\s-]/g, '_');
   if (!ALLOWED_SESSIONS.some(s => normalizedSession.includes(s))) {
@@ -183,21 +217,24 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     return null;
   }
 
-  // ── NY Afternoon extra rules ─────────────────────────────────────────────────────
-  // Trend-continuation only: direction must match intraday bias
-  // Confidence (score) must be > 65 — no low-conviction afternoon trades
+  // ── Fix #10: 3 trades total per killzone per day ─────────────────────────────
+  const sessionCount = countSessionTotal(sessionLabel);
+  if (sessionCount >= 3) {
+    console.log(`[SignalEngine][KillzoneCap] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — session '${sessionLabel}' already has ${sessionCount}/3 trades today`);
+    return null;
+  }
+
+  // ── NY Afternoon extra rules ─────────────────────────────────────────────────
   if (normalizedSession.includes('ny_afternoon')) {
     const confidence = (marketData.confidence as number) ?? 0;
     const intradayBias = (marketData.htfBias ?? marketData.bias ?? '') as string;
     const biasDirection = intradayBias.toLowerCase().includes('bull') ? 'long'
                         : intradayBias.toLowerCase().includes('bear') ? 'short'
                         : null;
-    // Block if score too low
     if (confidence < 65) {
       console.log(`[SignalEngine][AfternoonBlock] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — score=${confidence} < 65 required for ny_afternoon`);
       return null;
     }
-    // Block counter-trend trades — if bias is clear, only trade with it
     if (biasDirection && biasDirection !== ntDirection) {
       console.log(`[SignalEngine][AfternoonBlock] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — counter-trend in ny_afternoon (bias=${intradayBias})`);
       return null;
@@ -272,10 +309,16 @@ export function updateSignalResult(id: string, data: Partial<TradeSignal>): void
     sig.fillTime = new Date().toISOString();
   }
 
+  // ── Fix #7: PnL — prefer MuzziBot's totalPnlPts; use $2/pt for MNQ ─────────
   if (data.exitPrice !== undefined && sig.direction) {
     const raw = sig.direction === 'long' ? data.exitPrice - sig.entry : sig.entry - data.exitPrice;
-    sig.pnlPoints = parseFloat(raw.toFixed(2));
-    sig.pnlDollars = parseFloat((raw * 20).toFixed(2));
+    // If MuzziBot sent pnlPoints directly, use it; otherwise compute from price diff
+    const pnlPts = (data.pnlPoints !== undefined && data.pnlPoints !== 0)
+      ? data.pnlPoints
+      : parseFloat(raw.toFixed(2));
+    sig.pnlPoints = pnlPts;
+    // MNQ: $2 per point × 4 contracts = $8 per point
+    sig.pnlDollars = parseFloat((pnlPts * 2 * 4).toFixed(2));
     sig.closedAt = Date.now();
   }
 
@@ -288,8 +331,6 @@ export function getRecentSignals(limit = 50): TradeSignal[] {
 }
 
 export function clearExpiredSignals(): void {
-  // Raised from 5min to 2min — MuzziBot polls every 5s so 2min is plenty
-  // Old 5min was too short when NT8/Railway had any latency
   const TWO_MIN_MS = 2 * 60 * 1000;
   const now = Date.now();
   signals.forEach(s => {
@@ -318,6 +359,6 @@ export function getSignalStats(): {
     totalTrades: closed.length,
     winRate: closed.length ? Math.round((wins / closed.length) * 100) : 0,
     avgPnlPoints: closed.length ? parseFloat((pnlPts / closed.length).toFixed(2)) : 0,
-    todayPnlDollars: parseFloat(todayPnlDollars.toFixed(2)),
+    todayPnlDollars,
   };
 }

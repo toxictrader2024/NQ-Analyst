@@ -1,16 +1,19 @@
 /**
- * RiskEngine.ts
+ * RiskEngine.ts — v2
  *
- * Central server-side risk gate for Muzzi AI.
- * Blocks new automated trade signals when daily/session limits are hit.
- * Uses the existing SQLite data.db trade_signals table used by signalEngine.ts.
+ * Fixes applied:
+ *  #1  — Uses shared getDb() from db.ts (Railway persistent volume)
+ *  #7  — Daily loss uses $2/pt × 4 contracts = $8/pt (MNQ, not NQ)
+ *  #10 — Session cap is combined-direction (3 total per killzone) — counting
+ *         is now done in signalEngine.ts countSessionTotal(); RiskEngine only
+ *         checks daily-loss and consecutive-loss limits
+ *  #11 — Removed 30-min cooldown-after-any-stop; cooldown lives only in
+ *         MuzziBot (20min after TP2). RiskEngine no longer blocks on stops.
  */
 
-import Database from 'better-sqlite3';
-import path from 'path';
+import { getDb } from './db';
 
-const dbPath = path.resolve(process.cwd(), 'data.db');
-const db = new Database(dbPath);
+const db = getDb();
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS risk_events (
@@ -24,15 +27,9 @@ db.exec(`
 
 export interface RiskConfig {
   enabled: boolean;
+  /** Daily loss limit in dollars — MNQ $2/pt × 4 = $8/pt */
   maxDailyLossDollars: number;
   maxConsecutiveLosses: number;
-  maxLondonLongs: number;
-  maxLondonShorts: number;
-  maxNyLongs: number;
-  maxNyShorts: number;
-  maxAsiaLongs: number;
-  maxAsiaShorts: number;
-  cooldownAfterStopMinutes: number;
   blockLunchEt: boolean;
   blockNewsMinuteWindows: boolean;
 }
@@ -45,15 +42,9 @@ export interface RiskDecision {
 
 export const DEFAULT_RISK_CONFIG: RiskConfig = {
   enabled: true,
-  maxDailyLossDollars: 1000,
+  /** $400 = 50pt loss × $8/pt (4 MNQ) — roughly 2.5 full stops before lockout */
+  maxDailyLossDollars: 400,
   maxConsecutiveLosses: 3,
-  maxLondonLongs: 3,
-  maxLondonShorts: 3,
-  maxNyLongs: 3,
-  maxNyShorts: 3,
-  maxAsiaLongs: 3,
-  maxAsiaShorts: 3,
-  cooldownAfterStopMinutes: 30,
   blockLunchEt: true,
   blockNewsMinuteWindows: true,
 };
@@ -73,19 +64,10 @@ function etMinutesNow(): number {
   return h * 60 + m;
 }
 
-function normalizeSession(session?: string): 'asia' | 'london' | 'ny' | 'other' {
-  const s = (session || '').toLowerCase();
-  if (s.includes('asia')) return 'asia';
-  if (s.includes('london')) return 'london';
-  if (s.includes('ny') || s.includes('new_york')) return 'ny';
-  return 'other';
-}
-
 function queryClosedToday(): any[] {
-  const start = new Date(`${todayEt()}T00:00:00-04:00`).getTime();
+  const start = new Date(`${todayEt()}T00:00:00`).getTime();
   return db.prepare(`
-    SELECT data, created_at, status
-    FROM trade_signals
+    SELECT data FROM trade_signals
     WHERE created_at >= ?
     ORDER BY created_at DESC
   `).all(start).map((row: any) => {
@@ -102,7 +84,7 @@ function consecutiveLosses(signals: any[]): number {
   let count = 0;
   const closed = signals
     .filter(s => s.status === 'closed' && s.result && s.result !== 'EXPIRED')
-    .sort((a, b) => b.createdAt - a.createdAt);
+    .sort((a: any, b: any) => b.createdAt - a.createdAt);
   for (const s of closed) {
     const isLoss = s.result === 'STOPPED' || (s.pnlPoints ?? 0) < 0;
     if (!isLoss) break;
@@ -111,30 +93,12 @@ function consecutiveLosses(signals: any[]): number {
   return count;
 }
 
-function recentStopCooldown(signals: any[], cooldownMinutes: number): boolean {
-  const cutoff = Date.now() - cooldownMinutes * 60 * 1000;
-  return signals.some(s =>
-    s.status === 'closed' &&
-    (s.result === 'STOPPED' || (s.pnlPoints ?? 0) < 0) &&
-    (s.closedAt ?? s.createdAt) >= cutoff
-  );
-}
-
-function countSessionDirection(signals: any[], session: string, direction: string): number {
-  return signals.filter(s => {
-    const sameSession = normalizeSession(s.session) === normalizeSession(session);
-    return sameSession && s.direction === direction && ['pending', 'received', 'filled', 'closed'].includes(s.status);
-  }).length;
-}
-
 function isLunchBlocked(): boolean {
   const m = etMinutesNow();
   return m >= (11 * 60 + 30) && m < (13 * 60);
 }
 
 function isNewsMinuteWindow(): boolean {
-  // Conservative generic lockout: +/- 5 minutes around :00 and :30.
-  // Replace with real economic calendar later.
   const minute = etMinutesNow() % 60;
   return minute <= 5 || (minute >= 25 && minute <= 35) || minute >= 55;
 }
@@ -149,9 +113,16 @@ export function evaluateRiskGate(args: {
   if (!cfg.enabled) return { allowed: true, reason: 'Risk engine disabled' };
 
   const signals = queryClosedToday();
+
+  // Fix #7: PnL uses MNQ $2/pt × 4 contracts.
+  // pnlDollars is now computed correctly in signalEngine.ts updateSignalResult().
+  // Here we trust pnlDollars if set; fallback computes as $8/pt.
   const todayPnl = signals
-    .filter(s => s.status === 'closed')
-    .reduce((sum, s) => sum + (s.pnlDollars ?? ((s.pnlPoints ?? 0) * 20)), 0);
+    .filter((s: any) => s.status === 'closed')
+    .reduce((sum: number, s: any) => {
+      if (s.pnlDollars !== undefined && s.pnlDollars !== null) return sum + s.pnlDollars;
+      return sum + ((s.pnlPoints ?? 0) * 8); // $2/pt × 4 contracts
+    }, 0);
 
   if (todayPnl <= -Math.abs(cfg.maxDailyLossDollars)) {
     const reason = `Daily loss lockout hit: $${todayPnl.toFixed(2)}`;
@@ -166,11 +137,8 @@ export function evaluateRiskGate(args: {
     return { allowed: false, reason, details: { lossStreak } };
   }
 
-  if (recentStopCooldown(signals, cfg.cooldownAfterStopMinutes)) {
-    const reason = `Cooldown active after stop/loss (${cfg.cooldownAfterStopMinutes} min)`;
-    logRiskEvent('cooldown_lockout', reason, { cooldownAfterStopMinutes: cfg.cooldownAfterStopMinutes });
-    return { allowed: false, reason };
-  }
+  // Fix #11: NO stop-cooldown in RiskEngine.
+  // Cooldown is managed exclusively by MuzziBot's 20-min-after-TP2 gate.
 
   if (cfg.blockLunchEt && isLunchBlocked()) {
     const reason = 'Lunch block active: 11:30–13:00 ET';
@@ -184,36 +152,25 @@ export function evaluateRiskGate(args: {
     return { allowed: false, reason };
   }
 
-  const sess = normalizeSession(args.session);
-  const dir = args.direction;
-  const count = countSessionDirection(signals, args.session, dir);
-  let maxAllowed = Infinity;
-  if (sess === 'london' && dir === 'long') maxAllowed = cfg.maxLondonLongs;
-  if (sess === 'london' && dir === 'short') maxAllowed = cfg.maxLondonShorts;
-  if (sess === 'ny' && dir === 'long') maxAllowed = cfg.maxNyLongs;
-  if (sess === 'ny' && dir === 'short') maxAllowed = cfg.maxNyShorts;
-  if (sess === 'asia' && dir === 'long') maxAllowed = cfg.maxAsiaLongs;
-  if (sess === 'asia' && dir === 'short') maxAllowed = cfg.maxAsiaShorts;
+  // Fix #10: per-session killzone cap is handled in signalEngine.ts countSessionTotal()
+  // RiskEngine no longer duplicates per-direction counts.
 
-  if (count >= maxAllowed) {
-    const reason = `Session trade limit hit: ${sess} ${dir} ${count}/${maxAllowed}`;
-    logRiskEvent('session_trade_limit', reason, { session: sess, direction: dir, count, maxAllowed });
-    return { allowed: false, reason, details: { session: sess, direction: dir, count, maxAllowed } };
-  }
-
-  return { allowed: true, reason: 'Risk checks passed', details: { todayPnl, lossStreak, sessionCount: count } };
+  return { allowed: true, reason: 'Risk checks passed', details: { todayPnl, lossStreak } };
 }
 
 export function getRiskSnapshot(): object {
   const signals = queryClosedToday();
-  const todayPnl = signals.filter(s => s.status === 'closed')
-    .reduce((sum, s) => sum + (s.pnlDollars ?? ((s.pnlPoints ?? 0) * 20)), 0);
+  const todayPnl = signals.filter((s: any) => s.status === 'closed')
+    .reduce((sum: number, s: any) => {
+      if (s.pnlDollars !== undefined) return sum + s.pnlDollars;
+      return sum + ((s.pnlPoints ?? 0) * 8);
+    }, 0);
   return {
     dateEt: todayEt(),
     todayPnlDollars: Number(todayPnl.toFixed(2)),
     consecutiveLosses: consecutiveLosses(signals),
-    closedTradesToday: signals.filter(s => s.status === 'closed').length,
-    pendingOrFilled: signals.filter(s => ['pending', 'received', 'filled'].includes(s.status)).length,
+    closedTradesToday: signals.filter((s: any) => s.status === 'closed').length,
+    pendingOrFilled: signals.filter((s: any) => ['pending', 'received', 'entered', 'filled'].includes(s.status)).length,
     config: DEFAULT_RISK_CONFIG,
   };
 }

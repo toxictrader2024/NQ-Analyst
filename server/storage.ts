@@ -19,8 +19,10 @@ import {
   type InsertScorecard,
 } from "@shared/schema";
 
-// Use Render persistent disk path if available, otherwise local
-const DB_PATH = process.env.RENDER_EXTERNAL_URL ? "/data/data.db" : "data.db";
+// Use Railway persistent volume if mounted, otherwise local dev fallback
+const DB_PATH = process.env.RAILWAY_VOLUME_MOUNT_PATH
+  ? require("path").join(process.env.RAILWAY_VOLUME_MOUNT_PATH, "data.db")
+  : "data.db";
 const sqlite = new Database(DB_PATH);
 const db = drizzle(sqlite);
 

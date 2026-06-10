@@ -52,6 +52,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double TP1;
         public double TP2;
         public string Session;
+        public DateTime ReceivedAt; // Fix #16: time signal was polled from Railway
     }
 
     public class NQ_MuzziBot : Strategy
@@ -447,12 +448,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // ny_close and any unknown session are rejected — no trade after 11am ET
                 bool allowedSession = rsess == "london" || rsess == "ny_open"
                                    || rsess == "london_close" || rsess == "ny_open_london_close"
-                                   || rsess == "ny_afternoon"  // 1:30-3pm ET trend continuation
-                                   || rsess == ""  // allow blank (Railway sets it correctly)
-                                   || rsess == "default";
-                if (!allowedSession)
+                                   || rsess == "ny_afternoon";  // 1:30-3pm ET trend continuation
+                // Fix #2: blank and "default" no longer free-pass — Railway now always sends killzone
+                // Fix #2: also block if current ET time >= 15:00 regardless of session label
+                DateTime etNow;
+                try { etNow = TimeZoneInfo.ConvertTime(DateTime.UtcNow, TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")); }
+                catch { etNow = DateTime.UtcNow.AddHours(-5); }
+                bool pastHardCutoff = etNow.Hour >= 15;
+
+                if (!allowedSession || pastHardCutoff)
                 {
-                    Print("[MuzziBot] BLOCKED signal id=" + rid + " — session '" + rsess + "' is not a valid killzone (london/ny_open/london_close only)");
+                    string blkReason = pastHardCutoff ? "past 15:00 ET hard cutoff" : "session '" + rsess + "' not in allowed killzones";
+                    Print("[MuzziBot] BLOCKED signal id=" + rid + " — " + blkReason);
+                    // Fix #5: cancel-back so Railway doesn't hold a stale signal
+                    HttpPost(ServerUrl + "/api/trade-signal/cancel", "{"id":"" + rid + ""}");
                     return;
                 }
 
@@ -462,7 +471,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 PendingSignal sig = new PendingSignal
                 {
                     Id = rid, Direction = rdir, Entry = rentry,
-                    SL = rsl, TP1 = rtp1, TP2 = rtp2, Session = rsess
+                    SL = rsl, TP1 = rtp1, TP2 = rtp2, Session = rsess,
+                    ReceivedAt = DateTime.Now // Fix #16
                 };
                 lock (pendingLock) { pendingExec = sig; hasPending = true; }
 
@@ -515,7 +525,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             activeSignalId  = id;
             activeDirection = dir;
             activeSession   = sess;
-            activeEntry     = Close[0];
+            // Fix #16: if signal is <10s old, use Railway signal entry price (pre-computed from NT8)
+            // If >10s elapsed since poll, fill drift has occurred — fall back to current Close[0]
+            bool signalIsFresh = ps.ReceivedAt != default(DateTime) && (DateTime.Now - ps.ReceivedAt).TotalSeconds < 10.0;
+            activeEntry = (signalIsFresh && ps.Entry > 0) ? ps.Entry : Close[0];
+            if (signalIsFresh && ps.Entry > 0)
+                Print("[MuzziBot] Using signal entry " + ps.Entry.ToString("F2") + " (signal age " + (DateTime.Now - ps.ReceivedAt).TotalSeconds.ToString("F1") + "s)");
+            else
+                Print("[MuzziBot] Using Close[0]=" + Close[0].ToString("F2") + " (signal age >" + (ps.ReceivedAt == default(DateTime) ? "?" : (DateTime.Now - ps.ReceivedAt).TotalSeconds.ToString("F1")) + "s)");
 
             activeSL  = isLong ? activeEntry - slPts  : activeEntry + slPts;
             activeTp1 = isLong ? activeEntry + tp1Pts : activeEntry - tp1Pts;
@@ -613,6 +630,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + " qty=" + quantity);
                 entryBar = CurrentBar;
 
+                // Fix #14: Fill-quantity reconciliation
+                // Track how many contracts actually filled. If a fill is short (e.g.
+                // broker partial fill), log it — we cannot safely trail with wrong qty.
+                if (quantity < HalfQty)
+                {
+                    Print("[MuzziBot][WARNING] Partial fill — expected " + HalfQty
+                        + " contracts, got " + quantity + ". Proceeding but verify position.");
+                }
+
                 string sl = activeSession == "" ? "DEFAULT"
                     : activeSession.ToUpperInvariant().Replace("_"," ");
                 DrawStatusLabel("IN TRADE x" + (HalfQty*2) + " | "
@@ -696,12 +722,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 string sid = activeSignalId;
-                PostStatus("closed", "outcome:" + outcome
-                    + ",exitPrice:" + fill.ToString("F2", CultureInfo.InvariantCulture)
-                    + ",totalPnlPts:" + totalPnl.ToString("F2", CultureInfo.InvariantCulture)
-                    + ",tp1PnlPts:" + tp1Pnl.ToString("F2", CultureInfo.InvariantCulture)
-                    + ",runnerPnlPts:" + runnerPnl.ToString("F2", CultureInfo.InvariantCulture)
-                    + ",trailActive:" + _trailActive.ToString().ToLower());
+                PostStatusClosed(outcome, fill, totalPnl); // Fix #6: real JSON fields
 
                 RemoveTradeLines();
                 ResetSignal();
@@ -722,9 +743,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Draw.Text(this, TagOut, "STOP " + pnl.ToString("F1"), 0,
                     fill - 4*TickSize, SlColor);
 
-                PostStatus("closed", "outcome:STOPPED"
-                    + ",exitPrice:" + fill.ToString("F2", CultureInfo.InvariantCulture)
-                    + ",totalPnlPts:" + pnl.ToString("F2", CultureInfo.InvariantCulture));
+                PostStatusClosed("STOPPED", fill, pnl); // Fix #6: real JSON fields
 
                 RemoveTradeLines();
                 ResetSignal();
@@ -739,7 +758,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             string body = "{\"id\":\"" + sid + "\",\"status\":\"" + status + "\""
                 + ",\"detail\":\"" + extra + "\""
                 + ",\"session\":\"" + activeSession + "\""
+                + ",\"source\":\"ninjatrader\"}
+
+        // Fix #6: PostStatusClosed sends result + exitPrice as real JSON fields
+        // (previously packed in detail string Railway couldn't parse)
+        private void PostStatusClosed(string outcome, double exitFill, double totalPnlPts)
+        {
+            string sid = activeSignalId ?? "?";
+            string url = ServerUrl + "/api/trade-signal/result";
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            string body = "{\"id\":\"" + sid + "\",\"status\":\"closed\""
+                + ",\"result\":\"" + outcome + "\""
+                + ",\"exitPrice\":" + exitFill.ToString("F2", ci)
+                + ",\"pnlPoints\":" + totalPnlPts.ToString("F2", ci)
+                + ",\"session\":\"" + activeSession + "\""
                 + ",\"source\":\"ninjatrader\"}";
+            ThreadPool.QueueUserWorkItem(delegate { HttpPost(url, body); });
+        }";
             ThreadPool.QueueUserWorkItem(delegate { HttpPost(url, body); });
         }
 

@@ -563,22 +563,25 @@ export function registerRoutes(httpServer: Server, app: Express) {
         const isTVWebhook = !body.source || body.source === 'tradingview' || body.source === 'ninjatrader';
         if (isTVWebhook) {
           const freshWebhooks = storage.getRecentWebhooks(10);
-          const { score, bias, orderFlowScore, tvLatest, scLatest } = scoreSetup(freshWebhooks);
+          // Fix #3: destructure scFresh so we can null SC data when it is stale
+          const { score, bias, orderFlowScore, tvLatest, scLatest, scFresh } = scoreSetup(freshWebhooks);
 
           // Build merged marketData object — ICT from TV/NT8, order flow from SC
           // BUG FIX: if source is ninjatrader, use body.close directly (NT8 sends actual price)
-          // tvLatest only includes tradingview-sourced webhooks — stale for NT8 signals
+          // Fix #3: if SC data is stale (scFresh=false), pass null for all SC fields so
+          // signalEngine treats it as "SC offline" and does NOT block on stale delta
+          const scData = scFresh ? scLatest : null;
           const ntPrice = body.source === 'ninjatrader' && body.close ? Number(body.close) : null;
           const mergedMarketData = {
             close: ntPrice ?? tvLatest?.close ?? scLatest?.close ?? null,
-            // ── SC Volume fields — all passed through to signalEngine volume gate ──
-            delta:          scLatest?.delta          ?? null,
-            absorptionBull: scLatest?.absorptionBull ?? null,
-            absorptionBear: scLatest?.absorptionBear ?? null,
-            imbalanceBull:  scLatest?.imbalanceBull  ?? null,
-            imbalanceBear:  scLatest?.imbalanceBear  ?? null,
-            bidStackSize:   scLatest?.bidStackSize   ?? null,
-            askStackSize:   scLatest?.askStackSize   ?? null,
+            // ── SC Volume fields — null if SC data is stale ──────────────────────
+            delta:          scData?.delta          ?? null,
+            absorptionBull: scData?.absorptionBull ?? null,
+            absorptionBear: scData?.absorptionBear ?? null,
+            imbalanceBull:  scData?.imbalanceBull  ?? null,
+            imbalanceBear:  scData?.imbalanceBear  ?? null,
+            bidStackSize:   scData?.bidStackSize   ?? null,
+            askStackSize:   scData?.askStackSize   ?? null,
             bias,
             score,
             orderFlowScore,
@@ -1216,6 +1219,22 @@ export function registerRoutes(httpServer: Server, app: Express) {
     } catch (err: any) {
       console.error('[confirm] error:', err?.message);
       return res.json({ ok: true, warn: err?.message }); // always 200 — MuzziBot retries on 500
+    }
+  });
+
+  // ── POST /api/trade-signal/cancel — Cancel a rejected signal (Fix #5) ──────
+  // Called by MuzziBot when it blocks a signal (bad session, past cutoff, etc.)
+  // Prevents Railway from holding a stale pending signal indefinitely.
+  app.post("/api/trade-signal/cancel", (req, res) => {
+    try {
+      const { id } = req.body as { id: string };
+      if (!id) return res.status(400).json({ error: "id required" });
+      updateSignalResult(id, { status: 'cancelled', result: 'EXPIRED', exitReason: 'MuzziBot rejected — bad session or past cutoff' });
+      console.log(`[cancel] Signal ${id} cancelled by MuzziBot`);
+      return res.json({ ok: true, id });
+    } catch (err: any) {
+      console.error('[cancel] error:', err?.message);
+      return res.status(500).json({ error: err?.message });
     }
   });
 

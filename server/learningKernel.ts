@@ -5,8 +5,7 @@
  * Keeps the same exports used by routes.ts.
  */
 
-import Database from 'better-sqlite3';
-import path from 'path';
+import { getDb } from './db';
 
 export interface LearningEntry {
   signalId: string;
@@ -47,8 +46,7 @@ export interface FeatureWeight {
   lastUpdated: number;
 }
 
-const dbPath = path.resolve(process.cwd(), 'data.db');
-const db = new Database(dbPath);
+const db = getDb();
 const EMA_ALPHA = 0.15;
 const MAX_ENTRIES = 500;
 
