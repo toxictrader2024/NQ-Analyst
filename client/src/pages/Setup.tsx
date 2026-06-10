@@ -192,7 +192,7 @@ export default function Setup() {
         <section className="bg-card border border-border rounded-xl p-5">
           <h2 className="text-sm font-semibold text-foreground mb-1">1. Your Webhook URL</h2>
           <p className="text-xs text-muted-foreground mb-3">
-            Use this URL as the webhook endpoint in TradingView alert settings.
+            Use this URL as the webhook endpoint in NinjaTrader (NQ_ICT_Signals_v7) and Sierra Chart (NQ Analyst Bridge) settings.
           </p>
           <div className="flex items-center gap-2 bg-muted rounded-lg p-3">
             <code className="text-xs font-mono text-primary flex-1 break-all" data-testid="text-webhook-url">{webhookUrl}</code>
@@ -231,9 +231,9 @@ export default function Setup() {
         <section className="bg-card border border-border rounded-xl p-5">
           <div className="flex items-center justify-between mb-3">
             <div>
-              <h2 className="text-sm font-semibold text-foreground">3. TradingView Pine Script</h2>
+              <h2 className="text-sm font-semibold text-foreground">3. NinjaTrader Indicator</h2>
               <p className="text-xs text-muted-foreground mt-0.5">
-                Add this indicator to your NQ chart. Set the webhook URL in the input, then create an alert → Webhook.
+                Load NQ_ICT_Signals_v7.cs in NinjaTrader 8 on the 1m NQ/MNQ chart. Set the Railway webhook URL in the indicator inputs. TradingView is not used — disable any TV alerts pointing to this URL.
               </p>
             </div>
             <Button

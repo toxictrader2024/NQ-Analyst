@@ -38,14 +38,14 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   orderFlowConfluences: string[];
   warnings: string[];
   hasOrderFlow: boolean;
-  tvLatest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;
-  tv15Latest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;
-  tv5Latest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;
-  tv1Latest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;
+  tvLatest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;   // kept for compat — now = ntLatest
+  tv15Latest: ReturnType<typeof storage.getRecentWebhooks>[number] | null; // now = nt15Latest
+  tv5Latest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;  // now = nt5Latest
+  tv1Latest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;  // now = nt1Latest
   scLatest: ReturnType<typeof storage.getRecentWebhooks>[number] | null;
-  tvFresh: boolean;
+  tvFresh: boolean;   // now = ntFresh
   scFresh: boolean;
-  tvAge: number;
+  tvAge: number;      // now = ntAge
   scAge: number;
 } {
   const confluences: string[] = [];
@@ -57,28 +57,35 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   let ofBearPoints = 0;
 
   // ── Split streams ──────────────────────────────────────────────────────────
-  // TradingView sends ICT signals; Sierra Chart sends order flow.
-  // Within TradingView we further split by timeframe:
+  // NinjaTrader sends ICT signals (source='ninjatrader'); Sierra Chart sends order flow.
+  // NT8 NQ_ICT_Signals_v7 posts on every bar with timeframe in payload:
   //   15m → session bias (trend direction)
   //   5m  → setup confirmation (structure / FVG / OB)
   //   1m  → trigger execution (MSS, delta flip, 3-bar play)
-  const tvWebhooks = webhooks.filter(w => w.source === 'tradingview' || (!w.source && w.killzone !== null));
+  // TradingView is NO LONGER used — alerts should be disabled in TV.
+  const ntWebhooks = webhooks.filter(w => w.source === 'ninjatrader' || w.source === 'tradingview' || (!w.source && w.killzone !== null));
   const scWebhooks = webhooks.filter(w => w.source === 'sierra_chart' || w.source === 'bookmap_cme');
 
-  // Timeframe sub-streams from TradingView
-  const tv15 = tvWebhooks.filter(w => String(w.timeframe) === "15" || String(w.timeframe) === "15m");
-  const tv5  = tvWebhooks.filter(w => String(w.timeframe) === "5"  || String(w.timeframe) === "5m");
-  const tv1  = tvWebhooks.filter(w => String(w.timeframe) === "1"  || String(w.timeframe) === "1m");
+  // Timeframe sub-streams from NinjaTrader
+  const nt15 = ntWebhooks.filter(w => String(w.timeframe) === "15" || String(w.timeframe) === "15m");
+  const nt5  = ntWebhooks.filter(w => String(w.timeframe) === "5"  || String(w.timeframe) === "5m");
+  const nt1  = ntWebhooks.filter(w => String(w.timeframe) === "1"  || String(w.timeframe) === "1m");
 
-  // Most recent per timeframe (fall back to general tvWebhooks if specific TF absent)
-  const tv15Latest = tv15[0] ?? null;
-  const tv5Latest  = tv5[0]  ?? null;
-  const tv1Latest  = tv1[0]  ?? null;
+  // Most recent per timeframe (fall back to general ntWebhooks if specific TF absent)
+  const nt15Latest = nt15[0] ?? null;
+  const nt5Latest  = nt5[0]  ?? null;
+  const nt1Latest  = nt1[0]  ?? null;
 
-  // tvLatest = best available for general ICT scoring (prefer 5m for setup, fall back to 15m)
-  const tvLatest = tv5Latest ?? tv15Latest ?? tvWebhooks[0] ?? null;
-  const tvAge = tvLatest ? Date.now() - tvLatest.receivedAt : Infinity;
-  const tvFresh = tvAge < 30 * 60 * 1000; // 30 min
+  // ntLatest = best available for general ICT scoring (prefer 5m for setup, fall back to 15m)
+  const ntLatest = nt5Latest ?? nt15Latest ?? ntWebhooks[0] ?? null;
+  const ntAge = ntLatest ? Date.now() - ntLatest.receivedAt : Infinity;
+  const ntFresh = ntAge < 30 * 60 * 1000; // 30 min
+
+  // Alias old tv* names → nt* so rest of scoring engine works unchanged
+  const tvWebhooks = ntWebhooks;
+  const tv15 = nt15; const tv5 = nt5; const tv1 = nt1;
+  const tv15Latest = nt15Latest; const tv5Latest = nt5Latest; const tv1Latest = nt1Latest;
+  const tvLatest = ntLatest; const tvAge = ntAge; const tvFresh = ntFresh;
 
   // Use most recent Sierra Chart webhook for order flow (up to 5 min old)
   const scLatest = scWebhooks[0] ?? null;
@@ -93,7 +100,7 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   // ── ICT Signals (from TradingView) ─────────────────────────────────────────
 
   if (!tvFresh) {
-    warnings.push("TradingView ICT signals stale (>30min) — order flow only");
+    warnings.push("NinjaTrader ICT signals stale (>30min) — check NT8 indicator is running");
   }
 
   // Killzone check

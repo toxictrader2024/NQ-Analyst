@@ -47,7 +47,7 @@ export default function Signals() {
         </div>
       ) : signals.length === 0 ? (
         <div className="text-center py-20 text-muted-foreground text-sm">
-          No signals yet. Connect TradingView webhook or use "Demo Signal" on the dashboard.
+          No signals yet. Ensure NQ_ICT_Signals_v7 is running in NinjaTrader 8 on the 1m chart and the market is open.
         </div>
       ) : (
         <div className="overflow-x-auto">

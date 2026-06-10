@@ -188,8 +188,8 @@ export default function Dashboard() {
                   {!tvFresh && (
                     <span>
                       {hasTVData
-                        ? `TradingView last seen ${tvAgeMin}m ago — check your NQ1! alert is active. `
-                        : "TradingView not connected — add the Pine Script alert pointing to your webhook URL. "}
+                        ? `NinjaTrader last seen ${tvAgeMin}m ago — check NQ_ICT_Signals_v7 is running on the 1m chart. `
+                        : "NinjaTrader not connected — ensure NQ_ICT_Signals_v7 indicator is loaded and market is open. "}
                     </span>
                   )}
                   {!scFresh && (

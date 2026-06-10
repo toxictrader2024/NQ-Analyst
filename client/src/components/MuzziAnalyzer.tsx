@@ -591,7 +591,7 @@ export default function MuzziAnalyzer() {
         </div>
         <p className="text-[10px] text-muted-foreground mt-3 leading-relaxed border-t border-border/40 pt-2">
           15m = bias/direction | 5m = setup structure | 1m = trigger execution.
-          Grey items require manual chart verification. Auto-detected items use live TradingView + Sierra Chart data.
+          Grey items require manual chart verification. Auto-detected items use live NinjaTrader + Sierra Chart data.
         </p>
       </div>
 
