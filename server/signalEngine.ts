@@ -32,7 +32,6 @@ export interface TradeSignal {
   closedAt?: number;
 }
 
-import path from 'path';
 import { getDb } from './db';
 import { evaluateRiskGate } from './RiskEngine';
 
@@ -258,6 +257,7 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     volParts.push('SC offline');
   }
 
+  const ntSigId = marketData.nt_signal_id ? ` | nt_id:${marketData.nt_signal_id}` : '';
   const signal: TradeSignal = {
     id: generateId(),
     direction: ntDirection,
@@ -265,7 +265,7 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     qty: 1,
     session: sessionLabel,
     confidence: marketData.confidence ?? 70,
-    reason: `${marketData.reasons ?? `NT8 ${ntDirection.toUpperCase()}`} | ${volParts.join(' | ')} | Risk: ${risk.reason}`,
+    reason: `${marketData.reasons ?? `NT8 ${ntDirection.toUpperCase()}`} | ${volParts.join(' | ')} | Risk: ${risk.reason}${ntSigId}`,
     createdAt: Date.now(),
     status: 'pending',
   };

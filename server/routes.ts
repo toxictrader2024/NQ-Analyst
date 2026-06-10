@@ -601,6 +601,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
             direction: body.source === 'ninjatrader' && body.direction ? String(body.direction) : undefined,
             confidence: body.confidence ? Number(body.confidence) : undefined,
             reasons: body.reasons ? String(body.reasons) : undefined,
+            // Fix M1/#17: forward NT8 signal_id for end-to-end correlation (stored in signal.reason)
+            nt_signal_id: body.signal_id ? String(body.signal_id) : undefined,
           };
 
           const newSignal = evaluateSignal(mergedMarketData, activeSession);
@@ -1271,7 +1273,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
       const d = new Date(s.createdAt).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
       return d === todayET && s.direction; // only real trades, not SC data rows
     });
-    const closed  = todayTrades.filter(s => s.status === 'closed' || s.status === 'cancelled');
+    const closed  = todayTrades.filter(s => s.status === 'closed'); // Fix M4: cancelled = never filled, excluded from win-rate
     const wins    = closed.filter(s => s.result === 'TP1' || s.result === 'TP2');
     const tp2s    = closed.filter(s => s.result === 'TP2');
     const stopped = closed.filter(s => s.result === 'STOPPED');

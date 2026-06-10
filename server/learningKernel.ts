@@ -104,7 +104,7 @@ function normalizeEntry(entry: any): Omit<LearningEntry, 'recordedAt'> {
     tp2Price: Number(entry.tp2Price ?? entry.tp2 ?? 0),
     exitPrice: Number(entry.exitPrice ?? 0),
     pnlPoints: Number(entry.pnlPoints ?? entry.pnlPts ?? 0),
-    pnlDollars: Number(entry.pnlDollars ?? ((entry.pnlPoints ?? entry.pnlPts ?? 0) * 20)),
+    pnlDollars: Number(entry.pnlDollars ?? ((entry.pnlPoints ?? entry.pnlPts ?? 0) * 8)), // Fix #7: MNQ $2/pt × 4 contracts = $8/pt
     result: String(entry.result ?? entry.outcome ?? 'UNKNOWN'),
     exitReason: String(entry.exitReason ?? ''),
     scDelta: Number(entry.scDelta ?? entry.delta ?? 0),

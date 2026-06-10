@@ -20,10 +20,15 @@ import {
 } from "@shared/schema";
 
 // Use Railway persistent volume if mounted, otherwise local dev fallback
-const DB_PATH = process.env.RAILWAY_VOLUME_MOUNT_PATH
-  ? require("path").join(process.env.RAILWAY_VOLUME_MOUNT_PATH, "data.db")
-  : "data.db";
+// DB_PATH: use Railway persistent volume if mounted, else local dev
+// Import DB_PATH from db.ts to keep one source of truth
+import { DB_PATH as SHARED_DB_PATH } from './db';
+const DB_PATH = SHARED_DB_PATH;
 const sqlite = new Database(DB_PATH);
+// Fix M3: set WAL + busy_timeout on the drizzle connection too
+// (getDb() sets these on its connection; without them here SQLITE_BUSY can throw immediately)
+sqlite.pragma('journal_mode = WAL');
+sqlite.pragma('busy_timeout = 5000');
 const db = drizzle(sqlite);
 
 // Migrations

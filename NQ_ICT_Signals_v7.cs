@@ -169,9 +169,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 MinConfLong    = 4;
                 MinConfShort   = 4;
                 CooldownBars   = 15;
-                SlPts          = 15;
-                Tp1Pts         = 20;
-                Tp2Pts         = 40;
+                SlPts          = 20;
+                Tp1Pts         = 30;
+                Tp2Pts         = 70;
 
                 FilterNyAm     = false;
                 FilterLondon   = false;
@@ -766,13 +766,13 @@ namespace NinjaTrader.NinjaScript.Indicators
         // completes, so the primary signal is State == State.Realtime. We keep a
         // time-based fallback for safety: with Calculate.OnBarClose on a 1m chart
         // a just-closed live bar's Time[0] is at most ~1 min old, comfortably
-        // under the 3-minute window. This guarantees IsInRealtimeMode() is true
+        // under the 1.5-minute window. This guarantees IsInRealtimeMode() is true
         // during live trading and false during historical replay/backfill.
         private bool IsInRealtimeMode()
         {
             if (State == State.Realtime) return true;
             // Fallback: if the bar's timestamp is within 3 minutes of now, we're live
-            return (DateTime.Now - Times[0][0]).TotalMinutes < 3;
+            return (DateTime.Now - Times[0][0]).TotalMinutes < 1.5;
         }
 
         private bool CheckBullLevel() { return CheckInBullFvg() || CheckAtBullOb(); }
@@ -828,11 +828,11 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             int hm = et.Hour * 100 + et.Minute;
             if (hm >= 200  && hm < 500)  return "london";
-            if (hm >= 700  && hm < 930)  return "ny_open";       // pre-open
-            if (hm >= 930  && hm < 1100) return "ny_open";       // NY AM killzone
-            if (hm >= 1000 && hm < 1100) return "london_close";  // London close overlap
+            if (hm >= 700  && hm < 930)  return "ny_open";       // pre-market / NY pre-open
+            if (hm >= 1000 && hm < 1100) return "london_close";  // London close overlap (MUST be before ny_open 930-1100)
+            if (hm >= 930  && hm < 1100) return "ny_open";       // NY AM killzone (930-1000 only)
             if (hm >= 1330 && hm < 1500) return "ny_afternoon";  // NY PM killzone
-            return "ny_open"; // fallback
+            return "off_session"; // Fix #8: off-hours correctly labeled
         }
 
         private void PostRailway(string dir, double e, double sl, double tp1, double tp2, string reason, string id, int conf)

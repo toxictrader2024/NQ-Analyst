@@ -461,7 +461,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     string blkReason = pastHardCutoff ? "past 15:00 ET hard cutoff" : "session '" + rsess + "' not in allowed killzones";
                     Print("[MuzziBot] BLOCKED signal id=" + rid + " — " + blkReason);
                     // Fix #5: cancel-back so Railway doesn't hold a stale signal
-                    HttpPost(ServerUrl + "/api/trade-signal/cancel", "{"id":"" + rid + ""}");
+                    HttpPost(ServerUrl + "/api/trade-signal/cancel", "{\"id\":\"" + rid + "\"}");
                     return;
                 }
 
@@ -758,10 +758,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             string body = "{\"id\":\"" + sid + "\",\"status\":\"" + status + "\""
                 + ",\"detail\":\"" + extra + "\""
                 + ",\"session\":\"" + activeSession + "\""
-                + ",\"source\":\"ninjatrader\"}
+                + ",\"source\":\"ninjatrader\"}";
+            ThreadPool.QueueUserWorkItem(delegate { HttpPost(url, body); });
+        }
 
-        // Fix #6: PostStatusClosed sends result + exitPrice as real JSON fields
-        // (previously packed in detail string Railway couldn't parse)
+        // Fix #6: PostStatusClosed — result+exitPrice as real JSON fields (not packed in detail string)
         private void PostStatusClosed(string outcome, double exitFill, double totalPnlPts)
         {
             string sid = activeSignalId ?? "?";
@@ -774,11 +775,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 + ",\"session\":\"" + activeSession + "\""
                 + ",\"source\":\"ninjatrader\"}";
             ThreadPool.QueueUserWorkItem(delegate { HttpPost(url, body); });
-        }";
-            ThreadPool.QueueUserWorkItem(delegate { HttpPost(url, body); });
         }
 
-        private void DrawHLine(string tag, double price, Brush color, string label)
+                private void DrawHLine(string tag, double price, Brush color, string label)
         {
             int barsAgo = Math.Max(0, CurrentBar - entryBar);
             Draw.Line(this, tag, false, barsAgo, price, -50, price, color, DashStyleHelper.Dash, 1);
