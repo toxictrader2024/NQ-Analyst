@@ -231,6 +231,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             // ── 1m primary series (index 0) ──────────────────────────────
             if (CurrentBar < Math.Max(SweepLookback, FvgScanBars) + 5) return;
 
+            // BIP=0 FIX: refresh HTF bias every 1m bar using loaded 15m data.
+            // Prevents htfBull15/htfBear15 staying false when BIP==1 never fires.
+            if (Closes[1].Count > 5) UpdateHTFBias15();
+
             // Draw any pending 15m OBs that were queued by RunOB15()
             // (drawing must happen from primary series context)
             DrawPendingOBs();
