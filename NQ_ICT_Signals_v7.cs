@@ -728,8 +728,11 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (structBear)             shortConf++;
             if (htfBear15)              shortConf++;
 
-            bool longValid  = htfBull15 && longLvl  && discount && longConf  >= MinConfLong  && atrOk;
-            bool shortValid = htfBear15 && shortLvl && premium  && shortConf >= MinConfShort && atrOk;
+            // htfBull15/htfBear15 contribute +1 to conf score above (lines 718/729).
+            // Removed as hard boolean gate — 15m series silent after reload was
+            // blocking ALL signals. MinConf threshold is sufficient filter.
+            bool longValid  = longLvl  && discount && longConf  >= MinConfLong  && atrOk;
+            bool shortValid = shortLvl && premium  && shortConf >= MinConfShort && atrOk;
 
             if (longValid)
             {
