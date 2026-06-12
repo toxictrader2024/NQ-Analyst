@@ -46,7 +46,12 @@ _db.exec(`
     status TEXT NOT NULL DEFAULT 'pending'
   );
 `);
+// Add columns for direct close-data writes — safe to run on every startup (IF NOT EXISTS)
 try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN data TEXT NOT NULL DEFAULT '{}'`); } catch (_) {}
+try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN result TEXT`); }       catch (_) {}
+try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN exit_price REAL`); }    catch (_) {}
+try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN pnl_points REAL`); }    catch (_) {}
+try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN fill_price REAL`); }    catch (_) {}
 
 function dbSave(sig: TradeSignal) {
   _db.prepare('INSERT OR REPLACE INTO trade_signals (id, data, created_at, status) VALUES (?, ?, ?, ?)')
@@ -293,15 +298,42 @@ export function confirmSignal(id: string): void {
 }
 
 export function updateSignalResult(id: string, data: Partial<TradeSignal>): void {
-  let sig = signals.find(s => s.id === id);
-  if (!sig) {
-    const row = _db.prepare('SELECT data FROM trade_signals WHERE id=?').get(id) as any;
-    if (row) {
-      sig = JSON.parse(row.data) as TradeSignal;
-      signals.unshift(sig);
+  // ── FIX: Always write critical close fields directly to DB first ──────────
+  // This ensures result/exitPrice/pnlPoints survive even if in-memory lookup
+  // fails (e.g. Railway restarted mid-session and cleared the signals array).
+  const directFields: string[] = [];
+  const directVals: any[] = [];
+  if (data.status     != null) { directFields.push('status = ?');      directVals.push(data.status); }
+  if (data.result     != null) { directFields.push('result = ?');      directVals.push(data.result); }
+  if ((data as any).exitPrice  != null) { directFields.push('exit_price = ?');  directVals.push((data as any).exitPrice); }
+  if ((data as any).pnlPoints  != null) { directFields.push('pnl_points = ?');  directVals.push((data as any).pnlPoints); }
+  if ((data as any).fillPrice  != null) { directFields.push('fill_price = ?');  directVals.push((data as any).fillPrice); }
+  if (directFields.length > 0) {
+    directVals.push(id);
+    try {
+      _db.prepare(`UPDATE trade_signals SET ${directFields.join(', ')} WHERE id = ?`).run(...directVals);
+      console.log(`[SignalEngine] DB direct-write for ${id}:`, data);
+    } catch (e: any) {
+      console.error(`[SignalEngine] DB direct-write failed for ${id}:`, e?.message);
     }
   }
-  if (!sig) return;
+
+  // ── In-memory update ─────────────────────────────────────────────────────
+  let sig = signals.find(s => s.id === id);
+  if (!sig) {
+    // Try to reload from DB — handles Railway restarts wiping in-memory array
+    const row = _db.prepare('SELECT data FROM trade_signals WHERE id=?').get(id) as any;
+    if (row) {
+      try {
+        sig = JSON.parse(row.data) as TradeSignal;
+        if (sig) { sig.id = id; signals.unshift(sig); } // ensure id is set
+      } catch { sig = undefined; }
+    }
+  }
+  if (!sig) {
+    console.warn(`[SignalEngine] updateSignalResult: signal ${id} not found in memory or DB — direct DB write already applied`);
+    return;
+  }
 
   Object.assign(sig, data);
 
@@ -309,20 +341,20 @@ export function updateSignalResult(id: string, data: Partial<TradeSignal>): void
     sig.fillTime = new Date().toISOString();
   }
 
-  // ── Fix #7: PnL — prefer MuzziBot's totalPnlPts; use $2/pt for MNQ ─────────
-  if (data.exitPrice !== undefined && sig.direction) {
-    const raw = sig.direction === 'long' ? data.exitPrice - sig.entry : sig.entry - data.exitPrice;
-    // If MuzziBot sent pnlPoints directly, use it; otherwise compute from price diff
-    const pnlPts = (data.pnlPoints !== undefined && data.pnlPoints !== 0)
-      ? data.pnlPoints
+  // ── Fix #7: PnL — prefer MuzziBot's pnlPoints; fallback to price diff ───────
+  const incomingPnl = (data as any).pnlPoints;
+  const incomingExit = (data as any).exitPrice;
+  if (incomingExit !== undefined && sig.direction) {
+    const raw = sig.direction === 'long' ? incomingExit - sig.entry : sig.entry - incomingExit;
+    const pnlPts = (incomingPnl !== undefined && incomingPnl !== 0)
+      ? incomingPnl
       : parseFloat(raw.toFixed(2));
-    sig.pnlPoints = pnlPts;
-    // MNQ: $2 per point × 4 contracts = $8 per point
-    sig.pnlDollars = parseFloat((pnlPts * 2 * 4).toFixed(2));
-    sig.closedAt = Date.now();
+    sig.pnlPoints  = pnlPts;
+    sig.pnlDollars = parseFloat((pnlPts * 2 * 4).toFixed(2)); // MNQ $8/pt
+    sig.closedAt   = Date.now();
   }
 
-  dbSave(sig);
+  dbSave(sig); // full JSON blob re-serialized with all updated fields
   console.log(`[SignalEngine] Updated signal ${id}:`, data);
 }
 
