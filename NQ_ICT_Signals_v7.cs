@@ -284,21 +284,34 @@ namespace NinjaTrader.NinjaScript.Indicators
         #region HTF Bias from 15m structure
         private void UpdateHTFBias15()
         {
+            // STALE SWING GUARD: if BIP=1 stopped firing after initial load, swingList15
+            // contains old historical swings that no longer reflect current price action.
+            // If the newest swing is more than 8 x 15m bars old relative to CurrentBars[1],
+            // the list is stale — skip swing structure and go straight to EMA fallback.
+            int newestSwingBar = 0;
+            for (int i = swingList15.Count - 1; i >= 0; i--)
+                if (swingList15[i].Bar > newestSwingBar) { newestSwingBar = swingList15[i].Bar; break; }
+            int currentBar15 = (BarsInProgress == 1) ? CurrentBar : CurrentBars[1];
+            bool swingsStale = (swingList15.Count < 4) || (currentBar15 - newestSwingBar > 8);
+
             double sh1 = double.NaN, sh2 = double.NaN;
             double sl1 = double.NaN, sl2 = double.NaN;
-            for (int i = swingList15.Count - 1; i >= 0 && (double.IsNaN(sh2) || double.IsNaN(sl2)); i--)
+            if (!swingsStale)
             {
-                var s = swingList15[i];
-                if (s.IsHigh)  { if (double.IsNaN(sh1)) sh1 = s.Price; else if (double.IsNaN(sh2)) sh2 = s.Price; }
-                else           { if (double.IsNaN(sl1)) sl1 = s.Price; else if (double.IsNaN(sl2)) sl2 = s.Price; }
+                for (int i = swingList15.Count - 1; i >= 0 && (double.IsNaN(sh2) || double.IsNaN(sl2)); i--)
+                {
+                    var s = swingList15[i];
+                    if (s.IsHigh)  { if (double.IsNaN(sh1)) sh1 = s.Price; else if (double.IsNaN(sh2)) sh2 = s.Price; }
+                    else           { if (double.IsNaN(sl1)) sl1 = s.Price; else if (double.IsNaN(sl2)) sl2 = s.Price; }
+                }
             }
             bool hh = !double.IsNaN(sh1) && !double.IsNaN(sh2) && sh1 > sh2;
             bool hl = !double.IsNaN(sl1) && !double.IsNaN(sl2) && sl1 > sl2;
             bool lh = !double.IsNaN(sh1) && !double.IsNaN(sh2) && sh1 < sh2;
             bool ll = !double.IsNaN(sl1) && !double.IsNaN(sl2) && sl1 < sl2;
 
-            if (hh && hl)      { htfBull15 = true;  htfBear15 = false; }
-            else if (lh && ll) { htfBull15 = false; htfBear15 = true;  }
+            if (!swingsStale && hh && hl) { htfBull15 = true;  htfBear15 = false; }
+            else if (!swingsStale && lh && ll) { htfBull15 = false; htfBear15 = true;  }
             else
             {
                 // Fallback: not enough swing data yet (e.g. after indicator reload).
