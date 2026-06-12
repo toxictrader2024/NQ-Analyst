@@ -54,8 +54,12 @@ try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN pnl_points REAL`); }    cat
 try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN fill_price REAL`); }    catch (_) {}
 
 function dbSave(sig: TradeSignal) {
-  _db.prepare('INSERT OR REPLACE INTO trade_signals (id, data, created_at, status) VALUES (?, ?, ?, ?)')
-    .run(sig.id, JSON.stringify(sig), sig.createdAt, sig.status);
+  // Include direction in INSERT to satisfy any NOT NULL constraint on that column
+  // from prior schema migrations on the Railway volume DB.
+  _db.prepare(`
+    INSERT OR REPLACE INTO trade_signals (id, data, created_at, status, direction)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(sig.id, JSON.stringify(sig), sig.createdAt, sig.status, sig.direction ?? null);
 }
 
 function dbLoadRecent(): TradeSignal[] {
