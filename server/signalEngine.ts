@@ -282,6 +282,24 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   return signal;
 }
 
+// Test-inject: bypasses time/session gating — for pipeline verification only
+export function injectTestSignal(direction: 'long'|'short', entry: number, sl: number, tp1: number, tp2: number, session = 'ny_open'): TradeSignal {
+  const id = generateId();
+  const sig: TradeSignal = {
+    id, direction, entry, sl, tp1, tp2, session,
+    status: 'pending', score: 99,
+    reason: 'TEST INJECT — pipeline verification',
+    source: 'ninjatrader',
+    createdAt: Date.now(),
+    qty: 4,
+    confidence: 5,
+  };
+  signals.unshift(sig);
+  dbSave(sig);
+  console.log(`[SignalEngine] TEST INJECT: ${id} ${direction} @ ${entry}`);
+  return sig;
+}
+
 export function getPendingSignal(): TradeSignal | null {
   const pending = signals.filter(s => s.status === 'pending');
   if (!pending.length) return null;

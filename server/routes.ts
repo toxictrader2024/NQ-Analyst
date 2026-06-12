@@ -22,6 +22,7 @@ import {
   updateSignalResult,
   getRecentSignals,
   getSignalStats,
+  injectTestSignal,
 } from "./signalEngine";
 
 const anthropic = new Anthropic({
@@ -622,6 +623,21 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // ── POST /api/debug-signal — Test evaluateSignal directly with NT8 payload ───
+  // ── POST /api/test-inject — Inject a fake signal bypassing time/session gates ──
+  // Used to verify the full pipeline (Railway → MuzziBot → PostStatusClosed) after deploys.
+  app.post("/api/test-inject", (req, res) => {
+    try {
+      const { direction = 'long', entry = 29500, sl, tp1, tp2, session = 'ny_open' } = req.body || {};
+      const slV  = sl  ?? (direction === 'long' ? entry - 20 : entry + 20);
+      const tp1V = tp1 ?? (direction === 'long' ? entry + 30 : entry - 30);
+      const tp2V = tp2 ?? (direction === 'long' ? entry + 70 : entry - 70);
+      const sig = injectTestSignal(direction, Number(entry), Number(slV), Number(tp1V), Number(tp2V), session);
+      return res.json({ ok: true, id: sig.id, direction: sig.direction, entry: sig.entry, sl: sig.sl, tp1: sig.tp1, tp2: sig.tp2, session: sig.session });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message });
+    }
+  });
+
   app.post("/api/debug-signal", (req, res) => {
     const body = req.body || {};
     const freshWebhooks = storage.getRecentWebhooks(10);
