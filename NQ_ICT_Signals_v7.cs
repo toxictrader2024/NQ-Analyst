@@ -53,6 +53,9 @@ namespace NinjaTrader.NinjaScript.Indicators
         [NinjaScriptProperty][Display(Name = "Min Conf Long",   GroupName = "Signals",   Order = 10)] public int    MinConfLong   { get; set; }
         [NinjaScriptProperty][Display(Name = "Min Conf Short",  GroupName = "Signals",   Order = 11)] public int    MinConfShort  { get; set; }
         [NinjaScriptProperty][Display(Name = "Cooldown Bars",   GroupName = "Signals",   Order = 12)] public int    CooldownBars  { get; set; }
+        [NinjaScriptProperty][Display(Name = "Trend Follow: Enabled",       GroupName = "Signals",   Order = 12)] public bool   TrendFollowEnabled { get; set; }
+        [NinjaScriptProperty][Display(Name = "Trend Follow: Min Swing Count",GroupName = "Signals",   Order = 13)] public int    TrendMinSwings     { get; set; }
+        [NinjaScriptProperty][Display(Name = "Trend Follow: Pullback Ticks",GroupName = "Signals",   Order = 14)] public int    TrendPullbackTicks { get; set; }
         [NinjaScriptProperty][Display(Name = "SL Points",       GroupName = "Signals",   Order = 13)] public double SlPts         { get; set; }
         [NinjaScriptProperty][Display(Name = "TP1 Points",      GroupName = "Signals",   Order = 14)] public double Tp1Pts        { get; set; }
         [NinjaScriptProperty][Display(Name = "TP2 Points",      GroupName = "Signals",   Order = 15)] public double Tp2Pts        { get; set; }
@@ -117,6 +120,16 @@ namespace NinjaTrader.NinjaScript.Indicators
         private int    lastSweepLoBar = -999;
         private int    lastSignalBar  = -999;
 
+        // Trend-follow state
+        private int    hhCount        = 0;   // consecutive HH count
+        private int    hlCount        = 0;   // consecutive HL count
+        private int    lhCount        = 0;   // consecutive LH count
+        private int    llCount        = 0;   // consecutive LL count
+        private double lastConfirmedSwingHi = double.NaN;  // most recent confirmed swing high level
+        private double lastConfirmedSwingLo = double.NaN;  // most recent confirmed swing low level
+        private bool   trendBull      = false;  // 2+ consecutive HH+HL
+        private bool   trendBear      = false;  // 2+ consecutive LH+LL
+
         // ATR series — initialized in DataLoaded, safe to call on every bar
         private ATR atrSeries;
 
@@ -169,6 +182,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 MinConfLong    = 4;
                 MinConfShort   = 4;
                 CooldownBars   = 15;
+                TrendFollowEnabled  = true;
+                TrendMinSwings      = 2;   // 2 consecutive HH+HL or LH+LL to confirm trend
+                TrendPullbackTicks  = 60;  // 15pts (60 ticks @ 0.25/tick) pullback to prior swing level
                 SlPts          = 20;
                 Tp1Pts         = 30;
                 Tp2Pts         = 70;
@@ -617,8 +633,19 @@ namespace NinjaTrader.NinjaScript.Indicators
                 double ph = High[swLen];
                 if (!double.IsNaN(lastSwingHigh))
                 {
-                    if (ph > lastSwingHigh) { structBull = true;  if (ShowStruct) Draw.Text(this, "HH_"+CurrentBar, "HH", swLen, ph+TickSize*6,  Brushes.Lime); }
-                    else                    {                      if (ShowStruct) Draw.Text(this, "LH_"+CurrentBar, "LH", swLen, ph+TickSize*6,  Brushes.OrangeRed); }
+                    if (ph > lastSwingHigh)
+                    {
+                        structBull = true;
+                        hhCount++; lhCount = 0;  // HH resets LH streak
+                        lastConfirmedSwingHi = lastSwingHigh; // prior HH becomes pullback target
+                        if (ShowStruct) Draw.Text(this, "HH_"+CurrentBar, "HH", swLen, ph+TickSize*6,  Brushes.Lime);
+                    }
+                    else
+                    {
+                        lhCount++; hhCount = 0;  // LH resets HH streak
+                        lastConfirmedSwingHi = lastSwingHigh;
+                        if (ShowStruct) Draw.Text(this, "LH_"+CurrentBar, "LH", swLen, ph+TickSize*6,  Brushes.OrangeRed);
+                    }
                 }
                 lastSwingHigh = ph;
             }
@@ -627,11 +654,25 @@ namespace NinjaTrader.NinjaScript.Indicators
                 double pl = Low[swLen];
                 if (!double.IsNaN(lastSwingLow))
                 {
-                    if (pl < lastSwingLow) { structBear = true;  if (ShowStruct) Draw.Text(this, "LL_"+CurrentBar, "LL", swLen, pl-TickSize*10, Brushes.OrangeRed); }
-                    else                   {                      if (ShowStruct) Draw.Text(this, "HL_"+CurrentBar, "HL", swLen, pl-TickSize*10, Brushes.Lime); }
+                    if (pl < lastSwingLow)
+                    {
+                        structBear = true;
+                        llCount++; hlCount = 0;  // LL resets HL streak
+                        lastConfirmedSwingLo = lastSwingLow; // prior LL becomes pullback target
+                        if (ShowStruct) Draw.Text(this, "LL_"+CurrentBar, "LL", swLen, pl-TickSize*10, Brushes.OrangeRed);
+                    }
+                    else
+                    {
+                        hlCount++; llCount = 0;  // HL resets LL streak
+                        lastConfirmedSwingLo = lastSwingLow;
+                        if (ShowStruct) Draw.Text(this, "HL_"+CurrentBar, "HL", swLen, pl-TickSize*10, Brushes.Lime);
+                    }
                 }
                 lastSwingLow = pl;
             }
+            // Update trend state: require TrendMinSwings consecutive matching swings
+            trendBull = (hhCount >= TrendMinSwings && hlCount >= TrendMinSwings);
+            trendBear = (lhCount >= TrendMinSwings && llCount >= TrendMinSwings);
             if (!double.IsNaN(lastSwingHigh) && Close[0] > lastSwingHigh && !structBull)
             { structBull=true; structBear=false; if (ShowStruct) Draw.Text(this, "MSS_B_"+CurrentBar, "MSS^", 0, Low[0]-TickSize*10,  Brushes.Lime); }
             if (!double.IsNaN(lastSwingLow)  && Close[0] < lastSwingLow  && !structBear)
@@ -776,6 +817,70 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Print("[ICT] SIGNAL SHORT " + e.ToString("F2") + " InRealtime=" + IsInRealtimeMode() + " PostToRailway=" + PostToRailway);
                 if (PostToRailway && IsInRealtimeMode()) { int capConf = shortConf; ThreadPool.QueueUserWorkItem(_ => PostRailway("short", e, sl, tp1, tp2, rsn, sigId, capConf)); }
                 Print("[ICT] SHORT " + shortConf + "/7 @ " + e.ToString("F2") + " | " + rsn);
+            }
+            else if (TrendFollowEnabled)
+            {
+                // ── TREND-FOLLOW MODE ─────────────────────────────────────────────
+                // Fires when 1m structure confirms a trend (2+ HH+HL or LH+LL)
+                // and price pulls back to within TrendPullbackTicks of the prior
+                // confirmed swing level (old resistance becomes support, vice versa).
+                // Lower conf threshold (3/5) since structure IS the level.
+                double pullbackPts = TrendPullbackTicks * TickSize;
+
+                // TREND LONG: trendBull active, price pulls back near prior swing high (now support)
+                bool nearPriorHi  = !double.IsNaN(lastConfirmedSwingHi) &&
+                                    Close[0] >= lastConfirmedSwingHi - pullbackPts &&
+                                    Close[0] <= lastConfirmedSwingHi + pullbackPts;
+                int trendLongConf = 0;
+                if (trendBull)              trendLongConf += 2; // trend structure = 2pts
+                if (htfBull15)              trendLongConf++;    // HTF confirms
+                if (cisdBull)               trendLongConf++;    // CISD adds conviction
+                if (sweepLo || recentSwpLo) trendLongConf++;    // local liquidity swept
+
+                bool trendLongValid = trendBull && nearPriorHi && trendLongConf >= 3 && atrOk;
+
+                // TREND SHORT: trendBear active, price pulls back near prior swing low (now resistance)
+                bool nearPriorLo  = !double.IsNaN(lastConfirmedSwingLo) &&
+                                    Close[0] <= lastConfirmedSwingLo + pullbackPts &&
+                                    Close[0] >= lastConfirmedSwingLo - pullbackPts;
+                int trendShortConf = 0;
+                if (trendBear)              trendShortConf += 2;
+                if (htfBear15)              trendShortConf++;
+                if (cisdBear)               trendShortConf++;
+                if (sweepHi || recentSwpHi) trendShortConf++;
+
+                bool trendShortValid = trendBear && nearPriorLo && trendShortConf >= 3 && atrOk;
+
+                if (trendLongValid)
+                {
+                    double e = Close[0], sl = e-SlPts, tp1 = e+Tp1Pts, tp2 = e+Tp2Pts;
+                    string rsn  = "TREND+" + trendLongConf + "/5 HH=" + hhCount + " HL=" + hlCount + " PB@" + lastConfirmedSwingHi.ToString("F2");
+                    string slbl = "TREND L " + trendLongConf + "/5\n" + rsn;
+                    Draw.TriangleUp(this,  "SIG_TL_"  + sigCount, false, 0, Low[0]-TickSize*10,  Brushes.Cyan);
+                    Draw.ArrowUp(this,     "SIG_TLA_" + sigCount, false, 0, Low[0]-TickSize*22,  Brushes.Cyan);
+                    Draw.Text(this,        "SIG_TLT_" + sigCount, slbl,  0, Low[0]-TickSize*38,  Brushes.Cyan);
+                    sigCount++;
+                    lastSignalBar = CurrentBar;
+                    string sigId = DateTime.Now.Ticks.ToString();
+                    Print("[ICT] SIGNAL TREND-LONG " + e.ToString("F2") + " InRealtime=" + IsInRealtimeMode() + " PostToRailway=" + PostToRailway);
+                    if (PostToRailway && IsInRealtimeMode()) { int cc = trendLongConf; ThreadPool.QueueUserWorkItem(_ => PostRailway("long", e, sl, tp1, tp2, rsn, sigId, cc)); }
+                    Print("[ICT] TREND-LONG " + trendLongConf + "/5 @ " + e.ToString("F2") + " | " + rsn);
+                }
+                else if (trendShortValid)
+                {
+                    double e = Close[0], sl = e+SlPts, tp1 = e-Tp1Pts, tp2 = e-Tp2Pts;
+                    string rsn  = "TREND+" + trendShortConf + "/5 LH=" + lhCount + " LL=" + llCount + " PB@" + lastConfirmedSwingLo.ToString("F2");
+                    string slbl = "TREND S " + trendShortConf + "/5\n" + rsn;
+                    Draw.TriangleDown(this, "SIG_TS_"  + sigCount, false, 0, High[0]+TickSize*10, Brushes.Orange);
+                    Draw.ArrowDown(this,    "SIG_TSA_" + sigCount, false, 0, High[0]+TickSize*22, Brushes.Orange);
+                    Draw.Text(this,         "SIG_TST_" + sigCount, slbl,  0, High[0]+TickSize*38, Brushes.Orange);
+                    sigCount++;
+                    lastSignalBar = CurrentBar;
+                    string sigId = DateTime.Now.Ticks.ToString();
+                    Print("[ICT] SIGNAL TREND-SHORT " + e.ToString("F2") + " InRealtime=" + IsInRealtimeMode() + " PostToRailway=" + PostToRailway);
+                    if (PostToRailway && IsInRealtimeMode()) { int cc = trendShortConf; ThreadPool.QueueUserWorkItem(_ => PostRailway("short", e, sl, tp1, tp2, rsn, sigId, cc)); }
+                    Print("[ICT] TREND-SHORT " + trendShortConf + "/5 @ " + e.ToString("F2") + " | " + rsn);
+                }
             }
         }
         #endregion
