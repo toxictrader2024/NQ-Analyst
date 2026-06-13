@@ -54,12 +54,36 @@ try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN pnl_points REAL`); }    cat
 try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN fill_price REAL`); }    catch (_) {}
 
 function dbSave(sig: TradeSignal) {
-  // Include direction in INSERT to satisfy any NOT NULL constraint on that column
-  // from prior schema migrations on the Railway volume DB.
-  _db.prepare(`
-    INSERT OR REPLACE INTO trade_signals (id, data, created_at, status, direction)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(sig.id, JSON.stringify(sig), sig.createdAt, sig.status, sig.direction ?? null);
+  // Write all columns that may have NOT NULL constraints from prior Railway DB migrations.
+  // The data JSON blob is the source of truth; individual columns are for DB-level queries.
+  const stmt = _db.prepare(`
+    INSERT OR REPLACE INTO trade_signals
+      (id, data, created_at, status, direction, entry, sl, tp1, tp2, session, source, confidence, score, reason)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  try {
+    stmt.run(
+      sig.id,
+      JSON.stringify(sig),
+      sig.createdAt ?? Date.now(),
+      sig.status   ?? 'pending',
+      sig.direction ?? null,
+      sig.entry     ?? null,
+      sig.sl        ?? null,
+      sig.tp1       ?? null,
+      sig.tp2       ?? null,
+      sig.session   ?? null,
+      sig.source    ?? 'ninjatrader',
+      sig.confidence ?? null,
+      sig.score      ?? null,
+      sig.reason     ?? null,
+    );
+  } catch (e: any) {
+    // Fallback: minimal insert if schema differs
+    console.error('[dbSave] full insert failed, trying minimal:', e?.message);
+    _db.prepare('INSERT OR REPLACE INTO trade_signals (id, data, created_at, status) VALUES (?, ?, ?, ?)')
+      .run(sig.id, JSON.stringify(sig), sig.createdAt ?? Date.now(), sig.status ?? 'pending');
+  }
 }
 
 function dbLoadRecent(): TradeSignal[] {
