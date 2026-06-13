@@ -38,51 +38,147 @@ import { evaluateRiskGate } from './RiskEngine';
 // Single shared DB — all modules use getDb()
 const _db = getDb();
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SCHEMA-AGNOSTIC PERSISTENCE
+//
+// PROBLEM (the bug this fixes):
+//   The Railway persistent-volume DB already contains a `trade_signals` table
+//   created by EARLIER migrations (see storage.ts, which defines the table with
+//   `direction TEXT NOT NULL`, `entry REAL NOT NULL`, `sl/tp1/tp2 REAL NOT NULL`,
+//   `created_at INTEGER NOT NULL`, `status TEXT NOT NULL`, etc.). Because
+//   `CREATE TABLE IF NOT EXISTS` is a no-op when the table already exists, the
+//   live schema on the volume is NOT the 4-column table this file assumed.
+//   The old hard-coded INSERT guessed a fixed column list and kept tripping
+//   `NOT NULL constraint failed` one column at a time (direction, then entry, …).
+//
+// FIX:
+//   At startup we read the ACTUAL live schema via PRAGMA table_info and build
+//   every INSERT dynamically. We write a value for EVERY column that exists,
+//   and we always supply a non-null value for any NOT NULL column without a
+//   default. This works whether the table has 4 columns or 20, and never needs
+//   to be updated when migrations change the schema.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Ensure SOME trade_signals table exists (no-op if the volume already has one).
+// We also guarantee a `data` JSON blob column exists — it is our source of truth
+// for reloading full signals. ALTER ... ADD COLUMN with a DEFAULT is safe on a
+// populated table; wrapped in try/catch in case the column already exists.
 _db.exec(`
   CREATE TABLE IF NOT EXISTS trade_signals (
     id TEXT PRIMARY KEY,
-    data TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
+    data TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending'
   );
 `);
-// Add columns for direct close-data writes — safe to run on every startup (IF NOT EXISTS)
 try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN data TEXT NOT NULL DEFAULT '{}'`); } catch (_) {}
-try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN result TEXT`); }       catch (_) {}
-try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN exit_price REAL`); }    catch (_) {}
-try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN pnl_points REAL`); }    catch (_) {}
-try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN fill_price REAL`); }    catch (_) {}
+
+// ── Live schema introspection ────────────────────────────────────────────────
+interface ColInfo { name: string; type: string; notnull: number; dflt_value: any; pk: number; }
+
+function readLiveColumns(): ColInfo[] {
+  try {
+    const rows = _db.prepare(`PRAGMA table_info(trade_signals)`).all() as any[];
+    return rows.map(r => ({
+      name: String(r.name),
+      type: String(r.type || '').toUpperCase(),
+      notnull: Number(r.notnull) || 0,
+      dflt_value: r.dflt_value,
+      pk: Number(r.pk) || 0,
+    }));
+  } catch (e: any) {
+    console.error('[dbSave] PRAGMA table_info failed:', e?.message);
+    return [];
+  }
+}
+
+let LIVE_COLUMNS: ColInfo[] = readLiveColumns();
+console.log(`[SignalEngine] trade_signals live schema (${LIVE_COLUMNS.length} cols): ` +
+  LIVE_COLUMNS.map(c => `${c.name}${c.notnull ? '!' : ''}`).join(', '));
+
+// Map a live DB column name to a value taken from the signal object.
+// Returns `undefined` if this column has no natural mapping (caller then picks
+// a type-safe fallback so NOT NULL columns never fail).
+function valueForColumn(col: ColInfo, sig: TradeSignal): any {
+  const s = sig as any;
+  switch (col.name) {
+    case 'id':          return sig.id;
+    case 'data':        return JSON.stringify(sig);
+    case 'created_at':  return sig.createdAt ?? Date.now();
+    case 'createdat':   return sig.createdAt ?? Date.now();
+    case 'status':      return sig.status ?? 'pending';
+    case 'direction':   return sig.direction ?? '';
+    case 'entry':       return sig.entry ?? 0;
+    case 'sl':          return sig.sl ?? 0;
+    case 'tp1':         return sig.tp1 ?? 0;
+    case 'tp2':         return sig.tp2 ?? 0;
+    case 'qty':         return sig.qty ?? 1;
+    case 'session':     return sig.session ?? '';
+    case 'confidence':  return sig.confidence ?? 0;
+    case 'score':       return s.score ?? sig.confidence ?? 0;
+    case 'reason':      return sig.reason ?? '';
+    case 'source':      return s.source ?? 'ninjatrader';
+    case 'fill_price':  return sig.fillPrice ?? null;
+    case 'fill_time':   return sig.fillTime ?? null;
+    case 'exit_price':  return sig.exitPrice ?? null;
+    case 'pnl_points':  return sig.pnlPoints ?? null;
+    case 'pnl_dollars': return sig.pnlDollars ?? null;
+    case 'exit_reason': return sig.exitReason ?? null;
+    case 'result':      return sig.result ?? null;
+    case 'closed_at':   return sig.closedAt ?? null;
+    default:            return undefined; // no natural mapping
+  }
+}
+
+// Pick a non-null fallback for a NOT NULL column we couldn't map, based on its
+// declared SQLite type affinity. Guarantees the INSERT never violates NOT NULL.
+function notNullFallback(col: ColInfo): any {
+  const t = col.type;
+  if (t.includes('INT') || t.includes('REAL') || t.includes('FLOA') || t.includes('DOUB') || t.includes('NUM')) return 0;
+  return ''; // TEXT / BLOB / unknown affinity
+}
 
 function dbSave(sig: TradeSignal) {
-  // Write all columns that may have NOT NULL constraints from prior Railway DB migrations.
-  // The data JSON blob is the source of truth; individual columns are for DB-level queries.
-  const stmt = _db.prepare(`
-    INSERT OR REPLACE INTO trade_signals
-      (id, data, created_at, status, direction, entry, sl, tp1, tp2, session, source, confidence, score, reason)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+  // Refresh the schema if it somehow appears empty (e.g. first call raced startup).
+  if (!LIVE_COLUMNS.length) LIVE_COLUMNS = readLiveColumns();
+
+  // Build the column list + values dynamically from the LIVE schema.
+  const cols: string[] = [];
+  const vals: any[] = [];
+  for (const col of LIVE_COLUMNS) {
+    let v = valueForColumn(col, sig);
+    if (v === undefined) {
+      // Column not produced by the signal object.
+      if (col.notnull && col.dflt_value === null) {
+        // NOT NULL with no DB default → must supply a non-null value.
+        v = notNullFallback(col);
+      } else {
+        // Nullable or has a default → skip so the DB default applies.
+        continue;
+      }
+    }
+    cols.push(col.name);
+    vals.push(v);
+  }
+
+  if (cols.length) {
+    try {
+      const placeholders = cols.map(() => '?').join(', ');
+      const sql = `INSERT OR REPLACE INTO trade_signals (${cols.map(c => `"${c}"`).join(', ')}) VALUES (${placeholders})`;
+      _db.prepare(sql).run(...vals);
+      return;
+    } catch (e: any) {
+      console.error('[dbSave] dynamic insert failed, trying minimal fallback:', e?.message);
+    }
+  }
+
+  // Last-resort minimal insert (id + data + created_at + status are guaranteed
+  // to exist because we create/ensure them above).
   try {
-    stmt.run(
-      sig.id,
-      JSON.stringify(sig),
-      sig.createdAt ?? Date.now(),
-      sig.status   ?? 'pending',
-      sig.direction ?? null,
-      sig.entry     ?? null,
-      sig.sl        ?? null,
-      sig.tp1       ?? null,
-      sig.tp2       ?? null,
-      sig.session   ?? null,
-      sig.source    ?? 'ninjatrader',
-      sig.confidence ?? null,
-      sig.score      ?? null,
-      sig.reason     ?? null,
-    );
-  } catch (e: any) {
-    // Fallback: minimal insert if schema differs
-    console.error('[dbSave] full insert failed, trying minimal:', e?.message);
-    _db.prepare('INSERT OR REPLACE INTO trade_signals (id, data, created_at, status) VALUES (?, ?, ?, ?)')
+    _db.prepare(`INSERT OR REPLACE INTO trade_signals (id, data, created_at, status) VALUES (?, ?, ?, ?)`)
       .run(sig.id, JSON.stringify(sig), sig.createdAt ?? Date.now(), sig.status ?? 'pending');
+  } catch (e: any) {
+    console.error('[dbSave] minimal fallback also failed:', e?.message);
   }
 }
 
