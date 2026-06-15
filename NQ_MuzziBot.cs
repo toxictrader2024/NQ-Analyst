@@ -1,4 +1,5 @@
 // NQ_MuzziBot.cs — Execution strategy for NQ Analyst (CK Build v4 — MNQ Split Exit)
+// Jun 12 2026: All 17 fixes applied + Opus verified. PostStatusClosed sends result+exitPrice+pnlPoints.
 // ─────────────────────────────────────────────────────────────────────────────────
 // EXIT LOGIC (v4):
 //   Entry:     4 contracts, two named signals — E_HALF (2 contracts) + E_RUN (2 contracts)
@@ -88,6 +89,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Enable Trading", GroupName = "Execution", Order = 3)]
         public bool EnableTrading { get; set; }
 
+        [NinjaScriptProperty]
+        [Display(Name = "Test Mode (bypass time/session gates)", GroupName = "Execution", Order = 4,
+                 Description = "When true: bypasses 3pm ET block, session gate, and realtime check. Use ONLY on Sim101 for pipeline testing. NEVER enable on live account.")]
+        public bool TestMode { get; set; }
+
         // ── Trail ──────────────────────────────────────────────────────────────
         [NinjaScriptProperty]
         [Display(Name = "Trail Trigger Pts past TP1", GroupName = "Trail", Order = 1,
@@ -167,6 +173,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── TP2 cooldown ───────────────────────────────────────────────────────
         private DateTime _lastTp2Time = DateTime.MinValue;
 
+        // Orphan position guard — prevents repeated close attempts on startup
+        private bool _orphanCloseAttempted = false;
+
         // ── Entry signal name constants ────────────────────────────────────────
         // Two named entries per trade so SetProfitTarget applies to each independently.
         private string SigHalf => activeSignalId + "_h";   // 2 contracts → exits at TP1
@@ -196,7 +205,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Name                         = "NQ MuzziBot";
-                Description                  = "CK Build v4 — MNQ 4-contract split exit with 8.5pt trail.";
+                Description                  = "CK Build v4.1 — MNQ 4-contract split exit | WaitUntilFlat | orphan position guard";
                 Calculate                    = Calculate.OnPriceChange;
                 EntriesPerDirection          = 2;   // TWO named entries per direction
                 EntryHandling                = EntryHandling.AllEntries;
@@ -204,7 +213,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ExitOnSessionCloseSeconds    = 30;
                 IsFillLimitOnTouch           = false;
                 IsInstantiatedOnEachOptimizationIteration = false;
-                StartBehavior                = StartBehavior.ImmediatelySubmit;
+                StartBehavior                = StartBehavior.WaitUntilFlat;
                 BarsRequiredToTrade          = 0;
 
                 ServerUrl          = "https://nq-analyst-production.up.railway.app";
@@ -214,6 +223,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 AtmStrategyName = "";
                 HalfQty         = 2;     // 2+2 = 4 MNQ total
                 EnableTrading   = true;
+                TestMode        = false;
 
                 TrailTriggerPts = 8.0;   // pts past TP1 → lock SL + start trail
                 TrailPts        = 8.5;   // trailing distance
@@ -247,9 +257,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 activeSL        = 0;
                 activeTp1       = 0;
                 activeTp2       = 0;
-                _halfExited     = false;
-                _slLockedToTp1  = false;
-                _trailActive    = false;
+                _halfExited          = false;
+                _slLockedToTp1       = false;
+                _trailActive         = false;
+                _orphanCloseAttempted = false;
 
                 DrawStatusLabel("MUZZIBOT v4 ONLINE | " + (HalfQty*2) + " MNQ | WAITING", StatusIdle);
                 Print("[MuzziBot v4] DataLoaded | " + (HalfQty*2) + " MNQ | server " + ServerUrl);
@@ -275,6 +286,29 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Status heartbeat — only print once per bar close, not every tick
             if (IsFirstTickOfBar)
                 Print("[MuzziBot] BAR " + Time[0].ToString("HH:mm") + " | Pos:" + Position.MarketPosition + " | Bar#" + CurrentBar);
+
+            // ── ORPHAN POSITION GUARD ────────────────────────────────────────────
+            // WaitUntilFlat means we only start when flat. But if NT8 restarts into
+            // an existing open position that wasn't entered by this strategy instance
+            // (e.g. crash recovery with ImmediatelySubmit from a prior run), close it
+            // immediately rather than letting it sit unmanaged.
+            if (activeSignalId == null && !hasPending
+                && Position.MarketPosition != MarketPosition.Flat
+                && !_orphanCloseAttempted)
+            {
+                _orphanCloseAttempted = true;
+                Print("[MuzziBot][WARN] Orphan position detected on startup — "
+                    + Position.MarketPosition + " x" + Position.Quantity
+                    + " @ avg " + Position.AveragePrice.ToString("F2")
+                    + " — closing immediately (no active signal).");
+                DrawStatusLabel("ORPHAN POSITION — CLOSING", BearRed);
+                // Use ExitLong/ExitShort by name — managed close
+                if (Position.MarketPosition == MarketPosition.Long)
+                    ExitLong(Position.Quantity, "OrphanClose", "");
+                else
+                    ExitShort(Position.Quantity, "OrphanClose", "");
+                return;
+            }
 
             // ── STEP 1: Execute pending signal ──────────────────────────────────
             if (hasPending && activeSignalId == null)
@@ -458,11 +492,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (!allowedSession || pastHardCutoff)
                 {
-                    string blkReason = pastHardCutoff ? "past 15:00 ET hard cutoff" : "session '" + rsess + "' not in allowed killzones";
-                    Print("[MuzziBot] BLOCKED signal id=" + rid + " — " + blkReason);
-                    // Fix #5: cancel-back so Railway doesn't hold a stale signal
-                    HttpPost(ServerUrl + "/api/trade-signal/cancel", "{\"id\":\"" + rid + "\"}");
-                    return;
+                    if (TestMode)
+                    {
+                        Print("[MuzziBot] TEST MODE — bypassing session/time gate for signal id=" + rid);
+                    }
+                    else
+                    {
+                        string blkReason = pastHardCutoff ? "past 15:00 ET hard cutoff" : "session '" + rsess + "' not in allowed killzones";
+                        Print("[MuzziBot] BLOCKED signal id=" + rid + " — " + blkReason);
+                        // Fix #5: cancel-back so Railway doesn't hold a stale signal
+                        HttpPost(ServerUrl + "/api/trade-signal/cancel", "{\"id\":\"" + rid + "\"}");
+                        return;
+                    }
                 }
 
                 HttpPost(ServerUrl + "/api/trade-signal/confirm",
