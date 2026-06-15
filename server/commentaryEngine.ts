@@ -315,7 +315,7 @@ Use exact NQ price numbers. Be a prop desk analyst, not a textbook.`;
 
   try {
     const msg = await anthropic.messages.create({
-      model: "claude-sonnet-4",
+      model: "claude-sonnet-4-5",
       max_tokens: 400,
       messages: [{ role: "user", content: prompt }],
     });
@@ -479,7 +479,7 @@ export function startPulse() {
 
     try {
       const msg = await anthropic.messages.create({
-        model: "claude-sonnet-4",
+        model: "claude-sonnet-4-5",
         max_tokens: 350,
         messages: [{ role: "user", content: prompt }],
       });
