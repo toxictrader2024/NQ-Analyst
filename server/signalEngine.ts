@@ -231,7 +231,13 @@ function hasActiveSignal(): boolean {
     return false;
   });
 }
-
+  // ── Stale price guard — block signals if NT8 data is >3 minutes old ─────────
+  // Prevents 300pt stale-entry signals when NT8 disconnects mid-session.
+  const ntDataAge = marketData.ntDataAge as number | undefined;
+  if (ntDataAge !== undefined && ntDataAge > 180_000) {
+    console.log(`[SignalEngine][StalePrice] BLOCKED ${marketData.direction ?? '?'} @ ${price} — NT8 data is ${Math.round(ntDataAge / 1000)}s old (max 180s)`);
+    return null;
+  }
 // ── Fix #2: 15:00 ET hard clock block ───────────────────────────────────────
 function isAfter15etHardBlock(): boolean {
   try {
