@@ -588,7 +588,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // and queues the next signal without waiting for 2min expiry
                 string cancelId = id;
                 ThreadPool.QueueUserWorkItem(_ => {
-                    try { HttpPost(ServerUrl + "/api/trade-signal/cancel", "{"id":"" + cancelId + ""}"); }
+                    try { HttpPost(ServerUrl + "/api/trade-signal/cancel", "{\"id\":\"" + cancelId + "\"}"); }
                     catch {}
                 });
                 return;
