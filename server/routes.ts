@@ -129,8 +129,7 @@ function scoreSetup(webhooks: ReturnType<typeof storage.getRecentWebhooks>): {
   const nt1Latest  = nt1[0]  ?? null;
   const ntLatest   = nt5Latest ?? nt15Latest ?? ntWebhooks[0] ?? null;
   const ntAge      = ntLatest ? Date.now() - ntLatest.receivedAt : Infinity;
-  const ntFresh    = ntAge < 30 * 60 * 1000;
-
+  const ntFresh = ntAge < 3 * 60 * 1000; // 3 minutes — was 30min, caused stale price signals
   // Alias for backwards compat
   const tvLatest   = ntLatest;
   const tv15Latest = nt15Latest;
@@ -591,9 +590,11 @@ export function registerRoutes(httpServer: Server, app: Express) {
           const ntPrice = isNT8 && body.close ? Number(body.close) : null;
 
           // ROUTE-003: correctly read nt_sl/nt_tp1/nt_tp2 (not body.sl/body.tp1/body.tp2)
-          const mergedMarketData = {
-            close:          ntPrice ?? tvLatest?.close ?? scLatest?.close ?? null,
-            delta:          scData?.delta          ?? null,
+     const mergedMarketData = {
+  close:          ntPrice ?? tvLatest?.close ?? scLatest?.close ?? null,
+  ntDataAge:      ntLatest ? Date.now() - ntLatest.receivedAt : undefined, // stale price guard
+  delta:          scData?.delta          ?? null,
+            
             absorptionBull: scData?.absorptionBull ?? null,
             absorptionBear: scData?.absorptionBear ?? null,
             imbalanceBull:  scData?.imbalanceBull  ?? null,
