@@ -583,7 +583,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + " = " + priceDeviation.ToString("F1") + "pts deviation (max " + MaxEntryDeviation + "pts)"
                     + " | id=" + id);
                 hasPending      = false;
-                pendingSignal   = null;
+                pendingExec     = default(PendingSignal);
                 // Post rejection back to Railway so it clears the signal
                 PostStatus("rejected_stale", "deviation:" + priceDeviation.ToString("F1") + "pts");
                 return;
