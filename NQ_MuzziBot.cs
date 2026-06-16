@@ -69,6 +69,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int PollIntervalSec { get; set; }
 
         [NinjaScriptProperty]
+        [Range(5, 500)]
+        [Display(Name = "Max Entry Deviation (pts)", GroupName = "Server", Order = 6,
+                 Description = "Max pts current price can differ from signal entry before rejecting as stale. Default 50pts.")]
+        public double MaxEntryDeviation { get; set; }
+
+        [NinjaScriptProperty]
         [Range(0, 120)]
         [Display(Name = "Post-TP2 Cooldown Min", GroupName = "Server", Order = 3,
                  Description = "Minutes to block new entries after TP2 closes all contracts.")]
@@ -218,6 +224,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 ServerUrl          = "https://nq-analyst-production.up.railway.app";
                 PollIntervalSec    = 5;
+                MaxEntryDeviation  = 50;
                 PostTp2CooldownMin = 20;
 
                 AtmStrategyName = "";
@@ -564,18 +571,35 @@ namespace NinjaTrader.NinjaScript.Strategies
             double slPts, tp1Pts, tp2Pts;
             GetSessionRisk(sess, out slPts, out tp1Pts, out tp2Pts);
 
+            // ── Stale price deviation guard ──────────────────────────────────────
+            // If current price has moved more than MaxEntryDeviation pts from the
+            // Railway signal entry, the signal is too stale to trade safely.
+            // Reject it and clear the pending flag so the next signal can come through.
+            double priceDeviation = ps.Entry > 0 ? Math.Abs(Close[0] - ps.Entry) : 0;
+            if (ps.Entry > 0 && priceDeviation > MaxEntryDeviation)
+            {
+                Print("[MuzziBot] STALE SIGNAL REJECTED — signal entry " + ps.Entry.ToString("F2")
+                    + " vs current " + Close[0].ToString("F2")
+                    + " = " + priceDeviation.ToString("F1") + "pts deviation (max " + MaxEntryDeviation + "pts)"
+                    + " | id=" + id);
+                hasPending      = false;
+                pendingSignal   = null;
+                // Post rejection back to Railway so it clears the signal
+                PostStatus("rejected_stale", "deviation:" + priceDeviation.ToString("F1") + "pts");
+                return;
+            }
+
             tradeCount++;
             activeSignalId  = id;
             activeDirection = dir;
             activeSession   = sess;
-            // Fix #16: if signal is <10s old, use Railway signal entry price (pre-computed from NT8)
-            // If >10s elapsed since poll, fill drift has occurred — fall back to current Close[0]
-            bool signalIsFresh = ps.ReceivedAt != default(DateTime) && (DateTime.Now - ps.ReceivedAt).TotalSeconds < 10.0;
-            activeEntry = (signalIsFresh && ps.Entry > 0) ? ps.Entry : Close[0];
-            if (signalIsFresh && ps.Entry > 0)
-                Print("[MuzziBot] Using signal entry " + ps.Entry.ToString("F2") + " (signal age " + (DateTime.Now - ps.ReceivedAt).TotalSeconds.ToString("F1") + "s)");
-            else
-                Print("[MuzziBot] Using Close[0]=" + Close[0].ToString("F2") + " (signal age >" + (ps.ReceivedAt == default(DateTime) ? "?" : (DateTime.Now - ps.ReceivedAt).TotalSeconds.ToString("F1")) + "s)");
+            // Always anchor SL/TP to current Close[0] — we enter at market, so
+            // risk MUST be calculated from actual fill price, not Railway signal entry.
+            // Railway entry is a reference level only.
+            activeEntry = Close[0];
+            Print("[MuzziBot] Entry anchor: Close[0]=" + Close[0].ToString("F2")
+                + " | Signal ref=" + (ps.Entry > 0 ? ps.Entry.ToString("F2") : "N/A")
+                + " | Deviation=" + priceDeviation.ToString("F1") + "pts");
 
             activeSL  = isLong ? activeEntry - slPts  : activeEntry + slPts;
             activeTp1 = isLong ? activeEntry + tp1Pts : activeEntry - tp1Pts;
