@@ -480,8 +480,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // ── Hard session block (second line of defense after Railway) ───────
                 // Only allowed killzones: london, ny_open, london_close
                 // ny_close and any unknown session are rejected — no trade after 11am ET
-                bool allowedSession = rsess == "london" || rsess == "ny_open"
-                                   || rsess == "london_close" || rsess == "ny_open_london_close"
+                bool allowedSession = rsess == "london" || rsess == "london_open"
+                                   || rsess == "ny_open" || rsess == "london_close"
+                                   || rsess == "ny_open_london_close"
                                    || rsess == "ny_afternoon";  // 1:30-3pm ET trend continuation
                 // Fix #2: blank and "default" no longer free-pass — Railway now always sends killzone
                 // Fix #2: also block if current ET time >= 15:00 regardless of session label
@@ -535,6 +536,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             switch (session)
             {
                 case "london":
+                case "london_open":
                     slPts = LondonSlPts; tp1Pts = LondonTp1Pts; tp2Pts = LondonTp2Pts; break;
                 case "ny_open":
                 case "london_close":
