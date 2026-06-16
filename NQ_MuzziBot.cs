@@ -584,8 +584,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + " | id=" + id);
                 hasPending      = false;
                 pendingExec     = default(PendingSignal);
-                // Post rejection back to Railway so it clears the signal
-                PostStatus("rejected_stale", "deviation:" + priceDeviation.ToString("F1") + "pts");
+                // Call /cancel so Railway clears hasActiveSignal() immediately
+                // and queues the next signal without waiting for 2min expiry
+                string cancelId = id;
+                ThreadPool.QueueUserWorkItem(_ => {
+                    try { HttpPost(ServerUrl + "/api/trade-signal/cancel", "{"id":"" + cancelId + ""}"); }
+                    catch {}
+                });
                 return;
             }
 
