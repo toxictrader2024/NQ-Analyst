@@ -286,6 +286,13 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   const price = marketData.close as number | null;
   if (!price) return null;
 
+ // ── Stale price guard ─────────────────────────────────────────────────────
+  const ntDataAge = marketData.ntDataAge as number | undefined;
+  if (ntDataAge !== undefined && ntDataAge > 180_000) {
+    console.log(`[SignalEngine][StalePrice] BLOCKED ${marketData.direction ?? '?'} @ ${price} — NT8 data is ${Math.round(ntDataAge / 1000)}s old (max 180s)`);
+    return null;
+  } 
+
   // ── Fix #2: Hard 15:00 ET block — no new signals at or after 3pm ET ────────
   if (isAfter15etHardBlock()) {
     console.log(`[SignalEngine][HardBlock] BLOCKED — past 15:00 ET hard cutoff`);
