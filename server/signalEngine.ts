@@ -183,7 +183,7 @@ function dbSave(sig: TradeSignal) {
 }
 
 function dbLoadRecent(): TradeSignal[] {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000; // only load last 2 hours
   const rows = _db.prepare('SELECT data FROM trade_signals WHERE created_at > ? ORDER BY created_at DESC LIMIT 200').all(cutoff) as any[];
   return rows.map(r => {
     try { return JSON.parse(r.data); } catch { return null; }
@@ -216,7 +216,7 @@ function generateId(): string {
 // ── Fix #5: treat 'entered' as active ───────────────────────────────────────
 function hasActiveSignal(): boolean {
   const TEN_MIN  = 10 * 60 * 1000;
-  const TWO_MIN  =  2 * 60 * 1000;
+  const TWO_MIN_MS = 1 * 60 * 1000; // 1 minute
   const now = Date.now();
   return signals.some(s => {
     // Stale pending (>2min unconfirmed) → expired, don't block
