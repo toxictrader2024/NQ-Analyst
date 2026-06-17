@@ -281,7 +281,7 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
 
  // ── Stale price guard ─────────────────────────────────────────────────────
   const ntDataAge = marketData.ntDataAge as number | undefined;
-  if (ntDataAge !== undefined && ntDataAge > 180_000) {
+  if (ntDataAge !== undefined && ntDataAge > 60_000) {
     console.log(`[SignalEngine][StalePrice] BLOCKED ${marketData.direction ?? '?'} @ ${price} — NT8 data is ${Math.round(ntDataAge / 1000)}s old (max 180s)`);
     return null;
   } 
