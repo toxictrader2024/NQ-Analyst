@@ -629,7 +629,7 @@ ntDataAge: tvLatest ? Date.now() - (tvLatest as any).receivedAt : undefined,
             `conf=${mergedMarketData.confidence ?? "?"} ` +
             `nt_sl=${mergedMarketData.nt_sl ?? "?"} nt_tp1=${mergedMarketData.nt_tp1 ?? "?"} nt_tp2=${mergedMarketData.nt_tp2 ?? "?"}`
           );
-
+          if(!isNT8) return res.json({ ok: true, id: saved.id });
           const newSignal = evaluateSignal(mergedMarketData, activeSession);
           if (newSignal) {
             console.log(`[Signal] ✅ CREATED: ${newSignal.direction.toUpperCase()} @ ${newSignal.entry} id=${newSignal.id}`);
