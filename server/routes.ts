@@ -592,7 +592,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
           // ROUTE-003: correctly read nt_sl/nt_tp1/nt_tp2 (not body.sl/body.tp1/body.tp2)
      const mergedMarketData = {
   close:          ntPrice ?? tvLatest?.close ?? scLatest?.close ?? null,
-ntDataAge: tvLatest ? Date.now() - (tvLatest as any).receivedAt : undefined,
+ntDataAge: isNT8 ? 0 : (tvLatest ? Date.now() - (tvLatest as any).receivedAt : undefined),
   delta:          scData?.delta          ?? null,
             
             absorptionBull: scData?.absorptionBull ?? null,
