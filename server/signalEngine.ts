@@ -220,10 +220,10 @@ function hasActiveSignal(): boolean {
   const now = Date.now();
   return signals.some(s => {
     // Stale pending (>2min unconfirmed) → expired, don't block
-    if (s.status === 'pending' && (now - s.createdAt) > TWO_MIN) return false;
+    if (s.status === 'pending' && (now - s.createdAt) > TWO_MIN_MS) return false;
     if (s.status === 'pending') return true;
     // received but not filled for >2min → stale
-    if (s.status === 'received' && (now - s.createdAt) > TWO_MIN) return false;
+    if (s.status === 'received' && (now - s.createdAt) > TWO_MIN_MS) return false;
     if (s.status === 'received') return true;
     // FIX #5: 'entered' = MuzziBot received, submitted order — definitely active
     if (s.status === 'entered') return true;
