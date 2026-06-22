@@ -1,5 +1,5 @@
 /**
- * Signal Engine — v4
+ * Signal Engine — v5
  *
  * Fixes applied:
  *  #1  — Uses shared getDb() from db.ts (Railway persistent volume)
@@ -7,6 +7,12 @@
  *  #5  — 'entered' status treated as active in hasActiveSignal()
  *  #7  — PnL uses $2/pt MNQ (not $20/pt NQ); prefers MuzziBot totalPnlPts
  *  #10 — Session trade cap counts both directions combined (3 total per killzone)
+ *  #11 — SC VolumeGate now uses NT8's own payload CVD/delta/dom fields instead
+ *         of Railway's cached SC snapshot. NT8 already baked SC flow into its
+ *         confidence score — Railway's gate should use the same snapshot NT8 used,
+ *         not a fresher one that may contradict the scored setup.
+ *         SHORT veto threshold raised: delta>300 (was >50), absorption only blocks
+ *         if delta also >200 (was >0). Mild positive delta no longer kills shorts.
  */
 
 export interface TradeSignal {
@@ -40,29 +46,8 @@ const _db = getDb();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SCHEMA-AGNOSTIC PERSISTENCE
-//
-// PROBLEM (the bug this fixes):
-//   The Railway persistent-volume DB already contains a `trade_signals` table
-//   created by EARLIER migrations (see storage.ts, which defines the table with
-//   `direction TEXT NOT NULL`, `entry REAL NOT NULL`, `sl/tp1/tp2 REAL NOT NULL`,
-//   `created_at INTEGER NOT NULL`, `status TEXT NOT NULL`, etc.). Because
-//   `CREATE TABLE IF NOT EXISTS` is a no-op when the table already exists, the
-//   live schema on the volume is NOT the 4-column table this file assumed.
-//   The old hard-coded INSERT guessed a fixed column list and kept tripping
-//   `NOT NULL constraint failed` one column at a time (direction, then entry, …).
-//
-// FIX:
-//   At startup we read the ACTUAL live schema via PRAGMA table_info and build
-//   every INSERT dynamically. We write a value for EVERY column that exists,
-//   and we always supply a non-null value for any NOT NULL column without a
-//   default. This works whether the table has 4 columns or 20, and never needs
-//   to be updated when migrations change the schema.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Ensure SOME trade_signals table exists (no-op if the volume already has one).
-// We also guarantee a `data` JSON blob column exists — it is our source of truth
-// for reloading full signals. ALTER ... ADD COLUMN with a DEFAULT is safe on a
-// populated table; wrapped in try/catch in case the column already exists.
 _db.exec(`
   CREATE TABLE IF NOT EXISTS trade_signals (
     id TEXT PRIMARY KEY,
@@ -73,7 +58,6 @@ _db.exec(`
 `);
 try { _db.exec(`ALTER TABLE trade_signals ADD COLUMN data TEXT NOT NULL DEFAULT '{}'`); } catch (_) {}
 
-// ── Live schema introspection ────────────────────────────────────────────────
 interface ColInfo { name: string; type: string; notnull: number; dflt_value: any; pk: number; }
 
 function readLiveColumns(): ColInfo[] {
@@ -96,9 +80,6 @@ let LIVE_COLUMNS: ColInfo[] = readLiveColumns();
 console.log(`[SignalEngine] trade_signals live schema (${LIVE_COLUMNS.length} cols): ` +
   LIVE_COLUMNS.map(c => `${c.name}${c.notnull ? '!' : ''}`).join(', '));
 
-// Map a live DB column name to a value taken from the signal object.
-// Returns `undefined` if this column has no natural mapping (caller then picks
-// a type-safe fallback so NOT NULL columns never fail).
 function valueForColumn(col: ColInfo, sig: TradeSignal): any {
   const s = sig as any;
   switch (col.name) {
@@ -126,34 +107,27 @@ function valueForColumn(col: ColInfo, sig: TradeSignal): any {
     case 'exit_reason': return sig.exitReason ?? null;
     case 'result':      return sig.result ?? null;
     case 'closed_at':   return sig.closedAt ?? null;
-    default:            return undefined; // no natural mapping
+    default:            return undefined;
   }
 }
 
-// Pick a non-null fallback for a NOT NULL column we couldn't map, based on its
-// declared SQLite type affinity. Guarantees the INSERT never violates NOT NULL.
 function notNullFallback(col: ColInfo): any {
   const t = col.type;
   if (t.includes('INT') || t.includes('REAL') || t.includes('FLOA') || t.includes('DOUB') || t.includes('NUM')) return 0;
-  return ''; // TEXT / BLOB / unknown affinity
+  return '';
 }
 
 function dbSave(sig: TradeSignal) {
-  // Refresh the schema if it somehow appears empty (e.g. first call raced startup).
   if (!LIVE_COLUMNS.length) LIVE_COLUMNS = readLiveColumns();
 
-  // Build the column list + values dynamically from the LIVE schema.
   const cols: string[] = [];
   const vals: any[] = [];
   for (const col of LIVE_COLUMNS) {
     let v = valueForColumn(col, sig);
     if (v === undefined) {
-      // Column not produced by the signal object.
       if (col.notnull && col.dflt_value === null) {
-        // NOT NULL with no DB default → must supply a non-null value.
         v = notNullFallback(col);
       } else {
-        // Nullable or has a default → skip so the DB default applies.
         continue;
       }
     }
@@ -172,8 +146,6 @@ function dbSave(sig: TradeSignal) {
     }
   }
 
-  // Last-resort minimal insert (id + data + created_at + status are guaranteed
-  // to exist because we create/ensure them above).
   try {
     _db.prepare(`INSERT OR REPLACE INTO trade_signals (id, data, created_at, status) VALUES (?, ?, ?, ?)`)
       .run(sig.id, JSON.stringify(sig), sig.createdAt ?? Date.now(), sig.status ?? 'pending');
@@ -183,7 +155,7 @@ function dbSave(sig: TradeSignal) {
 }
 
 function dbLoadRecent(): TradeSignal[] {
-  const cutoff = Date.now() - 2 * 60 * 60 * 1000; // only load last 2 hours
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
   const rows = _db.prepare('SELECT data FROM trade_signals WHERE created_at > ? ORDER BY created_at DESC LIMIT 200').all(cutoff) as any[];
   return rows.map(r => {
     try { return JSON.parse(r.data); } catch { return null; }
@@ -192,7 +164,6 @@ function dbLoadRecent(): TradeSignal[] {
 
 const MAX_SIGNALS = 200;
 
-// On startup: load recent signals, expire stale pending (>2min) to prevent carry-over blocks
 const signals: TradeSignal[] = (() => {
   const loaded = dbLoadRecent();
   const TWO_MIN_MS = 2 * 60 * 1000;
@@ -213,25 +184,21 @@ function generateId(): string {
   return `sig_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
-// ── Fix #5: treat 'entered' as active ───────────────────────────────────────
 function hasActiveSignal(): boolean {
-  const TEN_MIN  = 10 * 60 * 1000;
-  const TWO_MIN_MS = 1 * 60 * 1000; // 1 minute
+  const TEN_MIN    = 10 * 60 * 1000;
+  const TWO_MIN_MS =  1 * 60 * 1000;
   const now = Date.now();
   return signals.some(s => {
-    // Stale pending (>2min unconfirmed) → expired, don't block
-    if (s.status === 'pending' && (now - s.createdAt) > TWO_MIN_MS) return false;
-    if (s.status === 'pending') return true;
-    // received but not filled for >2min → stale
+    if (s.status === 'pending'  && (now - s.createdAt) > TWO_MIN_MS) return false;
+    if (s.status === 'pending')  return true;
     if (s.status === 'received' && (now - s.createdAt) > TWO_MIN_MS) return false;
     if (s.status === 'received') return true;
-    // FIX #5: 'entered' = MuzziBot received, submitted order — definitely active
-    if (s.status === 'entered') return true;
+    if (s.status === 'entered')  return true;
     if (s.status === 'filled' && (now - s.createdAt) < TEN_MIN) return true;
     return false;
   });
 }
-// ── Fix #2: 15:00 ET hard clock block ───────────────────────────────────────
+
 function isAfter15etHardBlock(): boolean {
   try {
     const etStr = new Date().toLocaleString('en-US', {
@@ -241,14 +208,12 @@ function isAfter15etHardBlock(): boolean {
       hour12: false,
     });
     const [h, m] = etStr.split(':').map(Number);
-    const etMin = h * 60 + m;
-    return etMin >= (15 * 60); // >= 15:00 ET
+    return h * 60 + m >= 15 * 60;
   } catch {
     return false;
   }
 }
 
-// ── Fix #10: session trade cap — 3 TOTAL per killzone (not per direction) ───
 function countSessionTotal(sessionLabel: string): number {
   const todayEt = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
   return signals.filter(s => {
@@ -279,14 +244,14 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   const price = marketData.close as number | null;
   if (!price) return null;
 
- // ── Stale price guard ─────────────────────────────────────────────────────
+  // ── Stale price guard ──────────────────────────────────────────────────────
   const ntDataAge = marketData.ntDataAge as number | undefined;
   if (ntDataAge !== undefined && ntDataAge > 60_000) {
-    console.log(`[SignalEngine][StalePrice] BLOCKED ${marketData.direction ?? '?'} @ ${price} — NT8 data is ${Math.round(ntDataAge / 1000)}s old (max 180s)`);
+    console.log(`[SignalEngine][StalePrice] BLOCKED ${marketData.direction ?? '?'} @ ${price} — NT8 data is ${Math.round(ntDataAge / 1000)}s old (max 60s)`);
     return null;
-  } 
+  }
 
-  // ── Fix #2: Hard 15:00 ET block — no new signals at or after 3pm ET ────────
+  // ── Hard 15:00 ET block ────────────────────────────────────────────────────
   if (isAfter15etHardBlock()) {
     console.log(`[SignalEngine][HardBlock] BLOCKED — past 15:00 ET hard cutoff`);
     return null;
@@ -294,56 +259,85 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
 
   if (hasActiveSignal()) return null;
 
-  // NT8 is sole execution trigger
+  // ── Direction from NT8 payload ─────────────────────────────────────────────
   let ntDirection = marketData.direction as string | undefined;
   if (!ntDirection) {
     if (marketData.long_signal  === 1) ntDirection = 'long';
     if (marketData.short_signal === 1) ntDirection = 'short';
   }
-  if (ntDirection !== 'long' && ntDirection !== 'short') {
-    return null;
-  }
+  if (ntDirection !== 'long' && ntDirection !== 'short') return null;
 
   const isLong = ntDirection === 'long';
-  const entry = price;
-  const sl = marketData.nt_sl ?? (isLong ? entry - 20 : entry + 20);
-  const tp1 = marketData.nt_tp1 ?? (isLong ? entry + 30 : entry - 30);
-  const tp2 = marketData.nt_tp2 ?? (isLong ? entry + 70 : entry - 70);
+  const entry  = price;
+  const sl     = marketData.nt_sl  ?? (isLong ? entry - 20 : entry + 20);
+  const tp1    = marketData.nt_tp1 ?? (isLong ? entry + 30 : entry - 30);
+  const tp2    = marketData.nt_tp2 ?? (isLong ? entry + 70 : entry - 70);
 
-  // ── Fix #3 is in routes.ts — SC delta only present if fresh ─────────────────
-  const scDelta = marketData.delta as number | null;
-  const scAbsBull = marketData.absorptionBull as number | boolean | null;
-  const scAbsBear = marketData.absorptionBear as number | boolean | null;
-  const scImbBull = marketData.imbalanceBull as number | boolean | null;
-  const scImbBear = marketData.imbalanceBear as number | boolean | null;
-  const scBidStack = marketData.bidStackSize as number | null;
-  const scAskStack = marketData.askStackSize as number | null;
-  const scHasFreshData = scDelta !== null && scDelta !== undefined;
+  // ── FIX #11: SC VolumeGate — use NT8's own payload SC values ──────────────
+  //
+  // PROBLEM: Railway was reading delta/absorptionBull from its own cached SC
+  // snapshot (latestScData), which could be fresher than what NT8 used when it
+  // scored the setup. A SHORT scored by NT8 with CVD=-565 was blocked because
+  // Railway's snapshot had refreshed to delta=+185/absBull=true by the time the
+  // POST arrived. The gate contradicted the signal's own scoring basis.
+  //
+  // FIX: Prefer NT8's own SC fields sent in the webhook payload:
+  //   - body.cvd  → NT8's CVD reading at signal time (from its PollSCState call)
+  //   - body.delta → NT8's delta reading at signal time
+  //   - body.dom_bull / body.dom_bear → NT8's DOM reading at signal time
+  // Fall back to Railway's cached SC values only if NT8 didn't send them.
+  //
+  // Also raised the SHORT veto threshold:
+  //   - delta veto: >300 (was >50) — mild positive delta no longer kills shorts
+  //   - absorption veto: only if delta also >200 (was: any positive delta)
+  // NT8 already factored SC flow into its confidence score. Railway's gate
+  // should only hard-veto on genuinely extreme contradicting flow.
+
+  // Prefer NT8's own CVD first, then delta, then Railway's cached delta
+  const scDelta: number | null =
+    marketData.cvd   !== undefined && marketData.cvd   !== null ? Number(marketData.cvd)
+  : marketData.delta !== undefined && marketData.delta !== null ? Number(marketData.delta)
+  : null;
+
+  // Prefer NT8's dom_bull/dom_bear (from its own DOM poll) over cached absorption
+  const scAbsBull: boolean =
+    marketData.dom_bull !== undefined && marketData.dom_bull !== null
+      ? Number(marketData.dom_bull) > 0
+      : (marketData.absorptionBull === 1 || marketData.absorptionBull === true);
+
+  const scAbsBear: boolean =
+    marketData.dom_bear !== undefined && marketData.dom_bear !== null
+      ? Number(marketData.dom_bear) > 0
+      : (marketData.absorptionBear === 1 || marketData.absorptionBear === true);
+
+  const scImbBull  = marketData.imbalanceBull === 1 || marketData.imbalanceBull === true;
+  const scImbBear  = marketData.imbalanceBear === 1 || marketData.imbalanceBear === true;
+  const scBidStack = marketData.bidStackSize !== undefined ? Number(marketData.bidStackSize) : null;
+  const scAskStack = marketData.askStackSize !== undefined ? Number(marketData.askStackSize) : null;
+  const scHasFreshData = scDelta !== null;
 
   if (scHasFreshData) {
-    const absBull = scAbsBull === 1 || scAbsBull === true;
-    const absBear = scAbsBear === 1 || scAbsBear === true;
-    const imbBull = scImbBull === 1 || scImbBull === true;
-    const imbBear = scImbBear === 1 || scImbBear === true;
     const domBull = scBidStack !== null && scAskStack !== null && scAskStack > 0 && scBidStack > scAskStack * 2;
     const domBear = scBidStack !== null && scAskStack !== null && scBidStack > 0 && scAskStack > scBidStack * 2;
 
-    if (isLong && scDelta < -100 && !absBull && !imbBull && !domBull) {
-      console.log(`[SignalEngine][SC VolumeGate] BLOCKED LONG @ ${entry} — delta=${scDelta}`);
+    // LONG gate: only block if delta is strongly negative AND no bullish confirmation
+    if (isLong && scDelta < -100 && !scAbsBull && !scImbBull && !domBull) {
+      console.log(`[SignalEngine][SC VolumeGate] BLOCKED LONG @ ${entry} — delta=${scDelta} (strongly bearish flow, no bull confirmation)`);
       return null;
     }
 
-    const positiveDeltaShortBlock = scDelta > 50 && !absBear && !imbBear && !domBear;
-    const bullAbsorptionShortBlock = absBull && scDelta > 0 && !absBear;
-    if (!isLong && (positiveDeltaShortBlock || bullAbsorptionShortBlock)) {
-      console.log(`[SignalEngine][SC VolumeGate] BLOCKED SHORT @ ${entry} — delta=${scDelta} absBull=${absBull}`);
+    // SHORT gate: only block on genuinely extreme bullish contradiction
+    // Raised from delta>50 → delta>300, and absorption only if delta also >200
+    const strongBullDeltaBlocksShort  = scDelta > 300 && !scAbsBear && !scImbBear && !domBear;
+    const strongBullAbsorbBlocksShort = scAbsBull && scDelta > 200 && !scAbsBear;
+    if (!isLong && (strongBullDeltaBlocksShort || strongBullAbsorbBlocksShort)) {
+      console.log(`[SignalEngine][SC VolumeGate] BLOCKED SHORT @ ${entry} — delta=${scDelta} absBull=${scAbsBull} (extreme bull contradiction)`);
       return null;
     }
   }
 
+  // ── Session allowlist ──────────────────────────────────────────────────────
   const sessionLabel = getSessionLabel(marketData, session);
-
-  // ── Session allowlist ────────────────────────────────────────────────────────
   const ALLOWED_SESSIONS = ['london', 'ny_open', 'london_close', 'ny_open_london_close', 'ny_afternoon'];
   const normalizedSession = sessionLabel.toLowerCase().replace(/[\s-]/g, '_');
   if (!ALLOWED_SESSIONS.some(s => normalizedSession.includes(s))) {
@@ -351,16 +345,16 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     return null;
   }
 
-  // ── Fix #10: 3 trades total per killzone per day ─────────────────────────────
+  // ── Session trade cap: 3 total per killzone per day ────────────────────────
   const sessionCount = countSessionTotal(sessionLabel);
   if (sessionCount >= 3) {
     console.log(`[SignalEngine][KillzoneCap] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — session '${sessionLabel}' already has ${sessionCount}/3 trades today`);
     return null;
   }
 
-  // ── NY Afternoon extra rules ─────────────────────────────────────────────────
+  // ── NY Afternoon extra rules ───────────────────────────────────────────────
   if (normalizedSession.includes('ny_afternoon')) {
-    const confidence = (marketData.confidence as number) ?? 0;
+    const confidence   = (marketData.confidence as number) ?? 0;
     const intradayBias = (marketData.htfBias ?? marketData.bias ?? '') as string;
     const biasDirection = intradayBias.toLowerCase().includes('bull') ? 'long'
                         : intradayBias.toLowerCase().includes('bear') ? 'short'
@@ -375,19 +369,21 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     }
   }
 
+  // ── Risk gate ──────────────────────────────────────────────────────────────
   const risk = evaluateRiskGate({ direction: ntDirection, session: sessionLabel, confidence: marketData.confidence });
   if (!risk.allowed) {
     console.log(`[SignalEngine][RiskGate] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — ${risk.reason}`);
     return null;
   }
 
+  // ── Build reason string ────────────────────────────────────────────────────
   const volParts: string[] = [];
   if (scHasFreshData) {
     volParts.push(`SC delta ${scDelta! > 0 ? '+' : ''}${scDelta}`);
-    if (scAbsBull === 1 || scAbsBull === true) volParts.push('bull absorb');
-    if (scAbsBear === 1 || scAbsBear === true) volParts.push('bear absorb');
-    if (scImbBull === 1 || scImbBull === true) volParts.push('bid imbalance');
-    if (scImbBear === 1 || scImbBear === true) volParts.push('ask imbalance');
+    if (scAbsBull) volParts.push('bull absorb');
+    if (scAbsBear) volParts.push('bear absorb');
+    if (scImbBull) volParts.push('bid imbalance');
+    if (scImbBear) volParts.push('ask imbalance');
   } else {
     volParts.push('SC offline');
   }
@@ -417,13 +413,12 @@ export function injectTestSignal(direction: 'long'|'short', entry: number, sl: n
   const id = generateId();
   const sig: TradeSignal = {
     id, direction, entry, sl, tp1, tp2, session,
-    status: 'pending', score: 99,
+    status: 'pending',
     reason: 'TEST INJECT — pipeline verification',
-    source: 'ninjatrader',
     createdAt: Date.now(),
     qty: 4,
     confidence: 5,
-  };
+  } as any;
   signals.unshift(sig);
   dbSave(sig);
   console.log(`[SignalEngine] TEST INJECT: ${id} ${direction} @ ${entry}`);
@@ -446,13 +441,11 @@ export function confirmSignal(id: string): void {
 }
 
 export function updateSignalResult(id: string, data: Partial<TradeSignal>): void {
-  // ── FIX: Always write critical close fields directly to DB first ──────────
-  // This ensures result/exitPrice/pnlPoints survive even if in-memory lookup
-  // fails (e.g. Railway restarted mid-session and cleared the signals array).
+  // Always write critical close fields directly to DB first
   const directFields: string[] = [];
   const directVals: any[] = [];
-  if (data.status     != null) { directFields.push('status = ?');      directVals.push(data.status); }
-  if (data.result     != null) { directFields.push('result = ?');      directVals.push(data.result); }
+  if (data.status              != null) { directFields.push('status = ?');      directVals.push(data.status); }
+  if (data.result              != null) { directFields.push('result = ?');      directVals.push(data.result); }
   if ((data as any).exitPrice  != null) { directFields.push('exit_price = ?');  directVals.push((data as any).exitPrice); }
   if ((data as any).pnlPoints  != null) { directFields.push('pnl_points = ?');  directVals.push((data as any).pnlPoints); }
   if ((data as any).fillPrice  != null) { directFields.push('fill_price = ?');  directVals.push((data as any).fillPrice); }
@@ -466,15 +459,13 @@ export function updateSignalResult(id: string, data: Partial<TradeSignal>): void
     }
   }
 
-  // ── In-memory update ─────────────────────────────────────────────────────
   let sig = signals.find(s => s.id === id);
   if (!sig) {
-    // Try to reload from DB — handles Railway restarts wiping in-memory array
     const row = _db.prepare('SELECT data FROM trade_signals WHERE id=?').get(id) as any;
     if (row) {
       try {
         sig = JSON.parse(row.data) as TradeSignal;
-        if (sig) { sig.id = id; signals.unshift(sig); } // ensure id is set
+        if (sig) { sig.id = id; signals.unshift(sig); }
       } catch { sig = undefined; }
     }
   }
@@ -489,8 +480,8 @@ export function updateSignalResult(id: string, data: Partial<TradeSignal>): void
     sig.fillTime = new Date().toISOString();
   }
 
-  // ── Fix #7: PnL — prefer MuzziBot's pnlPoints; fallback to price diff ───────
-  const incomingPnl = (data as any).pnlPoints;
+  // Fix #7: PnL — prefer MuzziBot's pnlPoints; fallback to price diff
+  const incomingPnl  = (data as any).pnlPoints;
   const incomingExit = (data as any).exitPrice;
   if (incomingExit !== undefined && sig.direction) {
     const raw = sig.direction === 'long' ? incomingExit - sig.entry : sig.entry - incomingExit;
@@ -502,7 +493,7 @@ export function updateSignalResult(id: string, data: Partial<TradeSignal>): void
     sig.closedAt   = Date.now();
   }
 
-  dbSave(sig); // full JSON blob re-serialized with all updated fields
+  dbSave(sig);
   console.log(`[SignalEngine] Updated signal ${id}:`, data);
 }
 
@@ -529,16 +520,16 @@ export function getSignalStats(): {
   avgPnlPoints: number;
   todayPnlDollars: number;
 } {
-  const closed = signals.filter(s => s.status === 'closed' && s.result !== undefined && s.result !== 'EXPIRED');
-  const wins = closed.filter(s => s.result === 'TP1' || s.result === 'TP2').length;
-  const pnlPts = closed.reduce((sum, s) => sum + (s.pnlPoints ?? 0), 0);
+  const closed  = signals.filter(s => s.status === 'closed' && s.result !== undefined && s.result !== 'EXPIRED');
+  const wins    = closed.filter(s => s.result === 'TP1' || s.result === 'TP2').length;
+  const pnlPts  = closed.reduce((sum, s) => sum + (s.pnlPoints ?? 0), 0);
   const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
   const todaySignals = closed.filter(s => new Date(s.createdAt).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) === todayStr);
   const todayPnlDollars = todaySignals.reduce((sum, s) => sum + (s.pnlDollars ?? 0), 0);
   return {
-    totalTrades: closed.length,
-    winRate: closed.length ? Math.round((wins / closed.length) * 100) : 0,
-    avgPnlPoints: closed.length ? parseFloat((pnlPts / closed.length).toFixed(2)) : 0,
+    totalTrades:    closed.length,
+    winRate:        closed.length ? Math.round((wins / closed.length) * 100) : 0,
+    avgPnlPoints:   closed.length ? parseFloat((pnlPts / closed.length).toFixed(2)) : 0,
     todayPnlDollars,
   };
 }
