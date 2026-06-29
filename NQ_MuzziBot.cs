@@ -1,5 +1,6 @@
 // NQ_MuzziBot.cs — Execution strategy for NQ Analyst (CK Build v4 — MNQ Split Exit)
 // Jun 12 2026: All 17 fixes applied + Opus verified. PostStatusClosed sends result+exitPrice+pnlPoints.
+// Jun 29 2026: Fix #18 — GET timeout recovery: lastPoll reset on error; HttpWebRequest dual timeout (connect+read); immediate retry after failure.
 // ─────────────────────────────────────────────────────────────────────────────────
 // EXIT LOGIC (v4):
 //   Entry:     4 contracts, two named signals — E_HALF (2 contracts) + E_RUN (2 contracts)
@@ -155,7 +156,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private volatile bool    hasPending  = false;
         private PendingSignal    pendingExec;
         private readonly object  pendingLock = new object();
-        private DateTime         lastPoll    = DateTime.MinValue;
+        private DateTime         lastPoll        = DateTime.MinValue;
+        private volatile bool     _lastPollFailed = false; // Fix #18: retry immediately after GET timeout
 
         // ── Trade state (main thread only) ─────────────────────────────────────
         private string   activeSignalId  = null;
@@ -431,10 +433,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // ── STEP 4: Poll Railway for new signal ─────────────────────────────
-            if (activeSignalId == null && !hasPending && !polling
-                && (DateTime.Now - lastPoll).TotalSeconds >= PollIntervalSec)
+            // Fix #18: if last poll timed out, skip interval check and retry immediately
+            bool _pollDue = _lastPollFailed
+                || (DateTime.Now - lastPoll).TotalSeconds >= PollIntervalSec;
+            if (activeSignalId == null && !hasPending && !polling && _pollDue)
             {
                 lastPoll = DateTime.Now;
+                _lastPollFailed = false; // will be set true again if this poll also fails
                 ThreadPool.QueueUserWorkItem(delegate { PollForSignal(); });
             }
         }
@@ -532,7 +537,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print("[MuzziBot] Signal queued: " + rdir.ToUpperInvariant()
                     + " @ " + rentry.ToString("F2") + " sess=" + rsess + " id=" + rid);
             }
-            catch (Exception ex) { Print("[MuzziBot] Poll error: " + ex.Message); }
+            catch (Exception ex)
+            {
+                Print("[MuzziBot] Poll error: " + ex.Message);
+                _lastPollFailed = true; // Fix #18: signal OnBarUpdate to retry immediately next bar
+            }
             finally { polling = false; }
         }
 
@@ -900,12 +909,22 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // ── HTTP helpers ─────────────────────────────────────────────────────────
+        // Fix #18: Use HttpWebRequest with both Timeout (connect) and ReadWriteTimeout (read)
+        // WebClient.Timeout only sets the connect timeout on some Windows configs; the socket
+        // read phase can hang for 20-30s past the intended limit. Setting both fields on
+        // HttpWebRequest enforces a strict wall-clock deadline on the full HTTP operation.
         private string HttpGet(string url, int timeoutMs)
         {
             try
             {
-                using (var wc = new TimedWebClient(timeoutMs))
-                    return wc.DownloadString(url);
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Timeout          = timeoutMs; // connect timeout
+                req.ReadWriteTimeout = timeoutMs; // socket read timeout — Fix #18
+                req.Method           = "GET";
+                req.KeepAlive        = false;     // don't recycle socket; avoids stale-conn hangs
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                using (var sr   = new System.IO.StreamReader(resp.GetResponseStream()))
+                    return sr.ReadToEnd();
             }
             catch (Exception ex) { Print("[MuzziBot] GET error: " + ex.Message); return null; }
         }
