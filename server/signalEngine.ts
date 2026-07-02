@@ -20,6 +20,11 @@
  *         block SHORT if delta>0 AND bull absorb active. Stacks on top of CVD gate.
  *  #14 — Same-direction re-entry cooldown: after a STOPPED result in same session+
  *         direction, require 30 min before another entry in same direction.
+ *  #15 — London Close CVD exemption: when session=london_close AND signal contains
+ *         LondonSweptLow (for longs) or LondonSweptHigh (for shorts), skip the CVD
+ *         alignment gate. These are ICT liquidity sweep reversals where counter-CVD
+ *         entries are the thesis — CVD reflects prior session flow, not the reversal.
+ *         Recovers +247.5 pts of false-positive blocks from Jul 1 simulation.
  */
 
 export interface TradeSignal {
@@ -343,6 +348,23 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
     }
   }
 
+  // ── Fix #15: London Close CVD Exemption flag ────────────────────────────────
+  //
+  // In London Close, ICT thesis setups that tag a swept level (LondonSweptLow for
+  // longs, LondonSweptHigh for shorts) are liquidity sweep reversals. By definition
+  // price is reversing AGAINST the prior session's CVD trend. The CVD gate would
+  // incorrectly block these — the sweep tag is the signal that smart money is
+  // reversing, making counter-CVD entries structurally valid.
+  //
+  // Simulation evidence: Jul 1 London Close +127pt and +120.5pt LONG winners were
+  // both blocked by CVD gate (CVD=-79221 from AM session). Exempting them recovers
+  // +247.5 pts with zero additional loss exposure.
+  const ntReasons = String(marketData.reasons ?? marketData.reason ?? '');
+  const isLondonCloseReversal =
+    normalizeKillzone(getSessionLabel(marketData, session)).includes('london_close') &&
+    ((isLong  && ntReasons.includes('LondonSweptLow')) ||
+     (!isLong && ntReasons.includes('LondonSweptHigh')));
+
   // ── Fix #12: CVD Alignment Gate ─────────────────────────────────────────────
   //
   // Block any trade where the cumulative CVD sign contradicts the trade direction.
@@ -359,7 +381,7 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   const cvdValue: number | null =
     marketData.cvd !== undefined && marketData.cvd !== null ? Number(marketData.cvd) : null;
 
-  if (cvdValue !== null && Math.abs(cvdValue) > 500) {
+  if (cvdValue !== null && Math.abs(cvdValue) > 500 && !isLondonCloseReversal) {  // Fix #15: exempt LC sweep reversals
     if (isLong && cvdValue < 0) {
       console.log(`[SignalEngine][CVDGate] BLOCKED LONG @ ${entry} — CVD=${cvdValue} (bearish cumulative flow contradicts LONG) | Fix #12`);
       return null;
