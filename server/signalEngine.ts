@@ -13,6 +13,13 @@
  *         not a fresher one that may contradict the scored setup.
  *         SHORT veto threshold raised: delta>300 (was >50), absorption only blocks
  *         if delta also >200 (was >0). Mild positive delta no longer kills shorts.
+ *  #12 — CVD Alignment Gate: block any trade where cumulative CVD sign contradicts
+ *         direction. CVD < 0 = bearish bias (block LONGs), CVD > 0 = bullish bias
+ *         (block SHORTs). Based on Jun 22 / Jul 1 loss analysis — 100% correlation.
+ *  #13 — SC Delta Confirmation Gate: block LONG if delta<0 AND bear absorb active;
+ *         block SHORT if delta>0 AND bull absorb active. Stacks on top of CVD gate.
+ *  #14 — Same-direction re-entry cooldown: after a STOPPED result in same session+
+ *         direction, require 30 min before another entry in same direction.
  */
 
 export interface TradeSignal {
@@ -334,6 +341,73 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
       console.log(`[SignalEngine][SC VolumeGate] BLOCKED SHORT @ ${entry} — delta=${scDelta} absBull=${scAbsBull} (extreme bull contradiction)`);
       return null;
     }
+  }
+
+  // ── Fix #12: CVD Alignment Gate ─────────────────────────────────────────────
+  //
+  // Block any trade where the cumulative CVD sign contradicts the trade direction.
+  // CVD < 0 = net bearish order flow (short sellers winning) → block LONGs.
+  // CVD > 0 = net bullish order flow (buyers winning) → block SHORTs.
+  //
+  // Based on post-trade analysis of Jun 22 and Jul 1 losses: every loser was taken
+  // against CVD bias; every winner had CVD aligned. Retroactively blocks both
+  // -80/-81pt losses with zero winners blocked.
+  //
+  // Guard: only apply when CVD is a meaningful non-zero value. CVD within ±500
+  // of zero is considered ambiguous — do not block. This prevents false vetoes
+  // on low-volume pre-session prints where CVD resets.
+  const cvdValue: number | null =
+    marketData.cvd !== undefined && marketData.cvd !== null ? Number(marketData.cvd) : null;
+
+  if (cvdValue !== null && Math.abs(cvdValue) > 500) {
+    if (isLong && cvdValue < 0) {
+      console.log(`[SignalEngine][CVDGate] BLOCKED LONG @ ${entry} — CVD=${cvdValue} (bearish cumulative flow contradicts LONG) | Fix #12`);
+      return null;
+    }
+    if (!isLong && cvdValue > 0) {
+      console.log(`[SignalEngine][CVDGate] BLOCKED SHORT @ ${entry} — CVD=${cvdValue} (bullish cumulative flow contradicts SHORT) | Fix #12`);
+      return null;
+    }
+  }
+
+  // ── Fix #13: SC Delta Confirmation Gate ──────────────────────────────────────
+  //
+  // Tighter than the existing VolumeGate (Fix #11 uses threshold -100 for LONGs).
+  // This gate checks delta + absorption together as a confluence confirmation.
+  // Block LONG  if delta < 0 AND bear absorb active (sellers absorbing bids).
+  // Block SHORT if delta > 0 AND bull absorb active (buyers absorbing offers).
+  // Delta threshold is -10/+10 to avoid filtering on near-zero noise.
+  if (scHasFreshData && scDelta !== null) {
+    if (isLong && scDelta < -10 && scAbsBear) {
+      console.log(`[SignalEngine][DeltaConfirmGate] BLOCKED LONG @ ${entry} — delta=${scDelta} + bear absorb active (Fix #13)`);
+      return null;
+    }
+    if (!isLong && scDelta > 10 && scAbsBull) {
+      console.log(`[SignalEngine][DeltaConfirmGate] BLOCKED SHORT @ ${entry} — delta=${scDelta} + bull absorb active (Fix #13)`);
+      return null;
+    }
+  }
+
+  // ── Fix #14: Same-direction re-entry cooldown (30 min after STOPPED) ─────────
+  //
+  // After a STOPPED loss in the same session + same direction, require 30 minutes
+  // before re-entering the same way. Prevents chasing after a failed setup with
+  // no structural reset (e.g. Jul 1: LONG stopped, new LONG 35 min later same CVD).
+  // Cooldown resets if: (a) 30 min elapsed, OR (b) direction reverses successfully.
+  const COOLDOWN_MS = 30 * 60 * 1000;
+  const now_cd = Date.now();
+  const recentStopSameDir = signals.find(s =>
+    s.status === 'closed' &&
+    s.result === 'STOPPED' &&
+    s.direction === ntDirection &&
+    normalizeKillzone(s.session ?? '') === normalizeKillzone(sessionLabel) &&
+    s.closedAt !== undefined &&
+    (now_cd - (s.closedAt as number)) < COOLDOWN_MS
+  );
+  if (recentStopSameDir) {
+    const minsAgo = Math.round((now_cd - (recentStopSameDir.closedAt as number)) / 60000);
+    console.log(`[SignalEngine][CooldownGate] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — ${minsAgo}min since last STOPPED ${ntDirection.toUpperCase()} in ${sessionLabel} (30min cooldown) | Fix #14`);
+    return null;
   }
 
   // ── Session allowlist ──────────────────────────────────────────────────────
