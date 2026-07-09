@@ -57,6 +57,52 @@ import { evaluateRiskGate } from './RiskEngine';
 const _db = getDb();
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MORNING BRIEF STATE — fed from pre-session cron via POST /api/brief-state
+// ─────────────────────────────────────────────────────────────────────────────
+export interface BriefSetup {
+  entry_low:  number;
+  entry_high: number;
+  direction:  'long' | 'short';
+  tp1: number; tp2: number; sl: number;
+}
+export interface BriefState {
+  bias: string; bias_score: number; setups: BriefSetup[]; generated_at: number;
+}
+let _briefState: BriefState | null = null;
+export function setBriefState(b: BriefState): void {
+  _briefState = b;
+  console.log(`[BriefFilter] Brief state updated: bias=${b.bias} score=${b.bias_score} setups=${b.setups.length} generated=${new Date(b.generated_at).toISOString()}`);
+}
+export function getBriefState(): BriefState | null { return _briefState; }
+function briefBiasDirection(): 'long'|'short'|null {
+  if (!_briefState) return null;
+  const b = _briefState.bias.toLowerCase();
+  return b.includes('bull') ? 'long' : b.includes('bear') ? 'short' : null;
+}
+function distanceToNearestZone(entry: number): number {
+  if (!_briefState || !_briefState.setups.length) return 0;
+  let minDist = Infinity;
+  for (const setup of _briefState.setups) {
+    if (entry >= setup.entry_low && entry <= setup.entry_high) return 0;
+    minDist = Math.min(minDist, Math.abs(entry - setup.entry_low), Math.abs(entry - setup.entry_high));
+  }
+  return minDist;
+}
+function checkBriefFilter(direction: 'long'|'short', entry: number): string | null {
+  if (!_briefState) return null;
+  const ageMs = Date.now() - _briefState.generated_at;
+  if (ageMs > 20 * 60 * 60 * 1000) { console.log(`[BriefFilter] Brief is ${Math.round(ageMs/3600000)}h old — skipping filter`); return null; }
+  const biasDir = briefBiasDirection();
+  if (biasDir && _briefState.bias_score >= 65 && direction !== biasDir)
+    return `counter-bias (brief=${_briefState.bias} score=${_briefState.bias_score} signal=${direction.toUpperCase()})`;
+  const dist = distanceToNearestZone(entry);
+  if (dist > 75) return `outside_zone (${dist.toFixed(0)}pts from nearest zone, max 75pts)`;
+  return null;
+}
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SCHEMA-AGNOSTIC PERSISTENCE
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -429,6 +475,13 @@ export function evaluateSignal(marketData: any, session: string): TradeSignal | 
   if (recentStopSameDir) {
     const minsAgo = Math.round((now_cd - (recentStopSameDir.closedAt as number)) / 60000);
     console.log(`[SignalEngine][CooldownGate] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — ${minsAgo}min since last STOPPED ${ntDirection.toUpperCase()} in ${sessionLabel} (30min cooldown) | Fix #14`);
+    return null;
+  }
+
+  // ── Morning brief filter ────────────────────────────────────────────────────
+  const briefBlock = checkBriefFilter(ntDirection as 'long'|'short', entry);
+  if (briefBlock) {
+    console.log(`[SignalEngine][BriefFilter] BLOCKED ${ntDirection.toUpperCase()} @ ${entry} — ${briefBlock}`);
     return null;
   }
 

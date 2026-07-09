@@ -49,7 +49,7 @@ import {
   getWeights, getRecentLearningEntries,
 } from "./learningKernel";
 import {
-  evaluateSignal, clearExpiredSignals, getPendingSignal,
+  evaluateSignal, clearExpiredSignals, getPendingSignal, setBriefState, getBriefState,
   confirmSignal, updateSignalResult, getRecentSignals,
   getSignalStats, injectTestSignal,
 } from "./signalEngine";
@@ -982,5 +982,16 @@ ntDataAge: isNT8 ? 0 : (tvLatest ? Date.now() - (tvLatest as any).receivedAt : u
   });
 
   // Health check
+  app.post("/api/brief-state", (req, res) => {
+    try {
+      const body = req.body as any;
+      if (!body || typeof body.bias !== 'string' || typeof body.bias_score !== 'number')
+        return res.status(400).json({ ok: false, error: "Missing bias/bias_score" });
+      setBriefState({ bias: body.bias, bias_score: body.bias_score, setups: Array.isArray(body.setups) ? body.setups : [], generated_at: body.generated_at ?? Date.now() });
+      return res.json({ ok: true, bias: body.bias, bias_score: body.bias_score, setups_loaded: (body.setups||[]).length });
+    } catch(e: any) { return res.status(500).json({ ok: false, error: e?.message }); }
+  });
+  app.get("/api/brief-state", (_req, res) => res.json(getBriefState() ?? { ok: false, message: "No brief state loaded" }));
+
   app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 }
